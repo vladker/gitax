@@ -54,3 +54,9 @@ Thumbs.db
 
 # Journal backup
 *.backup.json
+
+# Debug screenshots and test files
+debug*.png
+test_*.py
+inspect_*.py
+*.bat

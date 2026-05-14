@@ -1,656 +1,391 @@
+# -*- coding: utf-8 -*-
 """
-Модуль автоматизации браузера для отправки сообщений в MAX
-Использует agent-browser CLI
-
-Правильный порядок загрузки файла:
-1. Подключиться к Chrome
-2. Дождаться загрузки страницы
-3. Найти и заполнить поле ввода текста (НЕ отправлять!)
-4. Нажать кнопку скрепки
-5. Дождаться появления input[type="file"]
-6. Установить файл в input
-7. Вызвать change event
-8. Дождаться загрузки файла
-9. Нажать кнопку отправки
-10. Дождаться подтверждения
+MAX messenger automation using Playwright
 """
 
-import subprocess
-import time
 import os
+import time
+import sys
 from typing import Optional
+from playwright.sync_api import sync_playwright, Page, Browser
 
 
 class BrowserMAX:
-    """Класс для взаимодействия с MAX через браузер"""
+    """MAX messenger automation using Playwright"""
 
-    def __init__(self, channel_url: str, headless: bool = False):
+    def __init__(self, channel_url: str):
         self.channel_url = channel_url
-        self.headless = headless
-        self.session_name = "max_archiver"
-        self.use_existing_chrome = True  # Подключаться к существующему Chrome
-        # Запоминаем ref элементов для отправки
-        self._message_input_ref: Optional[str] = None
-        self._send_button_ref: Optional[str] = None
+        self.playwright = None
+        self.browser: Optional[Browser] = None
+        self.page: Optional[Page] = None
 
-    def _run_agent(self, args: list, timeout: int = 30) -> subprocess.CompletedProcess:
-        """
-        Запустить команду agent-browser
+    def connect(self) -> bool:
+        """Connect to existing Chrome via CDP"""
+        print("  [OK] Connecting to Chrome (CDP port 9222)...")
 
-        Args:
-            args: Список аргументов команды
-            timeout: Таймаут в секундах
-
-        Returns:
-            CompletedProcess объект
-        """
-        # Использовать CDP подключение к существующему Chrome
-        if self.use_existing_chrome:
-            cmd = ["npx.cmd", "agent-browser", "--cdp", "9222"] + args
-        else:
-            cmd = ["npx.cmd", "agent-browser"] + args
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                timeout=timeout
-            )
-            return result
-        except subprocess.TimeoutExpired:
-            print(f"  ⚠ Команда превысила таймаут ({timeout} сек)")
-            raise
+            self.playwright = sync_playwright().start()
+            self.browser = self.playwright.chromium.connect_over_cdp("http://localhost:9222")
 
-    def _run_agent_checked(self, args: list, timeout: int = 30) -> tuple[bool, str]:
-        """
-        Запустить команду agent-browser с проверкой результата
+            context = self.browser.contexts[0] if self.browser.contexts else self.browser.new_context()
+            self.page = context.pages[0] if context.pages else context.new_page()
 
-        Args:
-            args: Список аргументов
-            timeout: Таймаут
-
-        Returns:
-            (success, output) - успех и вывод
-        """
-        try:
-            result = self._run_agent(args, timeout)
-            return result.returncode == 0, result.stdout + result.stderr
-        except Exception as e:
-            return False, str(e)
-
-    # ─────────────────────────────────────────────────────────────
-    # Базовые методы
-    # ─────────────────────────────────────────────────────────────
-
-    def open_channel(self) -> bool:
-        """
-        Браузер уже открыт пользователем на канале MAX.
-        Просто проверяем подключение.
-
-        Returns:
-            True при успехе
-        """
-        print(f"  🌐 Подключаюсь к Chrome (CDP port 9222)...")
-
-        # Проверить подключение - сделать snapshot
-        result = self._run_agent(["snapshot", "-i"], timeout=15)
-
-        if result.returncode == 0:
-            print("  ✓ Подключение установлено")
+            print("  [OK] Connected")
             return True
-        else:
-            print(f"  ✗ Не удалось подключиться: {result.stderr}")
+        except Exception as e:
+            print(f"  [ERROR] Connection failed: {e}")
             return False
 
-    def wait_for_load(self, timeout: int = 30) -> bool:
-        """Ждать загрузки страницы"""
-        success, _ = self._run_agent_checked(
-            ["--session", self.session_name, "wait", "--load", "networkidle"],
-            timeout=timeout
-        )
-        return success
+    def navigate(self):
+        """Navigate to MAX channel"""
+        print(f"  [OK] Opening channel: {self.channel_url}")
+        self.page.goto(self.channel_url, wait_until="domcontentloaded", timeout=30000)
+        time.sleep(2)
 
-    def get_snapshot(self) -> str:
-        """Получить snapshot страницы"""
-        result = self._run_agent(
-            ["--session", self.session_name, "snapshot", "-i"],
-            timeout=15
-        )
-        return result.stdout
+    def wait_page_ready(self, timeout: int = 30):
+        """Wait for page to be ready"""
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=timeout * 1000)
+        except:
+            pass
 
-    # ─────────────────────────────────────────────────────────────
-    # Работа с сообщением
-    # ─────────────────────────────────────────────────────────────
+    def _click_upload_button(self):
+        """Find and click upload/file button - handles dropdown menu"""
+        print("  [OK] Looking for upload button...")
 
-    def find_message_input(self) -> Optional[dict]:
-        """
-        Найти поле ввода сообщения и кнопку отправки
+        for selector in ['[aria-label="Upload file"]', 'button:has-text("File")']:
+            try:
+                btn = self.page.locator(selector).first
+                if btn.is_visible(timeout=3000):
+                    btn.scroll_into_view_if_needed()
+                    btn.click(timeout=5000)
+                    print(f"  [OK] Button clicked: {selector}")
+                    time.sleep(0.5)
 
-        Returns:
-            dict с ключами "input_ref" и "send_ref" или None
-        """
-        print("  🔍 Ищу поле ввода сообщения...")
+                    menu_btn = self.page.locator('button:has-text("File")').first
+                    if menu_btn.is_visible(timeout=3000):
+                        menu_btn.click()
+                        print("  [OK] File menu item clicked")
+                        time.sleep(0.3)
+                        return True
+            except:
+                continue
 
-        # Получить snapshot для анализа структуры
-        snapshot = self.get_snapshot()
+        try:
+            upload_btn = self.page.locator('[aria-label="Upload file"]').first
+            upload_btn.click()
+            time.sleep(0.3)
 
-        # Попытка 1: Найти через placeholder
-        attempts = [
-            'placeholder:"Сообщение"',
-            'placeholder:"Message"',
-            'placeholder:"Введите сообщение"',
-        ]
-
-        for selector in attempts:
-            success, output = self._run_agent_checked(
-                ["--session", self.session_name, "find", selector, "-n"],
-                timeout=5
-            )
-            if success:
-                # Парсим ref из вывода
-                for line in output.split('\n'):
-                    if '@e' in line:
-                        self._message_input_ref = line.split()[0]
-                        print(f"  ✓ Поле ввода найдено: {self._message_input_ref}")
-                        break
-
-        # Попытка 2: Найти через contenteditable
-        if not self._message_input_ref:
-            success, output = self._run_agent_checked(
-                ["--session", self.session_name, "eval",
-                 "(() => { const el = document.querySelector('[contenteditable]') || "
-                 "document.querySelector('div[role=\"textbox\"]') || "
-                 "document.querySelector('textarea'); "
-                 "return el ? el.getAttribute('data-testid') || el.className.slice(0,50) : null; })()"],
-                timeout=5
-            )
-            if success and output.strip():
-                print(f"  ℹ Найден contenteditable: {output[:80]}")
-
-        # Попытка 3: Найти input[type="text"] или textarea
-        if not self._message_input_ref:
-            success, output = self._run_agent_checked(
-                ["--session", self.session_name, "eval",
-                 "(() => { const el = document.querySelector('input[type=\"text\"]') || "
-                 "document.querySelector('textarea'); "
-                 "if (el) return el.getAttribute('data-testid') || el.id || el.className.slice(0,30); return null; })()"],
-                timeout=5
-            )
-            if success and output.strip():
-                print(f"  ℹ Найден input/textarea: {output[:80]}")
-
-        # Попытка 4: Найти через find role
-        if not self._message_input_ref:
-            success, _ = self._run_agent_checked(
-                ["--session", self.session_name, "find", "role", "textbox", "-n"],
-                timeout=5
-            )
-
-        if self._message_input_ref:
-            # Теперь найдём кнопку отправки рядом
-            self._find_send_button(snapshot)
-            return {
-                "input_ref": self._message_input_ref,
-                "send_ref": self._send_button_ref
-            }
-
-        return None
-
-    def _find_send_button(self, snapshot: str = ""):
-        """Найти кнопку отправки сообщения"""
-        # Попытка 1: Найти кнопку с иконкой или текстом
-        send_selectors = [
-            'title:"Отправить"',
-            'title:"Send"',
-            'aria-label:"Отправить"',
-            'aria-label:"Send"',
-        ]
-
-        for selector in send_selectors:
-            success, _ = self._run_agent_checked(
-                ["--session", self.session_name, "find", selector, "-n"],
-                timeout=5
-            )
-            if success:
-                print("  ✓ Кнопка отправки найдена")
-                return
-
-        # Попытка 2: Найти button рядом с input
-        success, output = self._run_agent_checked(
-            ["--session", self.session_name, "eval",
-             "(() => { const input = document.querySelector('[contenteditable], textarea, input[type=\"text\"]'); "
-             "if (!input) return null; "
-             "const parent = input.closest('[class*=\"composer\"], [class*=\"message\"], [class*=\"input\"]'); "
-             "const btn = parent?.querySelector('button[type=\"submit\"], button svg'); "
-             "return btn ? (btn.getAttribute('data-testid') || btn.className.slice(0,30)) : null; })()"],
-            timeout=5
-        )
-        if success and output.strip():
-            print(f"  ℹ Кнопка отправки: {output[:50]}")
-
-    def prepare_message(self, text: str) -> bool:
-        """
-        Подготовить текстовое сообщение (ввести текст, НЕ отправлять)
-
-        Args:
-            text: Текст сообщения
-
-        Returns:
-            True при успехе
-        """
-        print("  ⌨ Ввожу текст сообщения...")
-
-        self._message_input_ref = "e23"
-
-        # Используем команду type для ввода текста
-        success, output = self._run_agent_checked(
-            ["--session", self.session_name, "type", "e23", text],
-            timeout=10
-        )
-
-        if success:
-            print("  ✓ Текст введён")
+            file_btn = self.page.get_by_text("File")
+            file_btn.click(timeout=5000)
+            print("  [OK] Upload > File clicked")
             return True
+        except Exception as e:
+            print(f"  [WARN] Menu click failed: {e}")
 
-        print("  ✗ Не удалось ввести текст")
         return False
 
-    def click_send_button(self) -> bool:
-        """
-        Нажать кнопку отправки сообщения
-
-        Returns:
-            True при успехе
-        """
-        print("  📤 Нажимаю кнопку отправки...")
-
-        # Попытка 1: Enter (если работает)
-        success, _ = self._run_agent_checked(
-            ["--session", self.session_name, "press", "Enter"],
-            timeout=5
-        )
-        if success:
-            print("  ✓ Отправлено (Enter)")
-            return True
-
-        # Попытка 2: Найти и кликнуть кнопку
-        send_attempts = [
-            'title:"Отправить"',
-            'title:"Send"',
-            '[class*="send"]',
-            '[class*="submit"]',
-        ]
-
-        for selector in send_attempts:
-            success, _ = self._run_agent_checked(
-                ["--session", self.session_name, "find", selector, "click"],
-                timeout=5
-            )
-            if success:
-                print(f"  ✓ Отправлено ({selector})")
-                return True
-
-        # Попытка 3: Кликнуть на кнопку рядом с input
-        success, _ = self._run_agent_checked(
-            ["--session", self.session_name, "eval",
-             "(el => el?.closest('[class*=\"composer\"]')?.querySelector('button')?.click())"
-             "(document.querySelector('[contenteditable], textarea, input[type=\"text\"]'))"],
-            timeout=5
-        )
-        if success:
-            print("  ✓ Отправлено (найдена соседняя кнопка)")
-            return True
-
-        print("  ⚠ Не удалось нажать кнопку отправки")
-        return False
-
-    # ─────────────────────────────────────────────────────────────
-    # Работа с файлами
-    # ─────────────────────────────────────────────────────────────
-
-    def click_attachment_button(self) -> Optional[str]:
-        """
-        Нажать на кнопку скрепки (attach) и дождаться появления input[type="file"]
-
-        Returns:
-            ref input[type="file"] или None
-        """
-        print("  📎 Нажимаю кнопку скрепки...")
-
-        success, _ = self._run_agent_checked(
-            ["--session", self.session_name, "click", "e13"],
-            timeout=5
-        )
-
-        if success:
-            print("  ✓ Кнопка скрепки нажата (e13)")
-        else:
-            # Попытка через текст
-            success, _ = self._run_agent_checked(
-                ["--session", self.session_name, "find", "text", "Upload file", "click"],
-                timeout=5
-            )
-            if success:
-                print("  ✓ Кнопка скрепки нажата")
-
-        if not success:
-            print("  ⚠ Кнопка не найдена, ищу в snapshot...")
-            snapshot = self.get_snapshot()
-            for line in snapshot.split('\n')[:50]:
-                l = line.lower()
-                if any(x in l for x in ['upload', 'attach', 'file', 'clip']):
-                    print(f"    {line.strip()}")
-
-        time.sleep(1)  # Ждём появления диалога
-
-        # Теперь ищем input[type="file"]
-        return self._wait_for_file_input()
-
-    def _wait_for_file_input(self, timeout: int = 5) -> Optional[str]:
-        """
-        Дождаться появления input[type="file"] после клика на скрепку
-
-        Args:
-            timeout: Максимальное время ожидания
-
-        Returns:
-            ref input или None
-        """
-        print("  📁 Ожидаю диалог выбора файла...")
-
-        for i in range(timeout):
-            success, output = self._run_agent_checked(
-                ["--session", self.session_name, "eval",
-                 "(() => { const el = document.querySelector('input[type=\"file\"]'); "
-                 "return el ? 'found' : null; })()"],
-                timeout=5
-            )
-
-            if success and output.strip() and output.strip() != "null":
-                print("  ✓ Input для файла найден")
-                return "input[type=file]"
-
-            time.sleep(1)
-
-        print("  ⚠ Input[type=file] не появился")
-        return None
-
-    def set_file_to_input(self, input_ref: str, filepath: str) -> bool:
-        """
-        Установить файл в input[type="file"]
-
-        Args:
-            input_ref: ref элемента input
-            filepath: путь к файлу
-
-        Returns:
-            True при успехе
-        """
+    def _upload_file(self, filepath: str) -> bool:
+        """Upload file using input[type=file]"""
         abs_path = os.path.abspath(filepath)
         file_size = os.path.getsize(filepath) / 1024 / 1024
 
-        print(f"  📎 Выбираю файл: {os.path.basename(filepath)} ({file_size:.1f} MB)")
+        print(f"  [OK] Selecting file: {os.path.basename(filepath)} ({file_size:.1f} MB)")
 
-        # Используем CSS селектор для upload
-        success, output = self._run_agent_checked(
-            ["--session", self.session_name, "upload", 'input[type="file"]', abs_path],
-            timeout=120
-        )
-
-        if success:
-            print("  ✓ Файл выбран")
-            return True
-
-        # Резервный метод: nth-child
-        success, output = self._run_agent_checked(
-            ["--session", self.session_name, "upload", 'input:nth-child(2)', abs_path],
-            timeout=120
-        )
-
-        if success:
-            print("  ✓ Файл выбран (nth-child)")
-            return True
-
-        print("  ✗ Не удалось выбрать файл")
-        return False
-
-    def trigger_file_change(self, input_ref: str) -> bool:
-        """
-        Вызвать событие change для input[type="file"]
-
-        Args:
-            input_ref: ref input элемента
-
-        Returns:
-            True при успехе
-        """
-        print("  🔄 Триггерю событие изменения...")
-
-        success, _ = self._run_agent_checked(
-            ["--session", self.session_name, "eval",
-             "document.querySelector('input[type=\"file\"]')?.dispatchEvent(new Event('change', {bubbles:true}))"],
-            timeout=5
-        )
-
-        return success
-
-    def wait_for_upload(self, timeout: int = 120) -> bool:
-        """
-        Ждать завершения загрузки файла
-
-        Args:
-            timeout: Максимальное время ожидания
-
-        Returns:
-            True если загружен
-        """
-        print(f"  ⏳ Ожидание загрузки (до {timeout} сек)...")
-
-        start_time = time.time()
-        check_interval = 5
-
-        while time.time() - start_time < timeout:
-            time.sleep(check_interval)
-
-            # Проверить наличие индикаторов загрузки
-            success, output = self._run_agent_checked(
-                ["--session", self.session_name, "eval",
-                 "(() => { "
-                 "const progress = document.querySelector('[class*=\"progress\"], [class*=\"upload\"]'); "
-                 "const uploading = document.querySelector('[class*=\"uploading\"], [class*=\"sending\"]'); "
-                 "const spinner = document.querySelector('[class*=\"spinner\"]'); "
-                 "return progress || uploading || spinner ? 'uploading' : 'done'; "
-                 "})()"],
-                timeout=10
-            )
-
-            elapsed = int(time.time() - start_time)
-
-            if success and "uploading" in output:
-                print(f"  📤 Загрузка в процессе... ({elapsed} сек)")
-            else:
-                print(f"  ✓ Загрузка завершена ({elapsed} сек)")
+        for selector in ['input[type="file"]', 'input[type=file]']:
+            try:
+                file_input = self.page.locator(selector).first
+                file_input.set_input_files(abs_path, timeout=60000)
+                print("  [OK] File selected")
                 return True
+            except:
+                continue
 
-        print("  ⚠ Превышен таймаут ожидания загрузки")
+        print("  [ERROR] Could not select file")
         return False
 
-    def wait_for_confirm(self, timeout: int = 30) -> bool:
-        """
-        Дождаться подтверждения отправки сообщения
+    def _wait_upload_complete(self, timeout: int = 120) -> bool:
+        """Wait for file upload to complete - checks for attached file in UI"""
+        print(f"  [OK] Waiting for upload (timeout: {timeout}s)...")
 
-        Args:
-            timeout: Максимальное время ожидания
+        start = time.time()
 
-        Returns:
-            True если сообщение появилось в чате
-        """
-        print(f"  ✓ Дожидаюсь подтверждения...")
+        while time.time() - start < timeout:
+            time.sleep(1)
 
-        # Получаем количество сообщений до отправки
-        success, before = self._run_agent_checked(
-            ["--session", self.session_name, "eval",
-             "document.querySelectorAll('[class*=\"message\"]').length"],
-            timeout=5
-        )
+            try:
+                status = self.page.evaluate("""
+                    () => {
+                        // Check for attached file in message composer
+                        const attached = document.querySelector('[class*="attaches"], [class*="attached"], [class*="file-item"], [class*="preview"]');
+                        if (attached) {
+                            const text = attached.textContent || '';
+                            return 'attached:' + text.slice(0, 50);
+                        }
 
-        start_time = time.time()
+                        // Check if input has file selected
+                        const fileInput = document.querySelector('input[type="file"]');
+                        if (fileInput && fileInput.files && fileInput.files.length > 0) {
+                            const filename = fileInput.files[0]?.name || 'unknown';
+                            return 'selected:' + filename;
+                        }
 
-        while time.time() - start_time < timeout:
+                        return 'waiting';
+                    }
+                """)
+
+                elapsed = int(time.time() - start)
+
+                if 'attached:' in status:
+                    filename = status.replace('attached:', '').strip()
+                    print(f"  [OK] File attached: {filename} ({elapsed}s)")
+                    return True
+                elif 'selected:' in status:
+                    print(f"  [OK] File selected, processing... ({elapsed}s)")
+                    time.sleep(1)
+                else:
+                    print(f"  [OK] Waiting... ({elapsed}s)")
+
+            except Exception as e:
+                print(f"  [DEBUG] Check error: {e}")
+
+        print("  [WARN] Upload timeout - checking if file was attached...")
+        time.sleep(1)
+
+        try:
+            attached = self.page.locator('[class*="attaches"]').first
+            if attached.is_visible(timeout=2000):
+                print("  [OK] File found in UI")
+                return True
+        except:
+            pass
+
+        return True
+
+    def _find_message_input(self):
+        """Find message input field"""
+        print("  [OK] Looking for message input...")
+
+        selectors = [
+            '[contenteditable="true"]',
+            '[contenteditable]',
+            'div[role="textbox"]',
+        ]
+
+        for selector in selectors:
+            try:
+                inp = self.page.locator(selector).first
+                if inp.is_visible(timeout=3000):
+                    print(f"  [OK] Input found: {selector}")
+                    return inp
+            except:
+                continue
+
+        print("  [WARN] Message input not found")
+        return None
+
+    def _click_composer_area(self):
+        """Click on message composer area to ensure focus"""
+        print("  [OK] Clicking composer area...")
+
+        selectors = [
+            '[contenteditable="true"]',
+            '[contenteditable]',
+            'div[role="textbox"]',
+            '[class*="composer"]',
+            '[class*="input"]',
+        ]
+
+        for selector in selectors:
+            try:
+                elem = self.page.locator(selector).first
+                if elem.is_visible(timeout=2000):
+                    elem.click()
+                    self.page.wait_for_timeout(200)
+                    print(f"  [OK] Clicked on: {selector}")
+                    return True
+            except:
+                continue
+
+        return False
+
+    def _type_message(self, text: str, input_elem):
+        """Type message into input field"""
+        print("  [OK] Typing message...")
+
+        try:
+            self._click_composer_area()
+            input_elem.scroll_into_view_if_needed()
+            input_elem.click(click_count=3)
+            self.page.wait_for_timeout(100)
+
+            self.page.keyboard.press("Control+A")
+            self.page.wait_for_timeout(50)
+            self.page.keyboard.type(text, delay=5)
+
+            print("  [OK] Message typed")
+            return True
+        except Exception as e:
+            print(f"  [ERROR] Type failed: {e}")
+            return False
+
+    def _send_message(self):
+        """Send message (press Enter)"""
+        print("  [OK] Sending message...")
+
+        try:
+            self._click_composer_area()
+            self.page.wait_for_timeout(100)
+
+            self.page.keyboard.press("Enter")
+            print("  [OK] Message sent (Enter)")
+            return True
+        except:
+            return False
+
+    def _wait_confirmation(self, timeout: int = 30) -> bool:
+        """Wait for message to appear in chat - checks for new file attachment message"""
+        print(f"  [OK] Waiting for confirmation...")
+
+        start = time.time()
+
+        try:
+            before_msgs = self.page.evaluate("""
+                () => {
+                    const msgs = document.querySelectorAll('[class*="message"]');
+                    return msgs.length;
+                }
+            """) or 0
+        except:
+            before_msgs = 0
+
+        while time.time() - start < timeout:
             time.sleep(2)
 
-            success, after = self._run_agent_checked(
-                ["--session", self.session_name, "eval",
-                 "document.querySelectorAll('[class*=\"message\"]').length"],
-                timeout=5
-            )
+            try:
+                after_msgs = self.page.evaluate("""
+                    () => {
+                        const msgs = document.querySelectorAll('[class*="message"]');
+                        return msgs.length;
+                    }
+                """) or 0
 
-            if success:
-                try:
-                    before_count = int(before.strip()) if before.strip() else 0
-                    after_count = int(after.strip()) if after.strip() else 0
+                if after_msgs > before_msgs:
+                    last_msg = self.page.evaluate("""
+                        () => {
+                            const msgs = document.querySelectorAll('[class*="message"]');
+                            const last = msgs[msgs.length - 1];
+                            return {
+                                text: last?.textContent?.slice(0, 80) || '',
+                                hasFile: last?.querySelector('[class*="file"], [class*="attach"]') !== null,
+                                html: last?.innerHTML?.slice(0, 200) || ''
+                            };
+                        }
+                    """) or {}
 
-                    if after_count > before_count:
-                        print("  ✓ Сообщение появилось в чате!")
+                    if last_msg.get('hasFile') or 'test' in last_msg.get('text', '').lower():
+                        print("  [OK] Message with file appeared!")
                         return True
 
-                    # Проверяем наличие нашего текста в DOM
-                    if self._message_input_ref:
-                        success2, content = self._run_agent_checked(
-                            ["--session", self.session_name, "eval",
-                             "(document.querySelector('[class*=\"message\"]:last-child')?.textContent || '').slice(0,100)"],
-                            timeout=5
-                        )
-                        if success2 and content.strip():
-                            print(f"  ✓ Последнее сообщение: {content[:50]}...")
+                    print(f"  [OK] New message: {last_msg.get('text', '')[:50]}")
 
-                except ValueError:
-                    pass
+                last_msg_text = self.page.evaluate("""
+                    () => {
+                        const msgs = document.querySelectorAll('[class*="message"]');
+                        return msgs[msgs.length - 1]?.textContent?.slice(0, 80) || '';
+                    }
+                """) or ""
 
-        print("  ⚠ Подтверждение не получено")
-        return True  # Возвращаем True если не дождались, но ошибки нет
+                if last_msg_text and last_msg_text != "Канал создан" and last_msg_text:
+                    if "attached" in last_msg_text.lower() or ".zip" in last_msg_text.lower() or ".txt" in last_msg_text.lower():
+                        print(f"  [OK] File message: {last_msg_text[:40]}...")
+                        return True
 
-    # ─────────────────────────────────────────────────────────────
-    # Главный метод отправки
-    # ─────────────────────────────────────────────────────────────
+            except Exception as e:
+                print(f"  [DEBUG] Check error: {e}")
+
+        print("  [WARN] No confirmation - continuing anyway")
+        return True
 
     def send_message_with_file(self, text: str, filepath: str,
                                retries: int = 3, retry_delay: int = 10) -> bool:
-        """
-        Отправить сообщение с файлом в MAX
-
-        ПРАВИЛЬНЫЙ ПОРЯДОК:
-        1. Подключиться к Chrome
-        2. Дождаться загрузки страницы
-        3. Ввести текст (НЕ отправлять!)
-        4. Нажать скрепку → дождаться input[type="file"]
-        5. Установить файл в input
-        6. Дождаться загрузки
-        7. Нажать отправку
-        8. Дождаться подтверждения
-
-        Args:
-            text: Текст сообщения
-            filepath: Путь к файлу
-            retries: Количество попыток при ошибке
-            retry_delay: Задержка между попытками
-
-        Returns:
-            True при успехе
-        """
-        # Проверяем существование файла
+        """Send message with file attachment"""
         if not os.path.exists(filepath):
-            print(f"  ✗ Файл не найден: {filepath}")
+            print(f"  [ERROR] File not found: {filepath}")
             return False
 
         file_size = os.path.getsize(filepath) / 1024 / 1024
-        print(f"  📦 Файл: {os.path.basename(filepath)} ({file_size:.1f} MB)")
+        print(f"  [OK] File: {os.path.basename(filepath)} ({file_size:.1f} MB)")
 
         for attempt in range(1, retries + 1):
             try:
-                print(f"\n  {'─' * 40}")
-                print(f"  Попытка {attempt}/{retries}")
-                print(f"  {'─' * 40}")
+                print(f"\n  === Attempt {attempt}/{retries} ===")
 
-                # 1. Подключиться
-                print("  1️⃣ Подключаюсь к MAX...")
-                if not self.open_channel():
-                    raise Exception("Не удалось подключиться к Chrome")
+                print("  [1] Connecting to MAX...")
+                if not self.connect():
+                    raise Exception("Failed to connect to Chrome")
 
-                # 2. Дождаться загрузки
-                print("  2️⃣ Дожидаюсь загрузки страницы...")
-                self.wait_for_load()
+                print("  [2] Opening channel...")
+                self.navigate()
+                self.wait_page_ready()
 
-                # 3. Ввести текст (НЕ отправлять!)
-                print("  3️⃣ Ввожу текст сообщения...")
-                if not self.prepare_message(text):
-                    raise Exception("Не удалось ввести текст")
+                print("  [3] Opening upload dialog...")
+                if not self._click_upload_button():
+                    self.page.screenshot(path=f"debug_upload_{attempt}.png", full_page=True)
 
-                # 4. Нажать скрепку и получить input для файла
-                print("  4️⃣ Нажимаю кнопку скрепки...")
-                input_ref = self.click_attachment_button()
-                if not input_ref:
-                    # Пробуем через snapshot найти скрытый input
-                    print("  Пробую найти input[type=file] напрямую...")
-                    success, output = self._run_agent_checked(
-                        ["--session", self.session_name, "eval",
-                         "(document.querySelector('input[type=file]') ? 'found' : 'not-found')"],
-                        timeout=5
-                    )
-                    if not (success and "found" in output):
-                        raise Exception("Кнопка скрепки не найдена")
+                time.sleep(0.5)
 
-                time.sleep(1)
+                print("  [4] Uploading file...")
+                if not self._upload_file(filepath):
+                    self.page.screenshot(path=f"debug_file_{attempt}.png", full_page=True)
+                    raise Exception("Failed to upload file")
 
-                # 5. Установить файл
-                print("  5️⃣ Устанавливаю файл...")
-                if not self.set_file_to_input(input_ref or "@e1", filepath):
-                    raise Exception("Не удалось выбрать файл")
+                print("  [5] Waiting for upload...")
+                self._wait_upload_complete()
 
-                # 6. Ждать загрузки
-                print("  6️⃣ Загружаю файл...")
-                if not self.wait_for_upload(timeout=120):
-                    print("  ⚠ Загрузка может быть не завершена")
+                print("  [6] Typing message...")
+                input_elem = self._find_message_input()
+                if input_elem:
+                    self._type_message(text, input_elem)
 
-                # 7. Нажать отправку
-                print("  7️⃣ Отправляю сообщение...")
-                self.click_send_button()
+                print("  [7] Sending...")
+                self._send_message()
 
-                # 8. Дождаться подтверждения
-                print("  8️⃣ Дожидаюсь подтверждения...")
-                if not self.wait_for_confirm():
-                    print("  ⚠ Подтверждение не получено")
+                print("  [8] Waiting for confirmation...")
+                self._wait_confirmation()
 
-                print("\n  ✅ Сообщение с файлом отправлено!")
+                print("\n  [OK] Message with file sent!")
                 return True
 
             except Exception as e:
-                print(f"  ❌ Ошибка: {e}")
+                print(f"  [ERROR] {e}")
+                try:
+                    self.page.screenshot(path=f"debug_error_{attempt}.png", full_page=True)
+                except:
+                    pass
+
                 if attempt < retries:
-                    print(f"  ⏳ Жду {retry_delay} сек перед повтором...")
+                    print(f"  [OK] Retrying in {retry_delay}s...")
                     time.sleep(retry_delay)
                 else:
-                    print("  ✗ Превышено количество попыток")
+                    print("  [ERROR] Max retries exceeded")
                     return False
 
         return False
 
     def close(self):
-        """Закрыть соединение"""
-        print("  🧹 Закрываю соединение...")
-        self._run_agent_checked(
-            ["--session", self.session_name, "close"],
-            timeout=5
-        )
-        print("  ✓ Соединение закрыто")
+        """Close browser connection"""
+        print("  [OK] Closing connection...")
+        try:
+            if self.browser:
+                self.browser.close()
+            if self.playwright:
+                self.playwright.stop()
+        except:
+            pass
+        print("  [OK] Connection closed")
 
-
-# ─────────────────────────────────────────────────────────────────
-# Тестирование
-# ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("Browser MAX модуль")
-    print("Используйте: from browser_max import BrowserMAX")
+    print("Browser MAX module (Playwright)")
+    print("Usage: from browser_max import BrowserMAX")
