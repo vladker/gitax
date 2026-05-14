@@ -58,11 +58,20 @@ class GitHubArchiver:
         return self.github
 
     def _init_max_browser(self) -> BrowserMAX:
-        """Инициализировать браузер MAX"""
+        """Initialize MAX browser (reuses connection if alive)"""
         if self.max_browser is None:
             channel_url = self.config.get('max', {}).get('channel_url', '')
             self.max_browser = BrowserMAX(channel_url)
         return self.max_browser
+
+    def _ensure_max_connected(self):
+        """Ensure MAX browser is connected and ready"""
+        browser = self._init_max_browser()
+        if not browser.keep_alive_connect():
+            raise Exception("Failed to connect to MAX")
+        browser.navigate()
+        browser.ensure_page_ready()
+        return browser
 
     def _format_stars(self, count: int) -> str:
         """Форматировать количество звёзд"""
@@ -142,11 +151,18 @@ class GitHubArchiver:
         print(f"\n  Загружено {len(repos)} репозиториев из журнала")
         print("  Проверяю актуальные версии на GitHub...\n")
 
-        # Флаг для автоматического режима
         auto_update = False
         updated_count = 0
         skipped_count = 0
         error_count = 0
+
+        browser = None
+        try:
+            browser = self._ensure_max_connected()
+        except Exception as e:
+            print(f"\n  ✗ Не удалось подключиться к MAX: {e}")
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
 
         for i, repo in enumerate(repos, 1):
             full_name = repo.get('full_name', '')
@@ -154,15 +170,14 @@ class GitHubArchiver:
             saved_version = repo.get('version', '')
             default_branch = repo.get('default_branch', 'main')
 
-            print(f"  {'─' * 56}")
+            print(f"\n  {'─' * 56}")
             print(f"  Проверка: {display_name} ({full_name})")
             print(f"    📌 Сохранённая версия: {saved_version}")
 
-            # Получить актуальную версию
             owner, repo_name = full_name.split('/', 1)
 
             try:
-                has_new, latest_version = self.github.check_new_version(  # type: ignore
+                has_new, latest_version = self.github.check_new_version(
                     owner, repo_name, default_branch, saved_version
                 )
             except Exception as e:
@@ -177,7 +192,6 @@ class GitHubArchiver:
                 skipped_count += 1
                 continue
 
-            # Есть обновление - спросить пользователя
             if auto_update:
                 choice = 'y'
             else:
@@ -189,26 +203,18 @@ class GitHubArchiver:
                     choice = 'y'
 
             if choice == 'y':
-                # Обновить репозиторий
                 print(f"\n    → Обновляю: {saved_version} → {latest_version}")
-
-                # Подготовить данные для сообщения
                 repo_update = dict(repo)
                 repo_update['version'] = latest_version
                 text = self._build_message_text(repo_update)
 
-                # Скачать ZIP
                 print("    ↓ Скачиваю ZIP...")
-                zip_path = self.github.download_zip(owner, repo_name, default_branch)  # type: ignore
+                zip_path = self.github.download_zip(owner, repo_name, default_branch)
 
                 if not zip_path or not os.path.exists(zip_path):
                     print("    ✗ Не удалось скачать ZIP")
                     error_count += 1
                     continue
-
-                # Отправить в MAX
-                browser = self._init_max_browser()  # type: ignore
-                print("    → Отправляю в MAX...")
 
                 success = browser.send_message_with_file(
                     text=text,
@@ -217,15 +223,6 @@ class GitHubArchiver:
                     retry_delay=self.config.get('archiver', {}).get('retry_delay', 10)
                 )
 
-                # Удалить временный файл
-                if os.path.exists(zip_path):
-                    try:
-                        os.remove(zip_path)
-                        print("    ✓ Временный файл удалён")
-                    except Exception as e:
-                        print(f"    ⚠ Не удалось удалить файл: {e}")
-
-                # Обновить журнал
                 if success:
                     self.journal.update_repository(full_name, {
                         'version': latest_version,
@@ -233,25 +230,46 @@ class GitHubArchiver:
                     })
                     updated_count += 1
                     print(f"    ✓ {display_name} обновлён")
+
+                    print("\n    🔍 Мониторю ленту MAX (3h timeout)...")
+                    confirmed, reason = browser._watch_message_feed(timeout=10800)
+
+                    if confirmed:
+                        print("    ✓ Файл доставлен в ленту")
+                    elif reason == "cancelled":
+                        if browser:
+                            browser.close()
+                        print("\n  ⚠ Прервано пользователем")
+                        return
+                    else:
+                        self.journal.update_repository(full_name, {'status': 'failed'})
+                        print("    ✗ Timeout 3h — пропущен")
                 else:
                     self.journal.update_repository(full_name, {'status': 'failed'})
                     error_count += 1
                     print(f"    ✗ Ошибка обновления")
 
+                if os.path.exists(zip_path):
+                    try:
+                        os.remove(zip_path)
+                    except Exception as e:
+                        print(f"    ⚠ Не удалось удалить файл: {e}")
+
             elif choice == 's':
                 print("\n  Останавливаю проверку...")
                 break
 
-            # Не 'n' явно пропускаем
             time.sleep(0.5)
 
-        # Итоги
         print("\n" + "═" * 60)
         print("Синхронизация завершена")
         print(f"  Обновлено: {updated_count}")
         print(f"  Пропущено: {skipped_count}")
         print(f"  Ошибок: {error_count}")
         print("═" * 60)
+
+        if browser:
+            browser.close()
 
         input("\n  Нажмите Enter для возврата в меню...")
 
@@ -263,14 +281,12 @@ class GitHubArchiver:
 
         limit = self.config.get('archiver', {}).get('limit', 100)
 
-        # Инициализация
         self._init_github()
 
-        # Получить топ репозиториев
         print(f"\n  Запрашиваю топ-{limit} репозиториев с GitHub...")
 
         try:
-            top_repos = self.github.get_top_repositories(limit)  # type: ignore
+            top_repos = self.github.get_top_repositories(limit)
         except Exception as e:
             print(f"\n  ✗ Ошибка загрузки с GitHub: {e}")
             input("\n  Нажмите Enter для возврата в меню...")
@@ -283,7 +299,6 @@ class GitHubArchiver:
 
         print(f"  ✓ Получено {len(top_repos)} репозиториев")
 
-        # Фильтровать уже загруженные
         processed_names = self.journal.get_processed_names()
         new_repos = [r for r in top_repos if r.get('full_name') not in processed_names]
 
@@ -295,10 +310,17 @@ class GitHubArchiver:
             input("\n  Нажмите Enter для возврата в меню...")
             return
 
-        # Флаг автоматической загрузки
         auto_load = False
         loaded_count = 0
         error_count = 0
+
+        browser = None
+        try:
+            browser = self._ensure_max_connected()
+        except Exception as e:
+            print(f"\n  ✗ Не удалось подключиться к MAX: {e}")
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
 
         for i, repo_info in enumerate(new_repos, 1):
             full_name = repo_info.get('full_name', '')
@@ -306,7 +328,7 @@ class GitHubArchiver:
             stars = repo_info.get('stargazers_count', 0)
             desc = repo_info.get('description', '') or 'Без описания'
 
-            print(f"  {'═' * 56}")
+            print(f"\n  {'═' * 56}")
             print(f"  #{i} из {len(new_repos)} | {display_name}")
             print(f"  {'─' * 56}")
             print(f"  ⭐ {self._format_stars(stars)} звёзд | 🍴 {self._format_stars(repo_info.get('forks_count', 0))} форков")
@@ -329,30 +351,44 @@ class GitHubArchiver:
                 print("\n  Выход из загрузки...")
                 break
             elif choice in ['', 'y', 'enter']:
-                # Загрузить репозиторий
-                success = self._download_and_send_repo_info(repo_info)
+                success = self._download_and_send_repo_info_connected(browser, repo_info)
 
                 if success:
                     loaded_count += 1
                     print(f"\n  ✓ Загружено ({loaded_count}/{len(new_repos)})")
+
+                    print("  🔍 Мониторю ленту MAX (3h timeout)...")
+                    confirmed, reason = browser._watch_message_feed(timeout=10800)
+
+                    if confirmed:
+                        print("  ✓ Файл доставлен в ленту")
+                    elif reason == "cancelled":
+                        if browser:
+                            browser.close()
+                        print("\n  ⚠ Прервано пользователем")
+                        return
+                    else:
+                        self.journal.update_repository(full_name, {'status': 'failed'})
+                        print("  ✗ Timeout 3h — пропущен")
                 else:
                     error_count += 1
                     print(f"\n  ✗ Ошибка загрузки")
             else:
-                # Пустой ввод = загрузить
-                success = self._download_and_send_repo_info(repo_info)
+                success = self._download_and_send_repo_info_connected(browser, repo_info)
                 if success:
                     loaded_count += 1
 
             time.sleep(0.5)
 
-        # Итоги
         print("\n" + "═" * 60)
         print("Загрузка завершена")
         print(f"  Обработано: {loaded_count + error_count}")
         print(f"  Успешно: {loaded_count}")
         print(f"  Ошибок: {error_count}")
         print("═" * 60)
+
+        if browser:
+            browser.close()
 
         input("\n  Нажмите Enter для возврата в меню...")
 
@@ -418,38 +454,46 @@ class GitHubArchiver:
 
     def _download_and_send_repo_info(self, repo_info: dict) -> bool:
         """
-        Скачать и отправить новый репозиторий (из API данных)
+        Download and send new repository (from API data)
 
         Args:
-            repo_info: Данные от GitHub API
+            repo_info: Data from GitHub API
 
         Returns:
-            True при успехе
+            True on success
+        """
+        browser = self._init_max_browser()
+        return self._download_and_send_repo_info_connected(browser, repo_info)
+
+    def _download_and_send_repo_info_connected(self, browser: BrowserMAX, repo_info: dict) -> bool:
+        """
+        Download and send repository with provided browser connection
+
+        Args:
+            browser: BrowserMAX instance (already connected)
+            repo_info: Data from GitHub API
+
+        Returns:
+            True on success
         """
         full_name = repo_info.get('full_name', '')
         owner, repo_name = full_name.split('/', 1)
         default_branch = repo_info.get('default_branch', 'main')
 
-        # Построить полные данные
-        repo_data = self.github.build_repo_data(repo_info)  # type: ignore
+        repo_data = self.github.build_repo_data(repo_info)
 
-        # Скачать ZIP
-        print("    ↓ Скачиваю ZIP...")
-        zip_path = self.github.download_zip(owner, repo_name, default_branch)  # type: ignore
+        print("    ↓ Downloading ZIP...")
+        zip_path = self.github.download_zip(owner, repo_name, default_branch)
 
         if not zip_path or not os.path.exists(zip_path):
-            print("    ✗ Не удалось скачать ZIP")
+            print("    ✗ Failed to download ZIP")
             return False
 
-        # Подготовить текст сообщения
         text = self._build_message_text(repo_data)
-        print("    ✓ Текст подготовлен")
+        print("    ✓ Text prepared")
 
-        # Отправить в MAX
-        self._init_max_browser()
-        print("    → Отправляю в MAX...")
+        print("    → Sending to MAX...")
 
-        browser = self._init_max_browser()  # type: ignore
         success = browser.send_message_with_file(
             text=text,
             filepath=zip_path,
@@ -457,15 +501,13 @@ class GitHubArchiver:
             retry_delay=self.config.get('archiver', {}).get('retry_delay', 10)
         )
 
-        # Удалить временный файл
         try:
             if os.path.exists(zip_path):
                 os.remove(zip_path)
-                print("    ✓ Временный файл удалён")
+                print("    ✓ Temp file removed")
         except Exception as e:
-            print(f"    ⚠ Не удалось удалить файл: {e}")
+            print(f"    ⚠ Failed to remove file: {e}")
 
-        # Добавить в журнал
         repo_data['status'] = 'sent' if success else 'failed'
         repo_data['version'] = repo_data.get('version', '') or 'unknown'
         self.journal.add_repository(repo_data)

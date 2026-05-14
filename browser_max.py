@@ -36,6 +36,23 @@ class BrowserMAX:
             print(f"  [ERROR] Connection failed: {e}")
             return False
 
+    def keep_alive_connect(self) -> bool:
+        """Connect to Chrome and stay connected. Use this for multiple operations."""
+        if self.browser and self.page:
+            print("  [OK] Already connected (reusing connection)")
+            return True
+        return self.connect()
+
+    def ensure_page_ready(self):
+        """Ensure page is loaded and ready for interaction"""
+        if not self.page:
+            raise Exception("Not connected. Call keep_alive_connect() first.")
+
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=15000)
+        except:
+            pass
+
     def navigate(self):
         """Navigate to MAX channel"""
         print(f"  [OK] Opening channel: {self.channel_url}")
@@ -179,6 +196,124 @@ class BrowserMAX:
             pass
 
         return True
+
+    def _watch_message_feed(self, timeout: int = 10800, progress: bool = True) -> tuple[bool, str]:
+        """
+        Monitor MAX feed for file confirmation.
+
+        Args:
+            timeout: Maximum seconds to wait (default: 10800 = 3 hours)
+            progress: Show progress bar
+
+        Returns:
+            (confirmed: bool, reason: str)
+            reason = "confirmed" | "timeout" | "cancelled"
+        """
+        hours = timeout // 3600
+        mins = (timeout % 3600) // 60
+        secs = timeout % 60
+        time_str = f"{hours}:{mins:02d}:{secs:02d}" if hours > 0 else f"{mins}:{secs:02d}"
+
+        print(f"\n  [OK] Watching feed for file confirmation")
+        print(f"       Timeout: {time_str} | Press Q to cancel")
+
+        start = time.time()
+        last_progress_time = start
+        cancel_requested = False
+
+        initial_count = 0
+        try:
+            initial_count = self.page.evaluate("""
+                () => document.querySelectorAll('[class*="message"]').length
+            """) or 0
+        except:
+            pass
+
+        while time.time() - start < timeout:
+            remaining = int(timeout - (time.time() - start))
+
+            if progress and time.time() - last_progress_time >= 60:
+                last_progress_time = time.time()
+
+                r_hours = remaining // 3600
+                r_mins = (remaining % 3600) // 60
+                r_secs = remaining % 60
+                remaining_str = f"{r_hours}:{r_mins:02d}:{r_secs:02d}" if r_hours > 0 else f"{r_mins}:{r_secs:02d}"
+
+                elapsed = int(time.time() - start)
+                e_hours = elapsed // 3600
+                e_mins = (elapsed % 3600) // 60
+                e_secs = elapsed % 60
+                elapsed_str = f"{e_hours}:{e_mins:02d}:{e_secs:02d}" if e_hours > 0 else f"{e_mins}:{e_secs:02d}"
+
+                progress_pct = min(100, int((elapsed / timeout) * 100))
+                filled = progress_pct // 2
+                empty = 50 - filled
+                bar = "█" * filled + "░" * empty
+
+                print(f"\r  [{bar}] {elapsed_str}/{remaining_str} remaining | Q to cancel", end="", flush=True)
+
+            try:
+                import select
+                import tty
+
+                if sys.platform == 'win32':
+                    import msvcrt
+                    if msvcrt.kbhit():
+                        key = msvcrt.getch()
+                        if key in [b'q', b'Q', b'\x03']:
+                            cancel_requested = True
+                else:
+                    if select.select([sys.stdin], [], [], 0)[0]:
+                        key = sys.stdin.read(1)
+                        if key.lower() == 'q':
+                            cancel_requested = True
+
+            except:
+                pass
+
+            if cancel_requested:
+                print(f"\n\n  [WARN] Cancelled by user")
+                return (False, "cancelled")
+
+            time.sleep(2)
+
+            try:
+                current_count = self.page.evaluate("""
+                    () => document.querySelectorAll('[class*="message"]').length
+                """) or 0
+
+                if current_count > initial_count:
+                    last_msg = self.page.evaluate("""
+                        () => {
+                            const msgs = document.querySelectorAll('[class*="message"]');
+                            const last = msgs[msgs.length - 1];
+                            if (!last) return null;
+
+                            const text = last.textContent || '';
+                            const html = last.innerHTML || '';
+                            const hasFile = last.querySelector('[class*="file"], [class*="attach"], [class*="download"], [class*="archive"]') !== null;
+
+                            return {
+                                text: text.slice(0, 100),
+                                hasFile: hasFile,
+                                hasZip: text.includes('.zip') || html.includes('.zip')
+                            };
+                        }
+                    """) or {}
+
+                    if last_msg:
+                        has_file = last_msg.get('hasFile', False) or last_msg.get('hasZip', False)
+                        if has_file:
+                            elapsed = int(time.time() - start)
+                            print(f"\n\n  [OK] File confirmed in feed! ({elapsed}s)")
+                            return (True, "confirmed")
+
+            except Exception as e:
+                pass
+
+        print(f"\n\n  [WARN] File confirmation timeout ({timeout}s)")
+        return (False, "timeout")
 
     def _find_message_input(self):
         """Find message input field"""
@@ -331,8 +466,14 @@ class BrowserMAX:
         return True
 
     def send_message_with_file(self, text: str, filepath: str,
-                               retries: int = 3, retry_delay: int = 10) -> bool:
-        """Send text message first, then file as second message"""
+                               retries: int = 3, retry_delay: int = 10,
+                               keep_alive: bool = False) -> bool:
+        """
+        Send text message first, then file as second message
+
+        Args:
+            keep_alive: If True, don't close connection after sending
+        """
         if not os.path.exists(filepath):
             print(f"  [ERROR] File not found: {filepath}")
             return False
@@ -344,9 +485,10 @@ class BrowserMAX:
             try:
                 print(f"\n  === Attempt {attempt}/{retries} ===")
 
-                print("  [1] Connecting to MAX...")
-                if not self.connect():
-                    raise Exception("Failed to connect to Chrome")
+                if not self.page:
+                    print("  [1] Connecting to MAX...")
+                    if not self.connect():
+                        raise Exception("Failed to connect to Chrome")
 
                 print("  [2] Opening channel...")
                 self.navigate()
@@ -374,7 +516,6 @@ class BrowserMAX:
                     fc_info.value.set_files(abs_path)
                     print(f"  [OK] File selected: {os.path.basename(filepath)}")
                 except Exception as e:
-                    self.page.screenshot(path=f"debug_file_{attempt}.png", full_page=True)
                     print(f"  [ERROR] {e}")
                     raise Exception("Failed to upload file")
 
@@ -392,15 +533,6 @@ class BrowserMAX:
 
             except Exception as e:
                 print(f"  [ERROR] {e}")
-                try:
-                    self.page.screenshot(path=f"debug_error_{attempt}.png", full_page=True)
-                except:
-                    pass
-
-                try:
-                    self.close()
-                except:
-                    pass
 
                 if attempt < retries:
                     print(f"  [OK] Retrying in {retry_delay}s...")
