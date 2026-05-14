@@ -104,6 +104,24 @@ class BrowserMAX:
         print("  [ERROR] Could not select file")
         return False
 
+    def _upload_file_drag_drop(self, filepath: str) -> bool:
+        """Upload file using file chooser"""
+        abs_path = os.path.abspath(filepath)
+        file_size = os.path.getsize(filepath) / 1024 / 1024
+        print(f"  [OK] Selecting file: {os.path.basename(filepath)} ({file_size:.1f} MB)")
+
+        try:
+            with self.page.expect_file_chooser(timeout=60000) as fc_info:
+                print("  [OK] Waiting for file dialog...")
+
+            file_chooser = fc_info.value
+            file_chooser.set_files(abs_path)
+            print("  [OK] File selected via dialog")
+            return True
+        except Exception as e:
+            print(f"  [ERROR] File chooser failed: {e}")
+            return False
+
     def _wait_upload_complete(self, timeout: int = 120) -> bool:
         """Wait for file upload to complete - checks for attached file in UI"""
         print(f"  [OK] Waiting for upload (timeout: {timeout}s)...")
@@ -210,18 +228,23 @@ class BrowserMAX:
         return False
 
     def _type_message(self, text: str, input_elem):
-        """Type message into input field"""
+        """Type message into input field using clipboard paste"""
         print("  [OK] Typing message...")
 
         try:
+            import pyperclip
+
             self._click_composer_area()
             input_elem.scroll_into_view_if_needed()
             input_elem.click(click_count=3)
             self.page.wait_for_timeout(100)
 
+            pyperclip.copy(text)
+            self.page.wait_for_timeout(50)
+
             self.page.keyboard.press("Control+A")
             self.page.wait_for_timeout(50)
-            self.page.keyboard.type(text, delay=5)
+            self.page.keyboard.press("Control+V")
 
             print("  [OK] Message typed")
             return True
@@ -309,7 +332,7 @@ class BrowserMAX:
 
     def send_message_with_file(self, text: str, filepath: str,
                                retries: int = 3, retry_delay: int = 10) -> bool:
-        """Send message with file attachment"""
+        """Send text message first, then file as second message"""
         if not os.path.exists(filepath):
             print(f"  [ERROR] File not found: {filepath}")
             return False
@@ -329,38 +352,53 @@ class BrowserMAX:
                 self.navigate()
                 self.wait_page_ready()
 
-                print("  [3] Opening upload dialog...")
-                if not self._click_upload_button():
-                    self.page.screenshot(path=f"debug_upload_{attempt}.png", full_page=True)
-
-                time.sleep(0.5)
-
-                print("  [4] Uploading file...")
-                if not self._upload_file(filepath):
-                    self.page.screenshot(path=f"debug_file_{attempt}.png", full_page=True)
-                    raise Exception("Failed to upload file")
-
-                print("  [5] Waiting for upload...")
-                self._wait_upload_complete()
-
-                print("  [6] Typing message...")
+                print("  [3] Typing message (about)...")
                 input_elem = self._find_message_input()
                 if input_elem:
                     self._type_message(text, input_elem)
 
-                print("  [7] Sending...")
+                print("  [4] Sending about message...")
+                self._send_message()
+                time.sleep(2)
+
+                print("  [5] Opening upload dialog...")
+                time.sleep(0.3)
+
+                print("  [6] Uploading file...")
+                abs_path = os.path.abspath(filepath)
+
+                try:
+                    with self.page.expect_file_chooser(timeout=60000) as fc_info:
+                        self._click_upload_button()
+
+                    fc_info.value.set_files(abs_path)
+                    print(f"  [OK] File selected: {os.path.basename(filepath)}")
+                except Exception as e:
+                    self.page.screenshot(path=f"debug_file_{attempt}.png", full_page=True)
+                    print(f"  [ERROR] {e}")
+                    raise Exception("Failed to upload file")
+
+                print("  [7] Waiting for upload...")
+                self._wait_upload_complete()
+
+                print("  [8] Sending file message...")
                 self._send_message()
 
-                print("  [8] Waiting for confirmation...")
+                print("  [9] Waiting for confirmation...")
                 self._wait_confirmation()
 
-                print("\n  [OK] Message with file sent!")
+                print("\n  [OK] About + file sent!")
                 return True
 
             except Exception as e:
                 print(f"  [ERROR] {e}")
                 try:
                     self.page.screenshot(path=f"debug_error_{attempt}.png", full_page=True)
+                except:
+                    pass
+
+                try:
+                    self.close()
                 except:
                     pass
 
@@ -383,6 +421,9 @@ class BrowserMAX:
                 self.playwright.stop()
         except:
             pass
+        self.playwright = None
+        self.browser = None
+        self.page = None
         print("  [OK] Connection closed")
 
 
