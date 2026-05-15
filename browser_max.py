@@ -4,6 +4,7 @@ MAX messenger automation using Playwright
 """
 
 import os
+import re
 import time
 import sys
 from typing import Optional
@@ -34,35 +35,50 @@ class ElementNotFoundError(BrowserMAXError):
 class BrowserMAX(LogMixin):
     """MAX messenger automation using Playwright"""
 
-    def __init__(self, channel_url: str):
+    def __init__(self, channel_url: str, use_local_browser: bool = True):
         self.channel_url = channel_url
+        self.use_local_browser = use_local_browser
         self.playwright = None
         self.browser: Optional[Browser] = None
         self.page: Optional[Page] = None
         self._connected = False
 
     def connect(self) -> bool:
-        """Connect to existing Chrome via CDP"""
-        self.logger.info("Connecting to Chrome (CDP port 9222)...")
+        """Connect to Chrome - local browser or via CDP"""
+        self.logger.info(f"Connecting to Chrome (local={self.use_local_browser})...")
 
         try:
             self.playwright = sync_playwright().start()
 
-            try:
-                self.browser = self.playwright.chromium.connect_over_cdp(
-                    "http://localhost:9222",
-                    timeout=30000
+            if self.use_local_browser:
+                # Launch local Chrome browser (no 50MB file limit)
+                self.logger.info("Launching local Chrome...")
+                self.browser = self.playwright.chromium.launch(
+                    headless=False,
+                    args=['--disable-blink-features=Automation']
                 )
-            except Exception as e:
-                self.logger.error(f"CDP connection failed: {e}")
-                self.playwright.stop()
-                self.playwright = None
-                return False
+                context = self.browser.new_context(
+                    viewport={'width': 1200, 'height': 900}
+                )
+                self.page = context.new_page()
+            else:
+                # Use CDP connection to existing Chrome (has 50MB file limit)
+                self.logger.info("Connecting via CDP (port 9222)...")
+                try:
+                    self.browser = self.playwright.chromium.connect_over_cdp(
+                        "http://localhost:9222",
+                        timeout=30000
+                    )
+                except Exception as e:
+                    self.logger.error(f"CDP connection failed: {e}")
+                    self.playwright.stop()
+                    self.playwright = None
+                    return False
 
-            context = self.browser.contexts[0] if self.browser.contexts else self.browser.new_context()
-            self.page = context.pages[0] if context.pages else context.new_page()
+                context = self.browser.contexts[0] if self.browser.contexts else self.browser.new_context()
+                self.page = context.pages[0] if context.pages else context.new_page()
+
             self._connected = True
-
             self.logger.info("Connected successfully")
             return True
         except Exception as e:
@@ -539,7 +555,8 @@ class BrowserMAX(LogMixin):
                 return True
 
             # Check lenta for file message
-            if self._check_upload_in_lenta():
+            done_lenta, _ = self._check_upload_in_lenta(None)
+            if done_lenta:
                 print(f"\n  [OK] File confirmed in feed ({elapsed}s)")
                 return True
 
@@ -564,7 +581,8 @@ class BrowserMAX(LogMixin):
                 # After ~30-60 seconds of no activity, assume upload is done
                 if consecutive_no_activity >= 2:
                     # Final verification
-                    if self._check_upload_in_lenta() or self._check_dom_upload_ready() or done:
+                    done_lenta, _ = self._check_upload_in_lenta(None)
+                    if done_lenta or self._check_dom_upload_ready() or done:
                         print(f"\n  [OK] Upload finished (no activity for {int(time_since_activity)}s)")
                         return True
 
@@ -572,7 +590,8 @@ class BrowserMAX(LogMixin):
                     if consecutive_no_activity >= 4:  # ~60 seconds
                         print(f"\n  [WARN] No upload activity for {int(time_since_activity)}s")
                         # Try one more thorough check
-                        if not self._check_upload_in_lenta():
+                        done_lenta, _ = self._check_upload_in_lenta(None)
+                        if not done_lenta:
                             print(f"  [INFO] Continuing to monitor...")
 
             # Show elapsed time every 30s if no progress
@@ -591,7 +610,8 @@ class BrowserMAX(LogMixin):
             self.logger.info(f"Upload complete at timeout: {filename}")
             return True
 
-        if self._check_upload_in_lenta():
+        done_lenta, _ = self._check_upload_in_lenta(None)
+        if done_lenta:
             self.logger.info("Upload confirmed in lenta at timeout")
             return True
 
@@ -723,10 +743,16 @@ class BrowserMAX(LogMixin):
             self.logger.debug(f"DOM composer check error: {e}")
             return False
 
-    def _check_upload_in_lenta(self) -> bool:
+    def _check_upload_in_lenta(self, expected_filename: Optional[str] = None) -> tuple[bool, Optional[str]]:
         """
         Check if file appears in message feed (not in composer).
         This is the definitive check that file was actually uploaded.
+
+        Args:
+            expected_filename: Optional filename to match
+
+        Returns:
+            (found: bool, filename: Optional[str])
         """
         script = """
             () => {
@@ -771,17 +797,19 @@ class BrowserMAX(LogMixin):
         try:
             result = self.page.evaluate(script)
             if result and result.get('found'):
-                self.logger.info(f"File found in lenta: {result.get('text', 'unknown')}")
-                return True
+                filename = result.get('text', 'unknown')
+                self.logger.info(f"File found in lenta: {filename}")
+                return (True, filename)
             elif result:
                 self.logger.debug(f"Lenta check: no file, last msgs: {result.get('lastMessages', [])}")
-            return False
+            return (False, None)
         except Exception as e:
             self.logger.debug(f"Lenta check error: {e}")
-            return False
+            return (False, None)
 
     def _wait_for_file_message(self, timeout: int = 300,
-                                expected_msg_index: Optional[int] = None) -> tuple[bool, str, int]:
+                                expected_msg_index: Optional[int] = None,
+                                expected_filename: Optional[str] = None) -> tuple[bool, str, int]:
         """
         Monitor chat online until file message is found.
         No hard timeout - exits when file is confirmed or error occurs.
@@ -789,10 +817,11 @@ class BrowserMAX(LogMixin):
         Args:
             timeout: Max time to wait (default 5 min as safety fallback)
             expected_msg_index: Expected message index (0 = any new)
+            expected_filename: Filename to match (if provided, only confirms if filename matches)
 
         Returns:
             (found: bool, reason: str, found_msg_index: int)
-            reason = "found" | "timeout" | "disconnected" | "no_activity"
+            reason = "found" | "timeout" | "disconnected" | "no_activity" | "filename_mismatch"
             found_msg_index: 0 if not found, otherwise message index
         """
         start = time.time()
@@ -800,6 +829,14 @@ class BrowserMAX(LogMixin):
         last_activity_time = start
 
         print(f"  [MONITOR] Starting live monitoring...")
+
+        # If filename provided, normalize it for comparison
+        search_name = None
+        if expected_filename:
+            import os as os_module
+            basename = os_module.path.basename(expected_filename).lower()
+            search_name = basename.replace('.zip', '').replace('-master', '').replace('-main', '')
+            print(f"  [SCAN] Looking for: {search_name}")
 
         try:
             if not self._ensure_alive():
@@ -818,8 +855,9 @@ class BrowserMAX(LogMixin):
             """) or ""
             print(f"  [MONITOR] Initial: {base_count} msgs, last: {init_result[:50]}...")
 
-            # IMMEDIATELY check if file message already exists (from upload)
-            for idx in range(max(0, base_count - 10), base_count + 1):
+            # Search ALL messages (not just last 10) to find our file
+            print(f"  [SCAN] Searching all {base_count} messages...")
+            for idx in range(base_count):
                 msg_result = self.page.evaluate(f"""
                     () => {{
                         const msgs = document.querySelectorAll('[class*="message"]');
@@ -834,28 +872,51 @@ class BrowserMAX(LogMixin):
                         const hasZip = /\\.zip/i.test(text) || /\\.zip/i.test(html);
                         const hasDownload = msg.querySelector('[download]') !== null ||
                                             msg.querySelector('a[href*="download"]') !== null;
-                        const hasSvg = msg.querySelector('svg') !== null;
 
                         return {{
                             text: text.slice(0, 150),
                             hasFileClass,
                             hasZip,
                             hasDownload,
-                            hasSvg,
                             classes: classes.slice(0, 80)
                         }};
                     }}
                 """) or {}
 
-                is_file = (msg_result.get('hasFileClass') or
-                          msg_result.get('hasZip') or
-                          msg_result.get('hasDownload'))
+                msg_text = msg_result.get('text', '').lower()
+                msg_html = msg_result.get('html', '').lower()
+                msg_classes = msg_result.get('classes', '').lower()
 
-                if is_file:
-                    print(f"  [OK] FILE ALREADY EXISTS! Message #{idx + 1}")
-                    print(f"       {msg_result.get('text', '')[:100]}...")
-                    return (True, "found", idx + 1)
+                match = re.search(r'([a-z0-9\-_]+\.zip)', msg_text)
+                if match:
+                    msg_filename = match.group(1).replace('-master', '').replace('-main', '')
+                    if search_name not in msg_filename:
+                        continue  # Skip - name mismatch
 
+                # Option 2: Check for download button or file icon
+                has_download_btn = (
+                    'download' in msg_classes or
+                    'download' in msg_html or
+                    msg_result.get('hasDownload') or
+                    'скачать' in msg_text.lower() or
+                    'download' in msg_text.lower()
+                )
+
+                # Option 3: Check for file size indicator (e.g., "388 MB", "388.2 MB")
+                has_size = re.search(r'\d+\.?\d*\s*(mb|gb|kb)', msg_text)
+                if not has_size:
+                    # Also check in HTML
+                    has_size = re.search(r'\d+\.?\d*\s*(mb|gb|kb)', msg_html)
+
+                # File message must have either download button OR size indicator
+                if not has_download_btn and not has_size:
+                    continue
+
+                print(f"  [OK] FILE FOUND! Message #{idx + 1}")
+                print(f"       {msg_result.get('text', '')[:100]}...")
+                return (True, "found", idx + 1)
+
+            print(f"  [SCAN] No matching file found")
             last_activity_time = time.time()
         except Exception as e:
             print(f"  [ERROR] Failed to initialize: {e}")
@@ -919,7 +980,26 @@ class BrowserMAX(LogMixin):
                                   msg_result.get('hasZip') or
                                   msg_result.get('hasDownload'))
 
+                        # Apply same robust checks as initial scan
                         if is_file:
+                            msg_text = msg_result.get('text', '').lower()
+                            msg_html = (msg_result.get('html') or '').lower()
+
+                            # Check for download indicator
+                            has_download = msg_result.get('hasDownload')
+                            if not has_download:
+                                has_download = 'download' in msg_text or 'скачать' in msg_text
+
+                            # Check for file size (e.g., "388 MB", "388.2 MB")
+                            has_size = re.search(r'\d+\.?\d*\s*(mb|gb|kb)', msg_text)
+                            if not has_size:
+                                has_size = re.search(r'\d+\.?\d*\s*(mb|gb|kb)', msg_html)
+
+                            # File must have download OR size
+                            if not has_download and not has_size:
+                                print(f"  [SKIP] Msg #{idx + 1}: no download/size indicator")
+                                continue
+
                             print(f"  [OK] FILE FOUND! Message #{idx + 1}")
                             print(f"       {msg_result.get('text', '')[:100]}...")
                             return (True, "found", idx + 1)
@@ -1298,17 +1378,21 @@ class BrowserMAX(LogMixin):
 
     def send_message_with_file(self, text: str, filepath: str,
                                retries: int = 3, retry_delay: int = 10,
-                               keep_alive: bool = False) -> bool:
+                               keep_alive: bool = False) -> tuple[bool, bool]:
         """
         Send text message first, then file as second message
 
         Args:
             keep_alive: If True, don't close connection after sending
+
+        Returns:
+            Tuple of (success: bool, file_deletable: bool)
+            file_deletable indicates if file can be safely deleted after upload
         """
         valid, err = self._validate_file(filepath)
         if not valid:
             self.logger.error(f"File not found or invalid: {err}")
-            return False
+            return (False, True)  # success=False, file_deletable=True (nothing to clean)
 
         abs_path = os.path.abspath(filepath)
         file_size_mb = os.path.getsize(abs_path) / 1024 / 1024
@@ -1384,11 +1468,19 @@ class BrowserMAX(LogMixin):
 
                 self.logger.debug("Waiting for file message confirmation...")
                 # Monitor online until file message is found
-                found, reason, msg_idx = self._wait_for_file_message(timeout=300)
+                found, reason, msg_idx = self._wait_for_file_message(
+                    timeout=300,
+                    expected_filename=filename
+                )
                 self.logger.info(f"Result: {reason}, msg #{msg_idx}")
 
+                # If file not confirmed, return failure
+                if not found:
+                    self.logger.error(f"File not found in chat: {reason}")
+                    return (False, True)  # failure, but file may be deletable
+
                 self.logger.info("About + file sent successfully!")
-                return True
+                return (True, True)  # success, file_deletable
 
             except (ConnectionError, UploadError, PlaywrightTimeout) as e:
                 self.logger.error(f"{type(e).__name__}: {e}")
@@ -1398,7 +1490,7 @@ class BrowserMAX(LogMixin):
                     time.sleep(retry_delay)
                 else:
                     self.logger.error("Max retries exceeded")
-                    return False
+                    return (False, True)  # success=False, file may be deletable
             except Exception as e:
                 self.logger.error(f"Unexpected error: {e}", exc_info=True)
 
@@ -1407,9 +1499,9 @@ class BrowserMAX(LogMixin):
                     time.sleep(retry_delay)
                 else:
                     self.logger.error("Max retries exceeded")
-                    return False
+                    return (False, True)  # success=False, file may be deletable
 
-        return False
+        return (False, True)
 
     def close(self):
         """Close browser connection gracefully"""
