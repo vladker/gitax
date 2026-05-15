@@ -312,19 +312,37 @@ class BrowserMAX(LogMixin):
             self.logger.error(f"File chooser failed: {e}")
             return False
 
-    def _install_upload_observer(self) -> Optional[str]:
+    def _install_upload_observer(self, expected_filename: str | None = None, expected_size: int | None = None) -> Optional[str]:
         """
         Install MutationObserver to track file upload.
         Returns unique observer ID for tracking.
+
+        Args:
+            expected_filename: Filename to match (e.g., "repo-master.zip")
+            expected_size: File size in bytes to match for verification
         """
         self._check_connection()
         upload_id = f"gitax_{int(time.time() * 1000)}"
         window_key = "gitax_upload_done"
 
+        # Build size pattern for matching (e.g., "388.2 MB" or "388 MB")
+        size_pattern = ""
+        if expected_size:
+            if expected_size >= 1024 * 1024 * 1024:
+                size_str = f"{expected_size / 1024 / 1024 / 1024:.1f} GB"
+            elif expected_size >= 1024 * 1024:
+                size_str = f"{expected_size / 1024 / 1024:.2f} MB"
+            else:
+                size_str = f"{expected_size / 1024:.1f} KB"
+            size_pattern = size_str.replace(".", "\\.").replace(" ", "\\s*")
+
         script = f"""
             () => {{
                 const id = '{upload_id}';
                 const target = '{window_key}';
+                const searchName = '{expected_filename or ''}';
+                const sizePattern = '{size_pattern}';
+                const expectedSize = {expected_size or 0};
 
                 window[target] = null;
                 window[target + '_file'] = null;
@@ -336,25 +354,43 @@ class BrowserMAX(LogMixin):
                             for (const node of m.addedNodes) {{
                                 if (node.nodeType !== 1) continue;
 
-                                const hasFile = (
-                                    node.className && (
-                                        node.className.includes('file') ||
-                                        node.className.includes('attach') ||
-                                        node.className.includes('upload') ||
-                                        node.className.includes('preview') ||
-                                        node.className.includes('item')
-                                    )
-                                ) || (
-                                    node.textContent && (
-                                        node.textContent.includes('.zip') ||
-                                        node.textContent.includes('.tar') ||
-                                        node.textContent.includes('file')
-                                    )
-                                );
+                                const text = node.textContent || '';
+                                const className = node.className || '';
 
-                                if (hasFile && !window[target]) {{
+                                // Check if this looks like a file message
+                                const hasFileClass = /file|attach|upload|preview|item/i.test(className);
+                                const hasZip = /\\.zip/i.test(text);
+                                const hasDownload = /скачать|download/i.test(text);
+
+                                if (!hasFileClass && !hasZip && !hasDownload) continue;
+
+                                // If we have search name, check for filename match
+                                if (searchName) {{
+                                    // Normalize for comparison (remove -master, -main, extensions)
+                                    const normalizedSearch = searchName.toLowerCase()
+                                        .replace('.zip', '')
+                                        .replace('-master', '')
+                                        .replace('-main', '')
+                                        .replace('.git', '');
+
+                                    // Look for repo name pattern in text
+                                    const textLower = text.toLowerCase();
+                                    const hasRepoName = textLower.includes(normalizedSearch);
+
+                                    // If no repo name match, skip unless this is a "Скачать" button
+                                    if (!hasRepoName && !hasDownload) continue;
+                                }}
+
+                                // If we have size pattern, verify size matches
+                                if (sizePattern) {{
+                                    const sizeRegex = new RegExp(sizePattern, 'i');
+                                    if (!sizeRegex.test(text)) continue;
+                                }}
+
+                                // Match found!
+                                if (!window[target]) {{
                                     window[target] = Date.now();
-                                    window[target + '_file'] = node.textContent ? node.textContent.slice(0, 100) : 'unknown';
+                                    window[target + '_file'] = text.slice(0, 100);
                                     window[target + '_selector'] = id;
                                 }}
                             }}
@@ -503,7 +539,8 @@ class BrowserMAX(LogMixin):
             self.logger.debug(f"State change detection error: {e}")
             return False, "error"
 
-    def _wait_upload_complete(self, timeout: int = 3600, poll_interval: float = 1.0) -> bool:
+    def _wait_upload_complete(self, timeout: int = 3600, poll_interval: float = 1.0,
+                               expected_filename: str | None = None, expected_size: int | None = None) -> bool:
         """
         Wait for file upload to complete - uses PROGRESS-BASED detection.
         No fixed timeout - waits until upload is confirmed or user cancels.
@@ -511,11 +548,13 @@ class BrowserMAX(LogMixin):
         Args:
             timeout: Maximum seconds (default 1h, for huge files)
             poll_interval: How often to check (seconds)
+            expected_filename: Filename to match for upload confirmation
+            expected_size: File size in bytes to match
         """
         self._check_connection()
         self.logger.info(f"Monitoring upload progress...")
 
-        observer_id = self._install_upload_observer()
+        observer_id = self._install_upload_observer(expected_filename, expected_size)
         pre_state = self._capture_pre_upload_state()
         start = time.time()
         last_activity_time = start
@@ -1396,6 +1435,7 @@ class BrowserMAX(LogMixin):
 
         abs_path = os.path.abspath(filepath)
         file_size_mb = os.path.getsize(abs_path) / 1024 / 1024
+        file_size_bytes = os.path.getsize(abs_path)
         filename = os.path.basename(filepath)
 
         self.logger.info(f"Sending message with file: {filename} ({file_size_mb:.1f} MB)")
@@ -1460,7 +1500,7 @@ class BrowserMAX(LogMixin):
                     raise UploadError("Failed to upload file - both methods failed")
 
                 self.logger.debug("Waiting for upload...")
-                if not self._wait_upload_complete():
+                if not self._wait_upload_complete(expected_filename=filename, expected_size=file_size_bytes):
                     raise UploadError("Upload did not complete in time")
 
                 self.logger.debug("Sending file message...")

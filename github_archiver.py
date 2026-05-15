@@ -89,7 +89,9 @@ class GitHubArchiver:
         """Initialize MAX browser (reuses connection if alive)"""
         if self.max_browser is None:
             channel_url = self.config.get('max', {}).get('channel_url', '')
-            self.max_browser = BrowserMAX(channel_url)
+            # Default to local browser for large file support (>50MB)
+            use_local = self.config.get('archiver', {}).get('use_local_browser', True)
+            self.max_browser = BrowserMAX(channel_url, use_local_browser=use_local)
         return self.max_browser
 
     def _ensure_max_connected(self):
@@ -117,14 +119,25 @@ class GitHubArchiver:
             return desc[:max_len-3] + "..."
         return desc
 
-    def _build_message_text(self, repo_data: dict) -> str:
+    def _format_file_size(self, size_bytes: int) -> str:
+        """Форматировать размер файла"""
+        if size_bytes >= 1024 * 1024 * 1024:
+            return f"{size_bytes / 1024 / 1024 / 1024:.1f} GB"
+        elif size_bytes >= 1024 * 1024:
+            return f"{size_bytes / 1024 / 1024:.1f} MB"
+        elif size_bytes >= 1024:
+            return f"{size_bytes / 1024:.1f} KB"
+        return f"{size_bytes} B"
+
+    def _build_message_text(self, repo_data: dict, zip_size: int | None = None) -> str:
         """Построить текст сообщения для MAX"""
         desc = self._format_description(repo_data.get('description', ''))
+        size_str = f"\n📦 Размер: {self._format_file_size(zip_size)}" if zip_size else ""
 
         text = f"""📦 {repo_data.get('display_name', '')}
 
 📝 {desc}
-
+{size_str}
 🔖 Версия: {repo_data.get('version', 'unknown')} ({repo_data.get('version_type', 'unknown')})
 ⭐ Звёзды: {self._format_stars(repo_data.get('stars', 0))}
 🍴 Форки: {self._format_stars(repo_data.get('forks', 0))}
@@ -489,24 +502,81 @@ class GitHubArchiver:
             print("    ✗ Failed to download ZIP")
             return False
 
-        text = self._build_message_text(repo_data)
+        zip_size = os.path.getsize(zip_path)
+        text = self._build_message_text(repo_data, zip_size)
         print("    ✓ Text prepared")
 
         print("    → Sending to MAX...")
 
-        success = browser.send_message_with_file(
+        # Send message with file - returns (success, file_deletable)
+        # Note: send_message_with_file confirms file message appears in chat before returning
+        success, _ = browser.send_message_with_file(
             text=text,
             filepath=zip_path,
             retries=self.config.get('archiver', {}).get('retries', 3),
             retry_delay=self.config.get('archiver', {}).get('retry_delay', 10)
         )
 
-        try:
+        # If upload failed, log and move on
+        if not success:
+            print(f"    ⚠ Upload failed, skipping file cleanup")
+            repo_data['status'] = 'failed'
+            repo_data['version'] = repo_data.get('version', '') or 'unknown'
+            self.journal.add_repository(repo_data)
+            return False
+
+        # Combined monitoring: wait for file to be deletable (message already confirmed by send_message_with_file)
+        print(f"    ⏳ Waiting for file to be released...")
+        wait_count = 0
+        max_wait = 600  # Max 10 minutes
+
+        while wait_count < max_wait:
+            # Check: File deletable
+            file_deletable = True
             if os.path.exists(zip_path):
+                try:
+                    with open(zip_path, 'rb') as f:
+                        pass  # Read-only check is safer
+                except (PermissionError, OSError):
+                    file_deletable = False
+                except Exception:
+                    file_deletable = True  # Other errors, assume deletable
+
+            # Log progress every 15 seconds
+            if wait_count % 15 == 0 and wait_count > 0:
+                status = "file_deletable" if file_deletable else "file_locked"
+                print(f"    ⏳ Status: {status} ({wait_count}s)")
+
+            # File deletable - we're done!
+            if file_deletable:
+                print(f"    ✓ Upload complete and file released ({wait_count}s)")
+                break
+
+            wait_count += 1
+            time.sleep(1)
+
+        # Delete file if possible
+        removed = False
+        if os.path.exists(zip_path):
+            try:
                 os.remove(zip_path)
                 print("    ✓ Temp file removed")
-        except Exception as e:
-            print(f"    ⚠ Failed to remove file: {e}")
+                removed = True
+            except PermissionError:
+                print(f"    ⚠ File still locked after {wait_count}s, will retry next cycle")
+            except Exception as e:
+                print(f"    ⚠ Failed to remove file: {e}")
+
+        # If can't delete, move to backup
+        if not removed and os.path.exists(zip_path):
+            try:
+                import hashlib
+                lock_suffix = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
+                locked_path = zip_path + f".locked_{lock_suffix}"
+                os.rename(zip_path, locked_path)
+                print(f"    ✓ File moved to: {os.path.basename(locked_path)}")
+            except Exception as e2:
+                print(f"    ⚠ Could not move locked file: {e2}")
 
         repo_data['status'] = 'sent' if success else 'failed'
         repo_data['version'] = repo_data.get('version', '') or 'unknown'
