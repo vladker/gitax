@@ -10,11 +10,39 @@ import sys
 import yaml
 import time
 import shutil
+import atexit
+import signal
 from datetime import datetime
+from logging_config import setup_logging
 
 from journal import Journal
 from github_api import GitHubAPI
 from browser_max import BrowserMAX
+
+
+class GracefulShutdown:
+    """Context manager for graceful shutdown"""
+    def __init__(self, archiver):
+        self.archiver = archiver
+        self.interrupted = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.cleanup()
+
+    def cleanup(self):
+        """Clean up resources on shutdown"""
+        if self.interrupted:
+            return
+
+        self.interrupted = True
+        if self.archiver.max_browser:
+            try:
+                self.archiver.max_browser.close()
+            except Exception:
+                pass
 
 
 class GitHubArchiver:
@@ -229,21 +257,7 @@ class GitHubArchiver:
                         'status': 'sent'
                     })
                     updated_count += 1
-                    print(f"    ✓ {display_name} обновлён")
-
-                    print("\n    🔍 Мониторю ленту MAX (3h timeout)...")
-                    confirmed, reason = browser._watch_message_feed(timeout=10800)
-
-                    if confirmed:
-                        print("    ✓ Файл доставлен в ленту")
-                    elif reason == "cancelled":
-                        if browser:
-                            browser.close()
-                        print("\n  ⚠ Прервано пользователем")
-                        return
-                    else:
-                        self.journal.update_repository(full_name, {'status': 'failed'})
-                        print("    ✗ Timeout 3h — пропущен")
+                    print(f"    ✓ {display_name} обновлён и отправлен")
                 else:
                     self.journal.update_repository(full_name, {'status': 'failed'})
                     error_count += 1
@@ -356,20 +370,6 @@ class GitHubArchiver:
                 if success:
                     loaded_count += 1
                     print(f"\n  ✓ Загружено ({loaded_count}/{len(new_repos)})")
-
-                    print("  🔍 Мониторю ленту MAX (3h timeout)...")
-                    confirmed, reason = browser._watch_message_feed(timeout=10800)
-
-                    if confirmed:
-                        print("  ✓ Файл доставлен в ленту")
-                    elif reason == "cancelled":
-                        if browser:
-                            browser.close()
-                        print("\n  ⚠ Прервано пользователем")
-                        return
-                    else:
-                        self.journal.update_repository(full_name, {'status': 'failed'})
-                        print("  ✗ Timeout 3h — пропущен")
                 else:
                     error_count += 1
                     print(f"\n  ✗ Ошибка загрузки")
@@ -537,23 +537,39 @@ class GitHubArchiver:
 
 def main():
     """Точка входа"""
+    logger = setup_logging(log_file="archiver.log", level=10)
     config_path = "config.yaml"
 
-    # Проверить аргументы командной строки
     if len(sys.argv) > 1:
         config_path = sys.argv[1]
 
+    archiver = None
+    shutdown = None
+
+    def signal_handler(signum, frame):
+        logger.info("Received interrupt signal, shutting down gracefully...")
+        if shutdown:
+            shutdown.cleanup()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     try:
         archiver = GitHubArchiver(config_path)
-        archiver.run()
+        shutdown = GracefulShutdown(archiver)
+
+        with shutdown:
+            archiver.run()
     except KeyboardInterrupt:
-        print("\n\n  Программа прервана пользователем.")
+        logger.info("Program interrupted by user")
         sys.exit(0)
     except Exception as e:
-        print(f"\n\n  ✗ Критическая ошибка: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"Critical error: {e}", exc_info=True)
         sys.exit(1)
+    finally:
+        if shutdown:
+            shutdown.cleanup()
 
 
 if __name__ == "__main__":

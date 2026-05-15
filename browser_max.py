@@ -7,10 +7,31 @@ import os
 import time
 import sys
 from typing import Optional
-from playwright.sync_api import sync_playwright, Page, Browser
+from playwright.sync_api import sync_playwright, Page, Browser, TimeoutError as PlaywrightTimeout
+from logging_config import LogMixin, setup_logging
 
 
-class BrowserMAX:
+class BrowserMAXError(Exception):
+    """Base exception for BrowserMAX errors"""
+    pass
+
+
+class ConnectionError(BrowserMAXError):
+    """Failed to connect to Chrome"""
+    pass
+
+
+class UploadError(BrowserMAXError):
+    """Failed to upload file"""
+    pass
+
+
+class ElementNotFoundError(BrowserMAXError):
+    """Required element not found"""
+    pass
+
+
+class BrowserMAX(LogMixin):
     """MAX messenger automation using Playwright"""
 
     def __init__(self, channel_url: str):
@@ -18,57 +39,153 @@ class BrowserMAX:
         self.playwright = None
         self.browser: Optional[Browser] = None
         self.page: Optional[Page] = None
+        self._connected = False
 
     def connect(self) -> bool:
         """Connect to existing Chrome via CDP"""
-        print("  [OK] Connecting to Chrome (CDP port 9222)...")
+        self.logger.info("Connecting to Chrome (CDP port 9222)...")
 
         try:
             self.playwright = sync_playwright().start()
-            self.browser = self.playwright.chromium.connect_over_cdp("http://localhost:9222")
+
+            try:
+                self.browser = self.playwright.chromium.connect_over_cdp(
+                    "http://localhost:9222",
+                    timeout=30000
+                )
+            except Exception as e:
+                self.logger.error(f"CDP connection failed: {e}")
+                self.playwright.stop()
+                self.playwright = None
+                return False
 
             context = self.browser.contexts[0] if self.browser.contexts else self.browser.new_context()
             self.page = context.pages[0] if context.pages else context.new_page()
+            self._connected = True
 
-            print("  [OK] Connected")
+            self.logger.info("Connected successfully")
             return True
         except Exception as e:
-            print(f"  [ERROR] Connection failed: {e}")
+            self.logger.error(f"Connection failed: {e}", exc_info=True)
             return False
 
     def keep_alive_connect(self) -> bool:
         """Connect to Chrome and stay connected. Use this for multiple operations."""
         if self.browser and self.page:
-            print("  [OK] Already connected (reusing connection)")
+            self.logger.debug("Already connected (reusing connection)")
             return True
         return self.connect()
 
     def ensure_page_ready(self):
         """Ensure page is loaded and ready for interaction"""
         if not self.page:
-            raise Exception("Not connected. Call keep_alive_connect() first.")
+            raise ConnectionError("Not connected. Call keep_alive_connect() first.")
 
         try:
             self.page.wait_for_load_state("networkidle", timeout=15000)
-        except:
-            pass
+        except PlaywrightTimeout:
+            self.logger.warning("Page load timeout, continuing anyway")
+        except Exception as e:
+            self.logger.warning(f"Unexpected error waiting for page: {e}")
 
     def navigate(self):
         """Navigate to MAX channel"""
-        print(f"  [OK] Opening channel: {self.channel_url}")
-        self.page.goto(self.channel_url, wait_until="domcontentloaded", timeout=30000)
-        time.sleep(2)
+        self.logger.info(f"Opening channel: {self.channel_url}")
+
+        # Reconnect if needed
+        if not self._ensure_alive():
+            raise ConnectionError("Failed to connect to Chrome")
+
+        try:
+            self.page.goto(self.channel_url, wait_until="domcontentloaded", timeout=30000)
+            time.sleep(2)
+        except Exception as e:
+            self.logger.warning(f"Navigation error: {e}, reconnecting...")
+            self._connected = False
+            self.page = None
+            if not self._ensure_alive():
+                raise ConnectionError("Failed to reconnect to Chrome")
+            self.page.goto(self.channel_url, wait_until="domcontentloaded", timeout=30000)
+            time.sleep(2)
 
     def wait_page_ready(self, timeout: int = 30):
         """Wait for page to be ready"""
+        if not self._ensure_alive():
+            return
+
         try:
             self.page.wait_for_load_state("networkidle", timeout=timeout * 1000)
-        except:
-            pass
+        except PlaywrightTimeout:
+            self.logger.warning(f"Page ready timeout after {timeout}s")
+        except Exception as e:
+            self.logger.warning(f"Unexpected error: {e}")
+
+    def _check_connection(self):
+        """Verify page is available and alive"""
+        if not self.page:
+            raise ConnectionError("Not connected. Call connect() first.")
+        if self.page.is_closed():
+            self.logger.warning("Page was closed, reconnecting...")
+            self._connected = False
+            self.page = None
+            raise ConnectionError("Page was closed, need to reconnect")
+
+    def _ensure_alive(self) -> bool:
+        """
+        Ensure connection is alive. Reconnect if needed.
+
+        Returns:
+            True if connected, False otherwise
+        """
+        if not self.page:
+            return self.connect()
+
+        try:
+            if self.page.is_closed():
+                self.logger.warning("Page is closed, reconnecting...")
+                self._connected = False
+                self.page = None
+                return self.connect()
+            return True
+        except Exception:
+            return self.connect()
+
+    def _safe_evaluate(self, script: str, default=None):
+        """
+        Safely evaluate JavaScript, reconnecting if page was closed.
+
+        Args:
+            script: JavaScript to evaluate
+            default: Default value if evaluation fails
+
+        Returns:
+            Result of evaluation or default
+        """
+        if not self._ensure_alive():
+            return default
+
+        try:
+            return self.page.evaluate(script)
+        except Exception as e:
+            self.logger.debug(f"Safe evaluate error: {e}")
+            return default
+
+    def get_message_count(self) -> int:
+        """Get current message count in chat"""
+        self._check_connection()
+        try:
+            count = self.page.evaluate(
+                "() => document.querySelectorAll('[class*=\"message\"]').length"
+            )
+            return count or 0
+        except Exception as e:
+            self.logger.debug(f"Failed to get message count: {e}")
+            return 0
 
     def _click_upload_button(self):
         """Find and click upload/file button - handles dropdown menu"""
-        print("  [OK] Looking for upload button...")
+        self._check_connection()
+        self.logger.info("Looking for upload button...")
 
         for selector in ['[aria-label="Upload file"]', 'button:has-text("File")']:
             try:
@@ -76,16 +193,20 @@ class BrowserMAX:
                 if btn.is_visible(timeout=3000):
                     btn.scroll_into_view_if_needed()
                     btn.click(timeout=5000)
-                    print(f"  [OK] Button clicked: {selector}")
+                    self.logger.debug(f"Button clicked: {selector}")
                     time.sleep(0.5)
 
                     menu_btn = self.page.locator('button:has-text("File")').first
                     if menu_btn.is_visible(timeout=3000):
                         menu_btn.click()
-                        print("  [OK] File menu item clicked")
+                        self.logger.debug("File menu item clicked")
                         time.sleep(0.3)
                         return True
-            except:
+            except PlaywrightTimeout:
+                self.logger.debug(f"Selector not found: {selector}")
+                continue
+            except Exception as e:
+                self.logger.warning(f"Error with selector {selector}: {e}")
                 continue
 
         try:
@@ -95,107 +216,767 @@ class BrowserMAX:
 
             file_btn = self.page.get_by_text("File")
             file_btn.click(timeout=5000)
-            print("  [OK] Upload > File clicked")
+            self.logger.info("Upload > File clicked")
             return True
         except Exception as e:
-            print(f"  [WARN] Menu click failed: {e}")
+            self.logger.warning(f"Menu click failed: {e}")
 
         return False
 
+    def _validate_file(self, filepath: str) -> tuple[bool, str]:
+        """Validate file before upload"""
+        if not os.path.exists(filepath):
+            return False, f"File not found: {filepath}"
+
+        file_size = os.path.getsize(filepath)
+        if file_size == 0:
+            return False, "File is empty"
+
+        if file_size > 2 * 1024 * 1024 * 1024:
+            return False, f"File too large: {file_size / 1024 / 1024 / 1024:.1f} GB"
+
+        filename = os.path.basename(filepath)
+        self.logger.debug(f"File validated: {filename} ({file_size / 1024 / 1024:.1f} MB)")
+        return True, ""
+
     def _upload_file(self, filepath: str) -> bool:
         """Upload file using input[type=file]"""
-        abs_path = os.path.abspath(filepath)
-        file_size = os.path.getsize(filepath) / 1024 / 1024
+        valid, err = self._validate_file(filepath)
+        if not valid:
+            self.logger.error(f"File validation failed: {err}")
+            return False
 
-        print(f"  [OK] Selecting file: {os.path.basename(filepath)} ({file_size:.1f} MB)")
+        abs_path = os.path.abspath(filepath)
+        filename = os.path.basename(filepath)
+        file_size_mb = os.path.getsize(abs_path) / 1024 / 1024
+
+        self.logger.info(f"Selecting file: {filename} ({file_size_mb:.1f} MB)")
 
         for selector in ['input[type="file"]', 'input[type=file]']:
             try:
                 file_input = self.page.locator(selector).first
                 file_input.set_input_files(abs_path, timeout=60000)
-                print("  [OK] File selected")
+                self.logger.info("File selected")
                 return True
-            except:
+            except PlaywrightTimeout:
+                self.logger.debug(f"Selector timeout: {selector}")
+                continue
+            except Exception as e:
+                self.logger.warning(f"Error with selector {selector}: {e}")
                 continue
 
-        print("  [ERROR] Could not select file")
+        self.logger.error("Could not select file - no input found")
         return False
 
     def _upload_file_drag_drop(self, filepath: str) -> bool:
         """Upload file using file chooser"""
+        self._check_connection()
+        valid, err = self._validate_file(filepath)
+        if not valid:
+            self.logger.error(f"File validation failed: {err}")
+            return False
+
         abs_path = os.path.abspath(filepath)
-        file_size = os.path.getsize(filepath) / 1024 / 1024
-        print(f"  [OK] Selecting file: {os.path.basename(filepath)} ({file_size:.1f} MB)")
+        filename = os.path.basename(filepath)
+        file_size_mb = os.path.getsize(abs_path) / 1024 / 1024
+        self.logger.info(f"Selecting file: {filename} ({file_size_mb:.1f} MB)")
 
         try:
             with self.page.expect_file_chooser(timeout=60000) as fc_info:
-                print("  [OK] Waiting for file dialog...")
+                self.logger.info("Waiting for file dialog...")
 
             file_chooser = fc_info.value
             file_chooser.set_files(abs_path)
-            print("  [OK] File selected via dialog")
+            self.logger.info("File selected via dialog")
             return True
+        except PlaywrightTimeout:
+            self.logger.error("File chooser timeout")
+            return False
         except Exception as e:
-            print(f"  [ERROR] File chooser failed: {e}")
+            self.logger.error(f"File chooser failed: {e}")
             return False
 
-    def _wait_upload_complete(self, timeout: int = 120) -> bool:
-        """Wait for file upload to complete - checks for attached file in UI"""
-        print(f"  [OK] Waiting for upload (timeout: {timeout}s)...")
+    def _install_upload_observer(self) -> Optional[str]:
+        """
+        Install MutationObserver to track file upload.
+        Returns unique observer ID for tracking.
+        """
+        self._check_connection()
+        upload_id = f"gitax_{int(time.time() * 1000)}"
+        window_key = "gitax_upload_done"
 
-        start = time.time()
+        script = f"""
+            () => {{
+                const id = '{upload_id}';
+                const target = '{window_key}';
 
-        while time.time() - start < timeout:
-            time.sleep(1)
+                window[target] = null;
+                window[target + '_file'] = null;
+                window[target + '_selector'] = null;
 
-            try:
-                status = self.page.evaluate("""
-                    () => {
-                        // Check for attached file in message composer
-                        const attached = document.querySelector('[class*="attaches"], [class*="attached"], [class*="file-item"], [class*="preview"]');
-                        if (attached) {
-                            const text = attached.textContent || '';
-                            return 'attached:' + text.slice(0, 50);
-                        }
+                const observer = new MutationObserver((mutations) => {{
+                    for (const m of mutations) {{
+                        if (m.type === 'childList') {{
+                            for (const node of m.addedNodes) {{
+                                if (node.nodeType !== 1) continue;
 
-                        // Check if input has file selected
-                        const fileInput = document.querySelector('input[type="file"]');
-                        if (fileInput && fileInput.files && fileInput.files.length > 0) {
-                            const filename = fileInput.files[0]?.name || 'unknown';
-                            return 'selected:' + filename;
-                        }
+                                const hasFile = (
+                                    node.className && (
+                                        node.className.includes('file') ||
+                                        node.className.includes('attach') ||
+                                        node.className.includes('upload') ||
+                                        node.className.includes('preview') ||
+                                        node.className.includes('item')
+                                    )
+                                ) || (
+                                    node.textContent && (
+                                        node.textContent.includes('.zip') ||
+                                        node.textContent.includes('.tar') ||
+                                        node.textContent.includes('file')
+                                    )
+                                );
 
-                        return 'waiting';
-                    }
-                """)
+                                if (hasFile && !window[target]) {{
+                                    window[target] = Date.now();
+                                    window[target + '_file'] = node.textContent ? node.textContent.slice(0, 100) : 'unknown';
+                                    window[target + '_selector'] = id;
+                                }}
+                            }}
+                        }}
 
-                elapsed = int(time.time() - start)
+                        if (m.type === 'attributes' && m.attributeName === 'src') {{
+                            const src = m.target.src || '';
+                            if (src.includes('file') || src.includes('upload') || src.includes('attach')) {{
+                                if (!window[target]) {{
+                                    window[target] = Date.now();
+                                    window[target + '_file'] = src.split('/').pop() || 'unknown';
+                                    window[target + '_selector'] = id;
+                                }}
+                            }}
+                        }}
+                    }}
+                }});
 
-                if 'attached:' in status:
-                    filename = status.replace('attached:', '').strip()
-                    print(f"  [OK] File attached: {filename} ({elapsed}s)")
-                    return True
-                elif 'selected:' in status:
-                    print(f"  [OK] File selected, processing... ({elapsed}s)")
-                    time.sleep(1)
-                else:
-                    print(f"  [OK] Waiting... ({elapsed}s)")
-
-            except Exception as e:
-                print(f"  [DEBUG] Check error: {e}")
-
-        print("  [WARN] Upload timeout - checking if file was attached...")
-        time.sleep(1)
+                try {{
+                    observer.observe(document.body, {{ childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'class'] }});
+                    return id;
+                }} catch (e) {{
+                    return null;
+                }}
+            }}
+        """
 
         try:
-            attached = self.page.locator('[class*="attaches"]').first
-            if attached.is_visible(timeout=2000):
-                print("  [OK] File found in UI")
-                return True
-        except:
-            pass
+            result = self.page.evaluate(script)
+            if result:
+                self.logger.debug(f"Upload observer installed: {result}")
+                return result
+            return None
+        except Exception as e:
+            self.logger.warning(f"Failed to install observer: {e}")
+            return None
 
-        return True
+    def _check_upload_done(self) -> tuple[bool, Optional[str]]:
+        """
+        Check if upload was completed via observer.
+
+        Returns:
+            (done: bool, filename: Optional[str])
+        """
+        script = """
+            () => {
+                const target = 'gitax_upload_done';
+                if (window[target]) {
+                    return {
+                        done: true,
+                        time: window[target],
+                        file: window[target + '_file'] || 'unknown',
+                        id: window[target + '_selector'] || null
+                    };
+                }
+                return { done: false, time: null, file: null, id: null };
+            }
+        """
+
+        try:
+            result = self.page.evaluate(script)
+            if result and result.get('done'):
+                return True, result.get('file')
+            return False, None
+        except Exception as e:
+            self.logger.debug(f"Check upload status error: {e}")
+            return False, None
+
+    def _capture_pre_upload_state(self) -> Optional[dict]:
+        """
+        Capture DOM state before upload to detect changes.
+        """
+        self._check_connection()
+        script = """
+            () => {
+                const msgs = document.querySelectorAll('[class*="message"]');
+                const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1].innerHTML.slice(0, 500) : '';
+
+                const attachments = document.querySelectorAll('[class*="attach"], [class*="file"], [class*="preview"]');
+                const attachCount = attachments.length;
+
+                const composer = document.querySelector('[class*="composer"], [class*="input"], [role="textbox"]');
+                const composerHtml = composer ? composer.innerHTML.slice(0, 200) : '';
+
+                return {
+                    msgCount: msgs.length,
+                    lastMsg: lastMsg,
+                    attachCount: attachCount,
+                    composerHtml: composerHtml
+                };
+            }
+        """
+
+        try:
+            return self.page.evaluate(script)
+        except Exception as e:
+            self.logger.warning(f"Failed to capture state: {e}")
+            return None
+
+    def _detect_state_change(self, before: Optional[dict]) -> tuple[bool, str]:
+        """
+        Detect if DOM state changed (file uploaded).
+        """
+        if not before:
+            return False, "no_baseline"
+
+        script = """
+            () => {
+                const msgs = document.querySelectorAll('[class*="message"]');
+                const newMsgs = document.querySelectorAll('[class*="message"]');
+                const lastMsgNew = newMsgs.length > 0 ? (newMsgs[newMsgs.length - 1].textContent || '') : '';
+
+                return {
+                    msgCount: msgs.length,
+                    lastMsgNew: lastMsgNew.slice(0, 100)
+                };
+            }
+        """
+
+        try:
+            current = self.page.evaluate(script)
+
+            changed = False
+            reason = "none"
+
+            if current.get('attachCount', 0) > before.get('attachCount', 0):
+                changed = True
+                reason = "new_attachment"
+
+            composer_current = current.get('composerHtml', '') or ''
+            composer_before = before.get('composerHtml', '') or ''
+            if composer_current != composer_before:
+                if 'file' in composer_current.lower() or 'preview' in composer_current.lower():
+                    changed = True
+                    reason = "composer_changed_with_file"
+
+            if current.get('msgCount', 0) > before.get('msgCount', 0):
+                changed = True
+                reason = "new_message"
+
+            if changed:
+                return True, reason
+
+            return False, reason
+        except Exception as e:
+            self.logger.debug(f"State change detection error: {e}")
+            return False, "error"
+
+    def _wait_upload_complete(self, timeout: int = 3600, poll_interval: float = 1.0) -> bool:
+        """
+        Wait for file upload to complete - uses PROGRESS-BASED detection.
+        No fixed timeout - waits until upload is confirmed or user cancels.
+
+        Args:
+            timeout: Maximum seconds (default 1h, for huge files)
+            poll_interval: How often to check (seconds)
+        """
+        self._check_connection()
+        self.logger.info(f"Monitoring upload progress...")
+
+        observer_id = self._install_upload_observer()
+        pre_state = self._capture_pre_upload_state()
+        start = time.time()
+        last_activity_time = start
+        last_progress_log = start
+        consecutive_no_activity = 0
+        max_no_activity_cycles = 30  # ~30 seconds of no progress = done or stalled
+
+        print(f"  [OK] Waiting for upload to complete... (Ctrl+C to cancel)")
+
+        while time.time() - start < timeout:
+            elapsed = int(time.time() - start)
+
+            # Check for upload progress (progress bar, percentage, activity)
+            progress_info = self._check_upload_progress()
+            if progress_info:
+                pct = progress_info.get('percent', 0)
+                speed = progress_info.get('speed', '')
+                remaining = progress_info.get('remaining', '')
+
+                if pct > 0 and pct < 100:
+                    last_activity_time = time.time()
+                    consecutive_no_activity = 0
+
+                    # Log progress every 10 seconds
+                    if time.time() - last_progress_log >= 10:
+                        print(f"\r  [UPLOAD] {pct}% {speed} {remaining}", end="", flush=True)
+                        last_progress_log = time.time()
+
+                elif pct >= 100:
+                    print(f"\n  [OK] Upload reached 100%")
+                    last_activity_time = time.time()
+
+            # Check if file appeared in message feed (definitive confirmation)
+            done, filename = self._check_upload_done()
+            if done:
+                self.logger.info(f"Upload complete: {filename} ({elapsed}s)")
+                return True
+
+            # Check lenta for file message
+            if self._check_upload_in_lenta():
+                print(f"\n  [OK] File confirmed in feed ({elapsed}s)")
+                return True
+
+            # Check DOM for attached file
+            if self._check_dom_upload_ready():
+                print(f"\n  [OK] File attached in composer ({elapsed}s)")
+                return True
+
+            # Check for state changes
+            changed, reason = self._detect_state_change(pre_state)
+            if changed:
+                self.logger.info(f"DOM change detected: {reason} ({elapsed}s)")
+                last_activity_time = time.time()
+                consecutive_no_activity = 0
+
+            # Track activity - if no progress for a while, consider it done
+            time_since_activity = time.time() - last_activity_time
+
+            if time_since_activity > 30:
+                consecutive_no_activity += 1
+
+                # After ~30-60 seconds of no activity, assume upload is done
+                if consecutive_no_activity >= 2:
+                    # Final verification
+                    if self._check_upload_in_lenta() or self._check_dom_upload_ready() or done:
+                        print(f"\n  [OK] Upload finished (no activity for {int(time_since_activity)}s)")
+                        return True
+
+                    # Still nothing after extended wait
+                    if consecutive_no_activity >= 4:  # ~60 seconds
+                        print(f"\n  [WARN] No upload activity for {int(time_since_activity)}s")
+                        # Try one more thorough check
+                        if not self._check_upload_in_lenta():
+                            print(f"  [INFO] Continuing to monitor...")
+
+            # Show elapsed time every 30s if no progress
+            if time.time() - last_progress_log >= 30 and elapsed > 30:
+                print(f"\r  [MONITOR] Elapsed: {elapsed}s | No progress for: {int(time_since_activity)}s", end="", flush=True)
+                last_progress_log = time.time()
+
+            time.sleep(poll_interval)
+
+        # Timeout - do final checks
+        print(f"\n  [WARN] Upload monitoring timeout ({timeout}s) - final check...")
+        time.sleep(2)
+
+        done, filename = self._check_upload_done()
+        if done:
+            self.logger.info(f"Upload complete at timeout: {filename}")
+            return True
+
+        if self._check_upload_in_lenta():
+            self.logger.info("Upload confirmed in lenta at timeout")
+            return True
+
+        if self._check_dom_upload_ready():
+            self.logger.info("Upload confirmed in composer at timeout")
+            return True
+
+        self.logger.error("Upload not confirmed - file may not have been uploaded")
+        return False
+
+    def _check_upload_progress(self) -> Optional[dict]:
+        """
+        Check for upload progress indicators in DOM.
+
+        Returns:
+            dict with keys: percent (int), speed (str), remaining (str) or None
+        """
+        script = """
+            () => {
+                // Look for various upload progress indicators
+                const selectors = [
+                    // Progress bar elements
+                    '[class*="progress"] [class*="bar"]',
+                    '[class*="upload"] [class*="progress"]',
+                    '[role="progressbar"]',
+                    '[class*="percent"]',
+                    // Loading/spinner while uploading
+                    '[class*="uploading"]',
+                    '[class*="loading"]',
+                    '[class*="transferring"]',
+                    // Text indicators
+                    '*[class*="upload"]',
+                    '*[class*="progress"]'
+                ];
+
+                for (const sel of selectors) {
+                    const els = document.querySelectorAll(sel);
+                    for (const el of els) {
+                        const text = el.textContent || '';
+                        const style = el.getAttribute('style') || '';
+                        const width = style.includes('width:') ? style.match(/width:\\s*([\\d.]+)%/) : null;
+                        const aria = el.getAttribute('aria-valuenow') || '';
+
+                        // Check for percentage patterns
+                        const percentMatch = text.match(/(\\d+)%/) || aria.match(/(\\d+)/);
+                        if (percentMatch) {
+                            return {
+                                percent: parseInt(percentMatch[1]),
+                                text: text.slice(0, 50),
+                                type: 'progress'
+                            };
+                        }
+
+                        // Check for width style
+                        if (width) {
+                            return {
+                                percent: parseFloat(width[1]),
+                                text: text.slice(0, 50),
+                                type: 'width'
+                            };
+                        }
+                    }
+                }
+
+                // Check for network activity indicator (spinner, loading)
+                const bodyClass = document.body.className || '';
+                if (bodyClass.includes('uploading') || bodyClass.includes('loading')) {
+                    return { percent: -1, text: 'uploading', type: 'class' };
+                }
+
+                // Check for any visible spinner
+                const spinners = document.querySelectorAll('[class*="spinner"], [class*="loader"], [class*="activity"]');
+                for (const sp of spinners) {
+                    if (sp.offsetHeight > 0 && sp.offsetParent !== null) {
+                        return { percent: -1, text: 'activity', type: 'spinner' };
+                    }
+                }
+
+                return null;
+            }
+        """
+
+        try:
+            result = self.page.evaluate(script)
+            return result if result else None
+        except Exception as e:
+            self.logger.debug(f"Progress check error: {e}")
+            return None
+
+    def _check_dom_upload_ready(self) -> bool:
+        """
+        Final DOM check for attached file in composer.
+        NOTE: Does NOT check input[type=file] - that only means file is selected, not uploaded.
+        """
+        script = """
+            () => {
+                // Only check for visible file indicators in composer
+                const composer = document.querySelector('[class*="composer"], [role="textbox"], [contenteditable]');
+                if (!composer) return false;
+
+                // Check for file preview/attachment elements within composer
+                const fileIndicators = composer.querySelectorAll(
+                    '[class*="preview"], [class*="file-item"], [class*="attach"], [class*="upload"], [data-file]'
+                );
+
+                for (const el of fileIndicators) {
+                    if (el.offsetHeight > 0) {
+                        const text = el.textContent || '';
+                        if (text.includes('.zip') || text.includes('.tar') || text.includes('MB') || text.includes('KB')) {
+                            return true;
+                        }
+                    }
+                }
+
+                // Alternative: check if composer has changed to include file class
+                const composerClasses = composer.className || '';
+                if (composerClasses.includes('with-file') || composerClasses.includes('has-file') || composerClasses.includes('file-attached')) {
+                    return true;
+                }
+
+                return false;
+            }
+        """
+
+        try:
+            result = self.page.evaluate(script)
+            return result is True
+        except Exception as e:
+            self.logger.debug(f"DOM composer check error: {e}")
+            return False
+
+    def _check_upload_in_lenta(self) -> bool:
+        """
+        Check if file appears in message feed (not in composer).
+        This is the definitive check that file was actually uploaded.
+        """
+        script = """
+            () => {
+                // Get ALL messages with their full details
+                const msgs = document.querySelectorAll('[class*="message"]');
+                const results = [];
+
+                for (const msg of msgs) {
+                    const text = msg.textContent || '';
+                    const html = msg.innerHTML || '';
+                    const hasFile = msg.querySelector('[class*="file"], [class*="attach"]') !== null;
+                    const hasDownload = msg.querySelector('a[download], [download]') !== null;
+                    const hasSvg = msg.querySelector('svg') !== null;
+                    const hrefs = Array.from(msg.querySelectorAll('a')).map(a => a.href || '');
+
+                    results.push({
+                        text: text.slice(0, 150),
+                        hasFile: hasFile,
+                        hasDownload: hasDownload,
+                        hasSvg: hasSvg,
+                        hrefs: hrefs.slice(0, 5)
+                    });
+                }
+
+                // Check if any message has file indicators
+                for (const r of results) {
+                    const hasArchive = /\\.(zip|tar|gz|rar|7z|zip\\.\\w+)/i.test(r.text) ||
+                                     /\\.(zip|tar|gz|rar|7z|zip\\.\\w+)/i.test(r.html || '');
+                    const hasFile = r.hasFile || r.hasDownload;
+                    const hasHrefArchive = r.hrefs.some(h => /\\.(zip|tar|gz|archive)/i.test(h));
+
+                    if (hasFile || hasArchive || hasHrefArchive) {
+                        return { found: true, text: r.text.slice(0, 100) };
+                    }
+                }
+
+                // Debug: return last 3 messages for troubleshooting
+                return { found: false, lastMessages: results.slice(-3).map(r => r.text.slice(0, 80)) };
+            }
+        """
+
+        try:
+            result = self.page.evaluate(script)
+            if result and result.get('found'):
+                self.logger.info(f"File found in lenta: {result.get('text', 'unknown')}")
+                return True
+            elif result:
+                self.logger.debug(f"Lenta check: no file, last msgs: {result.get('lastMessages', [])}")
+            return False
+        except Exception as e:
+            self.logger.debug(f"Lenta check error: {e}")
+            return False
+
+    def _wait_for_file_message(self, timeout: int = 300,
+                                expected_msg_index: Optional[int] = None) -> tuple[bool, str, int]:
+        """
+        Monitor chat online until file message is found.
+        No hard timeout - exits when file is confirmed or error occurs.
+
+        Args:
+            timeout: Max time to wait (default 5 min as safety fallback)
+            expected_msg_index: Expected message index (0 = any new)
+
+        Returns:
+            (found: bool, reason: str, found_msg_index: int)
+            reason = "found" | "timeout" | "disconnected" | "no_activity"
+            found_msg_index: 0 if not found, otherwise message index
+        """
+        start = time.time()
+        base_count = 0
+        last_activity_time = start
+
+        print(f"  [MONITOR] Starting live monitoring...")
+
+        try:
+            if not self._ensure_alive():
+                return (False, "not_connected", 0)
+
+            base_count = self.page.evaluate(
+                "() => document.querySelectorAll('[class*=\"message\"]').length"
+            ) or 0
+
+            init_result = self.page.evaluate("""
+                () => {
+                    const msgs = document.querySelectorAll('[class*="message"]');
+                    const last = msgs[msgs.length - 1];
+                    return last ? last.textContent?.slice(0, 200) || '' : '';
+                }
+            """) or ""
+            print(f"  [MONITOR] Initial: {base_count} msgs, last: {init_result[:50]}...")
+
+            # IMMEDIATELY check if file message already exists (from upload)
+            for idx in range(max(0, base_count - 10), base_count + 1):
+                msg_result = self.page.evaluate(f"""
+                    () => {{
+                        const msgs = document.querySelectorAll('[class*="message"]');
+                        const msg = msgs[{idx}];
+                        if (!msg) return null;
+
+                        const text = msg.textContent || '';
+                        const html = msg.innerHTML || '';
+                        const classes = msg.className || '';
+
+                        const hasFileClass = /file|attach|download|archive|preview/i.test(classes);
+                        const hasZip = /\\.zip/i.test(text) || /\\.zip/i.test(html);
+                        const hasDownload = msg.querySelector('[download]') !== null ||
+                                            msg.querySelector('a[href*="download"]') !== null;
+                        const hasSvg = msg.querySelector('svg') !== null;
+
+                        return {{
+                            text: text.slice(0, 150),
+                            hasFileClass,
+                            hasZip,
+                            hasDownload,
+                            hasSvg,
+                            classes: classes.slice(0, 80)
+                        }};
+                    }}
+                """) or {}
+
+                is_file = (msg_result.get('hasFileClass') or
+                          msg_result.get('hasZip') or
+                          msg_result.get('hasDownload'))
+
+                if is_file:
+                    print(f"  [OK] FILE ALREADY EXISTS! Message #{idx + 1}")
+                    print(f"       {msg_result.get('text', '')[:100]}...")
+                    return (True, "found", idx + 1)
+
+            last_activity_time = time.time()
+        except Exception as e:
+            print(f"  [ERROR] Failed to initialize: {e}")
+            return (False, "init_failed", 0)
+
+        no_change_count = 0
+        check_interval = 0.5  # Check every 0.5 seconds
+        checked_initial = False
+
+        while True:
+            elapsed = int(time.time() - start)
+            timeout_reached = elapsed >= timeout
+
+            try:
+                # Ensure connection alive
+                if not self._ensure_alive():
+                    print(f"  [WARN] Connection lost after {elapsed}s")
+                    return (False, "disconnected", 0)
+
+                # Get current state
+                current_count = self.page.evaluate(
+                    "() => document.querySelectorAll('[class*=\"message\"]').length"
+                ) or 0
+
+                if current_count > base_count:
+                    # New message(s) appeared!
+                    print(f"  [UPDATE] New messages: {base_count} -> {current_count}")
+                    last_activity_time = time.time()
+                    no_change_count = 0
+
+                    # Check new messages for file
+                    for idx in range(base_count, current_count):
+                        msg_result = self.page.evaluate(f"""
+                            () => {{
+                                const msgs = document.querySelectorAll('[class*="message"]');
+                                const msg = msgs[{idx}];
+                                if (!msg) return null;
+
+                                const text = msg.textContent || '';
+                                const html = msg.innerHTML || '';
+                                const classes = msg.className || '';
+
+                                const hasFileClass = /file|attach|download|archive|preview/i.test(classes);
+                                const hasZip = /\\.zip/i.test(text) || /\\.zip/i.test(html);
+                                const hasDownload = msg.querySelector('[download]') !== null ||
+                                                    msg.querySelector('a[href*="download"]') !== null;
+                                const hasSvg = msg.querySelector('svg') !== null;
+
+                                return {{
+                                    text: text.slice(0, 150),
+                                    hasFileClass,
+                                    hasZip,
+                                    hasDownload,
+                                    hasSvg,
+                                    classes: classes.slice(0, 80)
+                                }};
+                            }}
+                        """) or {}
+
+                        is_file = (msg_result.get('hasFileClass') or
+                                  msg_result.get('hasZip') or
+                                  msg_result.get('hasDownload'))
+
+                        if is_file:
+                            print(f"  [OK] FILE FOUND! Message #{idx + 1}")
+                            print(f"       {msg_result.get('text', '')[:100]}...")
+                            return (True, "found", idx + 1)
+
+                        print(f"  [INFO] Msg #{idx + 1}: {msg_result.get('text', '')[:60]}...")
+
+                    base_count = current_count
+
+                # Check for timeout
+                if timeout_reached:
+                    # Final check - scan last 20 messages for any file
+                    final_count = self.page.evaluate(
+                        "() => document.querySelectorAll('[class*=\"message\"]').length"
+                    ) or 0
+                    print(f"  [WARN] Timeout after {elapsed}s. Checking last 20 msgs...")
+
+                    for idx in range(max(0, final_count - 20), final_count):
+                        msg_result = self.page.evaluate(f"""
+                            () => {{
+                                const msgs = document.querySelectorAll('[class*="message"]');
+                                const msg = msgs[{idx}];
+                                if (!msg) return null;
+                                const text = msg.textContent || '';
+                                const html = msg.innerHTML || '';
+                                const classes = msg.className || '';
+                                const hasFileClass = /file|attach|download|archive|preview/i.test(classes);
+                                const hasZip = /\\.zip/i.test(text) || /\\.zip/i.test(html);
+                                const hasDownload = msg.querySelector('[download]') !== null;
+                                return {{
+                                    text: text.slice(0, 150),
+                                    hasFileClass,
+                                    hasZip,
+                                    hasDownload
+                                }};
+                            }}
+                        """) or {}
+
+                        if msg_result.get('hasFileClass') or msg_result.get('hasZip') or msg_result.get('hasDownload'):
+                            print(f"  [OK] File found at timeout! Msg #{idx + 1}")
+                            return (True, "found", idx + 1)
+
+                    print(f"  [WARN] No file found. Messages: {base_count} -> {final_count}")
+                    return (False, "timeout", 0)
+
+                # Periodic status
+                if elapsed > 0 and elapsed % 30 == 0:
+                    curr = self.page.evaluate(
+                        "() => document.querySelectorAll('[class*=\"message\"]').length"
+                    ) or 0
+                    print(f"  [MONITOR] {elapsed}s | {curr} msgs | no activity: {int(time.time() - last_activity_time)}s")
+
+                no_change_count += 1
+                time.sleep(check_interval)
+
+            except Exception as e:
+                print(f"  [ERROR] Monitor error: {e}")
+                time.sleep(check_interval)
 
     def _watch_message_feed(self, timeout: int = 10800, progress: bool = True) -> tuple[bool, str]:
         """
@@ -209,25 +990,34 @@ class BrowserMAX:
             (confirmed: bool, reason: str)
             reason = "confirmed" | "timeout" | "cancelled"
         """
+        self._check_connection()
         hours = timeout // 3600
         mins = (timeout % 3600) // 60
         secs = timeout % 60
         time_str = f"{hours}:{mins:02d}:{secs:02d}" if hours > 0 else f"{mins}:{secs:02d}"
 
-        print(f"\n  [OK] Watching feed for file confirmation")
-        print(f"       Timeout: {time_str} | Press Q to cancel")
+        self.logger.info(f"Watching feed for file confirmation (timeout: {time_str})")
 
         start = time.time()
         last_progress_time = start
         cancel_requested = False
 
         initial_count = 0
+        initial_last_msg = ""
         try:
             initial_count = self.page.evaluate("""
                 () => document.querySelectorAll('[class*="message"]').length
             """) or 0
-        except:
-            pass
+            initial_last_msg = self.page.evaluate("""
+                () => {
+                    const msgs = document.querySelectorAll('[class*="message"]');
+                    return msgs[msgs.length - 1]?.textContent?.slice(0, 200) || '';
+                }
+            """) or ""
+        except Exception as e:
+            self.logger.warning(f"Failed to get initial state: {e}")
+
+        self.logger.debug(f"Initial: count={initial_count}, last_msg={initial_last_msg[:50]}")
 
         while time.time() - start < timeout:
             remaining = int(timeout - (time.time() - start))
@@ -269,11 +1059,11 @@ class BrowserMAX:
                         if key.lower() == 'q':
                             cancel_requested = True
 
-            except:
-                pass
+            except Exception as e:
+                self.logger.debug(f"Keyboard check error: {e}")
 
             if cancel_requested:
-                print(f"\n\n  [WARN] Cancelled by user")
+                self.logger.info("Cancelled by user")
                 return (False, "cancelled")
 
             time.sleep(2)
@@ -292,32 +1082,64 @@ class BrowserMAX:
 
                             const text = last.textContent || '';
                             const html = last.innerHTML || '';
-                            const hasFile = last.querySelector('[class*="file"], [class*="attach"], [class*="download"], [class*="archive"]') !== null;
+                            
+                            // Check for various file indicators
+                            const hasFileClass = last.querySelector(
+                                '[class*="file"], [class*="attach"], [class*="download"], [class*="archive"]'
+                            ) !== null;
+                            
+                            // Check for SVG/file icons
+                            const hasSvgIcon = last.querySelector('svg') !== null;
+                            
+                            // Check for download button/link
+                            const hasDownloadLink = last.querySelector('a[href*="download"], [download]') !== null;
+                            
+                            // Check for file size patterns (common in file messages)
+                            const hasFileSize = /\\d+\\.?\\d*\\s*(MB|GB|KB|mb|gb|kb)/i.test(text);
+                            
+                            // Check for archive extensions
+                            const hasArchive = /\\.(zip|tar|gz|rar|7z|tgz|zip\\.\\w+)/i.test(text) ||
+                                              /\\.(zip|tar|gz|rar|7z|tgz|zip\\.\\w+)/i.test(html);
+                            
+                            // Check for specific file message patterns
+                            const isFileMessage = (
+                                hasFileClass ||
+                                hasDownloadLink ||
+                                hasFileSize ||
+                                hasArchive
+                            );
 
                             return {
-                                text: text.slice(0, 100),
-                                hasFile: hasFile,
-                                hasZip: text.includes('.zip') || html.includes('.zip')
+                                text: text.slice(0, 200),
+                                html: html.slice(0, 500),
+                                hasFile: isFileMessage,
+                                hasFileClass: hasFileClass,
+                                hasArchive: hasArchive,
+                                hasFileSize: hasFileSize
                             };
                         }
                     """) or {}
 
                     if last_msg:
-                        has_file = last_msg.get('hasFile', False) or last_msg.get('hasZip', False)
+                        has_file = last_msg.get('hasFile', False)
+                        self.logger.debug(f"New message detected: hasFile={has_file}, text={last_msg.get('text', '')[:50]}")
+
                         if has_file:
                             elapsed = int(time.time() - start)
-                            print(f"\n\n  [OK] File confirmed in feed! ({elapsed}s)")
+                            self.logger.info(f"File confirmed in feed! ({elapsed}s)")
+                            self.logger.debug(f"Message details: {last_msg.get('text', '')[:100]}")
                             return (True, "confirmed")
 
             except Exception as e:
-                pass
+                self.logger.debug(f"Feed check error: {e}")
 
-        print(f"\n\n  [WARN] File confirmation timeout ({timeout}s)")
+        self.logger.warning(f"File confirmation timeout ({timeout}s)")
         return (False, "timeout")
 
     def _find_message_input(self):
         """Find message input field"""
-        print("  [OK] Looking for message input...")
+        self._check_connection()
+        self.logger.debug("Looking for message input...")
 
         selectors = [
             '[contenteditable="true"]',
@@ -329,17 +1151,19 @@ class BrowserMAX:
             try:
                 inp = self.page.locator(selector).first
                 if inp.is_visible(timeout=3000):
-                    print(f"  [OK] Input found: {selector}")
+                    self.logger.debug(f"Input found: {selector}")
                     return inp
-            except:
+            except Exception as e:
+                self.logger.debug(f"Selector failed: {selector} ({e})")
                 continue
 
-        print("  [WARN] Message input not found")
+        self.logger.warning("Message input not found")
         return None
 
     def _click_composer_area(self):
         """Click on message composer area to ensure focus"""
-        print("  [OK] Clicking composer area...")
+        self._check_connection()
+        self.logger.debug("Clicking composer area...")
 
         selectors = [
             '[contenteditable="true"]',
@@ -355,16 +1179,17 @@ class BrowserMAX:
                 if elem.is_visible(timeout=2000):
                     elem.click()
                     self.page.wait_for_timeout(200)
-                    print(f"  [OK] Clicked on: {selector}")
+                    self.logger.debug(f"Clicked on: {selector}")
                     return True
-            except:
+            except Exception as e:
+                self.logger.debug(f"Selector failed: {selector} ({e})")
                 continue
 
         return False
 
     def _type_message(self, text: str, input_elem):
         """Type message into input field using clipboard paste"""
-        print("  [OK] Typing message...")
+        self.logger.debug("Typing message...")
 
         try:
             import pyperclip
@@ -381,29 +1206,34 @@ class BrowserMAX:
             self.page.wait_for_timeout(50)
             self.page.keyboard.press("Control+V")
 
-            print("  [OK] Message typed")
+            self.logger.debug("Message typed via clipboard")
             return True
+        except ImportError:
+            self.logger.error("pyperclip not installed")
+            return False
         except Exception as e:
-            print(f"  [ERROR] Type failed: {e}")
+            self.logger.error(f"Type failed: {e}")
             return False
 
     def _send_message(self):
         """Send message (press Enter)"""
-        print("  [OK] Sending message...")
+        self.logger.debug("Sending message...")
 
         try:
             self._click_composer_area()
             self.page.wait_for_timeout(100)
 
             self.page.keyboard.press("Enter")
-            print("  [OK] Message sent (Enter)")
+            self.logger.debug("Message sent (Enter)")
             return True
-        except:
+        except Exception as e:
+            self.logger.error(f"Send failed: {e}")
             return False
 
     def _wait_confirmation(self, timeout: int = 30) -> bool:
         """Wait for message to appear in chat - checks for new file attachment message"""
-        print(f"  [OK] Waiting for confirmation...")
+        self._check_connection()
+        self.logger.debug(f"Waiting for confirmation (timeout: {timeout}s)...")
 
         start = time.time()
 
@@ -414,7 +1244,8 @@ class BrowserMAX:
                     return msgs.length;
                 }
             """) or 0
-        except:
+        except Exception as e:
+            self.logger.warning(f"Failed to get initial count: {e}")
             before_msgs = 0
 
         while time.time() - start < timeout:
@@ -442,10 +1273,10 @@ class BrowserMAX:
                     """) or {}
 
                     if last_msg.get('hasFile') or 'test' in last_msg.get('text', '').lower():
-                        print("  [OK] Message with file appeared!")
+                        self.logger.info("Message with file appeared!")
                         return True
 
-                    print(f"  [OK] New message: {last_msg.get('text', '')[:50]}")
+                    self.logger.debug(f"New message: {last_msg.get('text', '')[:50]}")
 
                 last_msg_text = self.page.evaluate("""
                     () => {
@@ -456,13 +1287,13 @@ class BrowserMAX:
 
                 if last_msg_text and last_msg_text != "Канал создан" and last_msg_text:
                     if "attached" in last_msg_text.lower() or ".zip" in last_msg_text.lower() or ".txt" in last_msg_text.lower():
-                        print(f"  [OK] File message: {last_msg_text[:40]}...")
+                        self.logger.info(f"File message: {last_msg_text[:40]}...")
                         return True
 
             except Exception as e:
-                print(f"  [DEBUG] Check error: {e}")
+                self.logger.debug(f"Check error: {e}")
 
-        print("  [WARN] No confirmation - continuing anyway")
+        self.logger.warning("No confirmation - continuing anyway")
         return True
 
     def send_message_with_file(self, text: str, filepath: str,
@@ -474,89 +1305,128 @@ class BrowserMAX:
         Args:
             keep_alive: If True, don't close connection after sending
         """
-        if not os.path.exists(filepath):
-            print(f"  [ERROR] File not found: {filepath}")
+        valid, err = self._validate_file(filepath)
+        if not valid:
+            self.logger.error(f"File not found or invalid: {err}")
             return False
 
-        file_size = os.path.getsize(filepath) / 1024 / 1024
-        print(f"  [OK] File: {os.path.basename(filepath)} ({file_size:.1f} MB)")
+        abs_path = os.path.abspath(filepath)
+        file_size_mb = os.path.getsize(abs_path) / 1024 / 1024
+        filename = os.path.basename(filepath)
+
+        self.logger.info(f"Sending message with file: {filename} ({file_size_mb:.1f} MB)")
 
         for attempt in range(1, retries + 1):
             try:
-                print(f"\n  === Attempt {attempt}/{retries} ===")
+                self.logger.info(f"Attempt {attempt}/{retries}")
 
                 if not self.page:
-                    print("  [1] Connecting to MAX...")
+                    self.logger.info("Connecting to MAX...")
                     if not self.connect():
-                        raise Exception("Failed to connect to Chrome")
+                        raise ConnectionError("Failed to connect to Chrome")
 
-                print("  [2] Opening channel...")
+                self.logger.debug("Opening channel...")
                 self.navigate()
                 self.wait_page_ready()
 
-                print("  [3] Typing message (about)...")
+                self.logger.debug("Typing message...")
                 input_elem = self._find_message_input()
                 if input_elem:
                     self._type_message(text, input_elem)
 
-                print("  [4] Sending about message...")
+                self.logger.debug("Sending about message...")
                 self._send_message()
-                time.sleep(2)
+                time.sleep(1)
 
-                print("  [5] Opening upload dialog...")
+                self.logger.debug("Opening upload dialog...")
                 time.sleep(0.3)
 
-                print("  [6] Uploading file...")
-                abs_path = os.path.abspath(filepath)
+                self.logger.info("Uploading file...")
+                upload_timeout = max(60000, int(file_size_mb * 5000))
+                self.logger.debug(f"Upload timeout: {upload_timeout//1000}s")
 
+                uploaded = False
                 try:
-                    with self.page.expect_file_chooser(timeout=60000) as fc_info:
+                    with self.page.expect_file_chooser(timeout=upload_timeout) as fc_info:
                         self._click_upload_button()
 
-                    fc_info.value.set_files(abs_path)
-                    print(f"  [OK] File selected: {os.path.basename(filepath)}")
+                    fc_info.value.set_files(abs_path, timeout=upload_timeout)
+                    self.logger.info(f"File selected: {filename}")
+                    uploaded = True
+                except PlaywrightTimeout:
+                    self.logger.warning("File chooser timeout, trying input method...")
+                    try:
+                        file_input = self.page.locator('input[type="file"]').first
+                        file_input.set_input_files(abs_path, timeout=upload_timeout)
+                        self.logger.info("File uploaded via input")
+                        uploaded = True
+                    except Exception as e2:
+                        self.logger.error(f"Input method also failed: {e2}")
                 except Exception as e:
-                    print(f"  [ERROR] {e}")
-                    raise Exception("Failed to upload file")
+                    self.logger.warning(f"File chooser failed: {e}")
+                    try:
+                        file_input = self.page.locator('input[type="file"]').first
+                        file_input.set_input_files(abs_path, timeout=upload_timeout)
+                        self.logger.info("File uploaded via input")
+                        uploaded = True
+                    except Exception as e2:
+                        self.logger.error(f"Input method also failed: {e2}")
 
-                print("  [7] Waiting for upload...")
-                self._wait_upload_complete()
+                if not uploaded:
+                    raise UploadError("Failed to upload file - both methods failed")
 
-                print("  [8] Sending file message...")
+                self.logger.debug("Waiting for upload...")
+                if not self._wait_upload_complete():
+                    raise UploadError("Upload did not complete in time")
+
+                self.logger.debug("Sending file message...")
                 self._send_message()
 
-                print("  [9] Waiting for confirmation...")
-                self._wait_confirmation()
+                self.logger.debug("Waiting for file message confirmation...")
+                # Monitor online until file message is found
+                found, reason, msg_idx = self._wait_for_file_message(timeout=300)
+                self.logger.info(f"Result: {reason}, msg #{msg_idx}")
 
-                print("\n  [OK] About + file sent!")
+                self.logger.info("About + file sent successfully!")
                 return True
 
-            except Exception as e:
-                print(f"  [ERROR] {e}")
+            except (ConnectionError, UploadError, PlaywrightTimeout) as e:
+                self.logger.error(f"{type(e).__name__}: {e}")
 
                 if attempt < retries:
-                    print(f"  [OK] Retrying in {retry_delay}s...")
+                    self.logger.info(f"Retrying in {retry_delay}s...")
                     time.sleep(retry_delay)
                 else:
-                    print("  [ERROR] Max retries exceeded")
+                    self.logger.error("Max retries exceeded")
+                    return False
+            except Exception as e:
+                self.logger.error(f"Unexpected error: {e}", exc_info=True)
+
+                if attempt < retries:
+                    self.logger.info(f"Retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                else:
+                    self.logger.error("Max retries exceeded")
                     return False
 
         return False
 
     def close(self):
-        """Close browser connection"""
-        print("  [OK] Closing connection...")
+        """Close browser connection gracefully"""
+        self.logger.debug("Closing connection...")
         try:
             if self.browser:
                 self.browser.close()
             if self.playwright:
                 self.playwright.stop()
-        except:
-            pass
-        self.playwright = None
-        self.browser = None
-        self.page = None
-        print("  [OK] Connection closed")
+        except Exception as e:
+            self.logger.warning(f"Error during cleanup: {e}")
+        finally:
+            self._connected = False
+            self.playwright = None
+            self.browser = None
+            self.page = None
+        self.logger.debug("Connection closed")
 
 
 if __name__ == "__main__":

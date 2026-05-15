@@ -8,9 +8,25 @@ import time
 from datetime import datetime
 from typing import Optional
 from pathlib import Path
+from logging_config import LogMixin, setup_logging
 
 
-class GitHubAPI:
+class GitHubAPIError(Exception):
+    """Base exception for GitHub API errors"""
+    pass
+
+
+class RateLimitError(GitHubAPIError):
+    """Rate limit exceeded"""
+    pass
+
+
+class NotFoundError(GitHubAPIError):
+    """Resource not found"""
+    pass
+
+
+class GitHubAPI(LogMixin):
     """Класс для работы с GitHub API"""
 
     BASE_URL = "https://api.github.com"
@@ -53,25 +69,37 @@ class GitHubAPI:
         url = f"{self.BASE_URL}{endpoint}"
 
         while True:
-            response = self.session.request(method, url, **kwargs)
+            try:
+                response = self.session.request(method, url, **kwargs)
+            except requests.exceptions.ConnectionError as e:
+                self.logger.error(f"Connection error: {e}")
+                raise GitHubAPIError(f"Cannot connect to GitHub: {e}")
 
-            # Rate limit exceeded
             if response.status_code == 403:
                 reset_time = response.headers.get('X-RateLimit-Reset')
                 if reset_time:
                     wait_time = int(reset_time) - int(time.time()) + 5
                     if wait_time > 0:
-                        print(f"⚠ Rate limit. Жду {wait_time} сек...")
+                        self.logger.warning(f"Rate limit exceeded. Waiting {wait_time}s...")
                         time.sleep(min(wait_time, 60))
                         continue
 
-            # Success or client error
-            if response.status_code < 500:
-                return response
+            if response.status_code == 404:
+                raise NotFoundError(f"Resource not found: {endpoint}")
 
-            # Server error - retry
-            print(f"⚠ Сервер GitHub недоступен ({response.status_code}). Повторяю...")
-            time.sleep(5)
+            if response.status_code == 401:
+                raise GitHubAPIError("Authentication failed. Check your token.")
+
+            if response.status_code >= 500:
+                self.logger.warning(f"GitHub server error ({response.status_code}). Retrying...")
+                time.sleep(5)
+                continue
+
+            if response.status_code >= 400:
+                self.logger.error(f"Client error: {response.status_code} - {response.text[:200]}")
+                raise GitHubAPIError(f"API error {response.status_code}")
+
+            return response
 
     def get_top_repositories(self, limit: int = 100) -> list[dict]:
         """
@@ -84,7 +112,7 @@ class GitHubAPI:
             Список словарей с данными репозиториев
         """
         repos = []
-        per_page = min(100, limit)  # GitHub max per_page = 100
+        per_page = min(100, limit)
         pages = (limit + per_page - 1) // per_page
 
         for page in range(1, pages + 1):
@@ -94,33 +122,37 @@ class GitHubAPI:
 
             current_per_page = min(per_page, remaining)
 
-            print(f"  Загружаю страницу {page}/{pages}...")
-            response = self._request(
-                "GET",
-                "/search/repositories",
-                params={
-                    "q": "stars:>1000",
-                    "sort": "stars",
-                    "order": "desc",
-                    "per_page": current_per_page,
-                    "page": page
-                }
-            )
+            self.logger.info(f"Loading page {page}/{pages}...")
+            try:
+                response = self._request(
+                    "GET",
+                    "/search/repositories",
+                    params={
+                        "q": "stars:>1000",
+                        "sort": "stars",
+                        "order": "desc",
+                        "per_page": current_per_page,
+                        "page": page
+                    }
+                )
+            except GitHubAPIError as e:
+                self.logger.error(f"API request failed: {e}")
+                break
 
             if response.status_code != 200:
-                print(f"✗ Ошибка API: {response.status_code}")
+                self.logger.error(f"API error: {response.status_code}")
                 break
 
             data = response.json()
             repos.extend(data.get("items", []))
 
-            # Rate limit info
             remaining_calls = response.headers.get('X-RateLimit-Remaining', 'N/A')
-            print(f"  → Получено {len(data.get('items', []))} репозиториев (осталось запросов: {remaining_calls})")
+            self.logger.info(f"Got {len(data.get('items', []))} repos (remaining: {remaining_calls})")
 
             if len(data.get('items', [])) < current_per_page:
                 break
 
+        self.logger.info(f"Total repositories loaded: {len(repos)}")
         return repos
 
     def get_repository_details(self, owner: str, repo: str) -> Optional[dict]:
@@ -134,14 +166,19 @@ class GitHubAPI:
         Returns:
             Словарь с данными или None
         """
-        response = self._request("GET", f"/repos/{owner}/{repo}")
+        try:
+            response = self._request("GET", f"/repos/{owner}/{repo}")
+        except NotFoundError:
+            self.logger.warning(f"Repository not found: {owner}/{repo}")
+            return None
+        except GitHubAPIError as e:
+            self.logger.error(f"Error getting details: {e}")
+            return None
 
         if response.status_code == 200:
             return response.json()
-        elif response.status_code == 404:
-            return None
         else:
-            print(f"✗ Ошибка получения деталей: {response.status_code}")
+            self.logger.error(f"Error getting details: {response.status_code}")
             return None
 
     def get_latest_release(self, owner: str, repo: str) -> Optional[dict]:
@@ -155,12 +192,14 @@ class GitHubAPI:
         Returns:
             Словарь с данными релиза или None
         """
-        response = self._request("GET", f"/repos/{owner}/{repo}/releases/latest")
+        try:
+            response = self._request("GET", f"/repos/{owner}/{repo}/releases/latest")
+        except (NotFoundError, GitHubAPIError):
+            return None
 
         if response.status_code == 200:
             return response.json()
         else:
-            # Нет релиза или другие ошибки
             return None
 
     def get_latest_commit(self, owner: str, repo: str, branch: str) -> Optional[str]:
@@ -175,7 +214,10 @@ class GitHubAPI:
         Returns:
             Хеш коммита (7 символов) или None
         """
-        response = self._request("GET", f"/repos/{owner}/{repo}/commits/{branch}")
+        try:
+            response = self._request("GET", f"/repos/{owner}/{repo}/commits/{branch}")
+        except (NotFoundError, GitHubAPIError):
+            return None
 
         if response.status_code == 200:
             data = response.json()
@@ -227,7 +269,6 @@ class GitHubAPI:
         """
         url = f"https://github.com/{owner}/{repo}/archive/refs/heads/{ref}.zip"
 
-        # Если указана ветка, скачать с неё
         if ref not in ['main', 'master']:
             url = f"https://github.com/{owner}/{repo}/archive/refs/heads/{ref}.zip"
 
@@ -235,8 +276,13 @@ class GitHubAPI:
         filepath = os.path.join(self.output_dir, filename)
 
         try:
-            print(f"  ↓ Скачиваю: {url}")
+            self.logger.info(f"Downloading: {url}")
             response = self.session.get(url, stream=True, timeout=120)
+
+            if response.status_code == 404:
+                alt_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/main.zip"
+                self.logger.warning(f"404 on {url}, trying {alt_url}")
+                response = self.session.get(alt_url, stream=True, timeout=120)
 
             if response.status_code == 200:
                 with open(filepath, 'wb') as f:
@@ -244,14 +290,30 @@ class GitHubAPI:
                         f.write(chunk)
 
                 file_size = os.path.getsize(filepath)
-                print(f"  ✓ Скачано: {filename} ({file_size / 1024 / 1024:.1f} MB)")
+                if file_size < 1000:
+                    self.logger.warning(f"Downloaded file too small ({file_size} bytes), likely error page")
+                    os.remove(filepath)
+                    return None
+
+                self.logger.info(f"Downloaded: {filename} ({file_size / 1024 / 1024:.1f} MB)")
                 return filepath
             else:
-                print(f"  ✗ Ошибка скачивания: {response.status_code}")
+                self.logger.error(f"Download error: {response.status_code}")
                 return None
 
+        except requests.exceptions.Timeout:
+            self.logger.error("Download timeout")
+            return None
+        except requests.exceptions.ConnectionError as e:
+            self.logger.error(f"Connection error during download: {e}")
+            return None
         except Exception as e:
-            print(f"  ✗ Исключение при скачивании: {e}")
+            self.logger.error(f"Download exception: {e}")
+            if os.path.exists(filepath):
+                try:
+                    os.remove(filepath)
+                except Exception:
+                    pass
             return None
 
     def build_repo_data(self, repo_info: dict) -> dict:

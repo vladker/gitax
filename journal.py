@@ -4,17 +4,52 @@
 
 import json
 import os
+import time
+import tempfile
+import shutil
 from datetime import datetime
 from typing import Optional
 from pathlib import Path
+from enum import Enum
+from logging_config import LogMixin, setup_logging
 
 
-class Journal:
+class RepoStatus(Enum):
+    """Статусы репозиториев в журнале"""
+    SENT = "sent"
+    FAILED = "failed"
+    PENDING = "pending"
+
+
+class Journal(LogMixin):
     """Класс для управления журналом загруженных репозиториев"""
 
     def __init__(self, file_path: str = "journal.json"):
         self.file_path = file_path
+        self._lock_file = f"{file_path}.lock"
         self.data = self._load()
+
+    def _acquire_lock(self) -> bool:
+        """Acquire exclusive lock for safe writes"""
+        try:
+            if os.path.exists(self._lock_file):
+                lock_age = time.time() - os.path.getmtime(self._lock_file)
+                if lock_age > 300:
+                    self._release_lock()
+                else:
+                    return False
+            Path(self._lock_file).touch()
+            return True
+        except Exception:
+            return False
+
+    def _release_lock(self):
+        """Release lock file"""
+        try:
+            if os.path.exists(self._lock_file):
+                os.remove(self._lock_file)
+        except Exception:
+            pass
 
     def _load(self) -> dict:
         """Загрузить журнал из файла"""
@@ -42,10 +77,34 @@ class Journal:
         }
 
     def save(self):
-        """Сохранить журнал в файл"""
-        self.data["last_updated"] = datetime.now().isoformat()
-        with open(self.file_path, 'w', encoding='utf-8') as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
+        """Сохранить журнал в файл (атомарная запись)"""
+        if not self._acquire_lock():
+            self.logger.warning("Journal locked, skipping save")
+            return
+
+        try:
+            self.data["last_updated"] = datetime.now().isoformat()
+
+            temp_fd, temp_path = tempfile.mkstemp(
+                suffix='.json',
+                dir=os.path.dirname(self.file_path) or '.'
+            )
+
+            try:
+                with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
+                    json.dump(self.data, f, ensure_ascii=False, indent=2)
+
+                if os.path.exists(self.file_path):
+                    backup_path = f"{self.file_path}.bak"
+                    shutil.copy2(self.file_path, backup_path)
+
+                os.replace(temp_path, self.file_path)
+            except Exception:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                raise
+        finally:
+            self._release_lock()
 
     def add_repository(self, repo_data: dict) -> bool:
         """
@@ -151,8 +210,14 @@ class Journal:
         """Обновить статистику журнала"""
         repos = self.data.get("repositories", [])
         self.data["total_processed"] = len(repos)
-        self.data["total_sent"] = len([r for r in repos if r.get('status') == 'sent'])
-        self.data["total_failed"] = len([r for r in repos if r.get('status') == 'failed'])
+        self.data["total_sent"] = len([
+            r for r in repos
+            if r.get('status') == RepoStatus.SENT.value
+        ])
+        self.data["total_failed"] = len([
+            r for r in repos
+            if r.get('status') == RepoStatus.FAILED.value
+        ])
 
     def get_stats(self) -> dict:
         """Получить статистику журнала"""
