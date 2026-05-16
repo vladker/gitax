@@ -89,8 +89,9 @@ class GitHubArchiver:
         """Initialize MAX browser (reuses connection if alive)"""
         if self.max_browser is None:
             channel_url = self.config.get('max', {}).get('channel_url', '')
-            # Default to local browser for large file support (>50MB)
-            use_local = self.config.get('archiver', {}).get('use_local_browser', True)
+            # Default to CDP (existing browser) for seamless UX
+            # Use local browser only if explicitly requested
+            use_local = self.config.get('archiver', {}).get('use_local_browser', False)
             self.max_browser = BrowserMAX(channel_url, use_local_browser=use_local)
         return self.max_browser
 
@@ -257,7 +258,7 @@ class GitHubArchiver:
                     error_count += 1
                     continue
 
-                success = browser.send_message_with_file(
+                success, _ = browser.send_message_with_file(
                     text=text,
                     filepath=zip_path,
                     retries=self.config.get('archiver', {}).get('retries', 3),
@@ -437,7 +438,7 @@ class GitHubArchiver:
         # Отправить в MAX
         browser = self._init_max_browser()  # type: ignore
 
-        success = browser.send_message_with_file(
+        success, _ = browser.send_message_with_file(
             text=text,
             filepath=zip_path,
             retries=self.config.get('archiver', {}).get('retries', 3),

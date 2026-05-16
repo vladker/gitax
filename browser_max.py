@@ -7,9 +7,147 @@ import os
 import re
 import time
 import sys
+import logging
+import subprocess
 from typing import Optional
 from playwright.sync_api import sync_playwright, Page, Browser, TimeoutError as PlaywrightTimeout
 from logging_config import LogMixin, setup_logging
+
+
+# 7z volume size (49MB to leave buffer for CDN limits)
+SEVEN_ZIP_VOLUME_SIZE = "49M"
+
+# Module-level logger for standalone functions
+_logger = logging.getLogger("gitax")
+
+# 7-Zip executable path (Windows default)
+SEVEN_ZIP_EXE = "C:\\Program Files\\7-Zip\\7z.exe"
+
+
+def split_file_with_7z(filepath: str, volume_size: str = SEVEN_ZIP_VOLUME_SIZE) -> list[str]:
+    """
+    Split a file into volumes using 7z.
+
+    Args:
+        filepath: Path to file to split
+        volume_size: Volume size (e.g., "49M", "100M"). Default: 49M
+
+    Returns:
+        List of volume file paths (e.g., ['file.7z.001', 'file.7z.002', ...])
+        Returns empty list if split failed or file is small enough.
+    """
+    if not os.path.exists(filepath):
+        return []
+
+    file_size = os.path.getsize(filepath)
+    volume_bytes = _parse_size(volume_size)
+
+    # No split needed if file is smaller than threshold
+    if file_size <= volume_bytes:
+        return []
+
+    filename = os.path.basename(filepath)
+    output_base = filepath + ".7z"
+
+    # Remove any existing volumes with same base
+    _cleanup_existing_volumes(output_base)
+
+    cmd = [
+        SEVEN_ZIP_EXE,
+        "a",
+        "-v" + volume_size,  # Volume size (e.g., -v49m)
+        "-mx=0",             # No compression (faster, raw split)
+        output_base,
+        filepath
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=3600  # 1 hour max for large files
+        )
+
+        if result.returncode != 0:
+            _logger.warning(f"7z split failed: {result.stderr}")
+            _cleanup_existing_volumes(output_base)
+            return []
+
+        # Find created volumes
+        volumes = _find_volumes(output_base)
+
+        if volumes:
+            _logger.info(f"Split into {len(volumes)} volumes: {volumes[0]}...")
+            return volumes
+        else:
+            _logger.warning("7z succeeded but no volumes found")
+            return []
+
+    except subprocess.TimeoutExpired:
+        _logger.error("7z split timeout")
+        _cleanup_existing_volumes(output_base)
+        return []
+    except FileNotFoundError:
+        _logger.error(f"7z not found at {SEVEN_ZIP_EXE}")
+        return []
+    except Exception as e:
+        _logger.error(f"7z split error: {e}")
+        _cleanup_existing_volumes(output_base)
+        return []
+
+
+def _parse_size(size_str: str) -> int:
+    """Parse size string like '49M' or '1G' to bytes"""
+    size_str = size_str.upper().strip()
+    multipliers = {
+        'K': 1024,
+        'M': 1024 * 1024,
+        'G': 1024 * 1024 * 1024
+    }
+
+    for suffix, mult in multipliers.items():
+        if size_str.endswith(suffix):
+            try:
+                return int(float(size_str[:-1]) * mult)
+            except ValueError:
+                pass
+
+    # Plain number
+    try:
+        return int(size_str)
+    except ValueError:
+        return 0
+
+
+def _cleanup_existing_volumes(base_path: str):
+    """Remove any existing volume files matching base pattern"""
+    import glob
+    pattern = base_path + ".*"
+    for f in glob.glob(pattern):
+        try:
+            os.remove(f)
+        except Exception:
+            pass
+
+
+def _find_volumes(base_path: str) -> list[str]:
+    """Find all volume files matching base.7z.xxx pattern, sorted"""
+    import glob
+    pattern = base_path + ".*"
+    volumes = sorted(glob.glob(pattern))
+    return volumes
+
+
+def cleanup_volumes(volume_paths: list[str]):
+    """Remove volume files after successful upload"""
+    for vp in volume_paths:
+        try:
+            if os.path.exists(vp):
+                os.remove(vp)
+                _logger.debug(f"Removed: {vp}")
+        except Exception as e:
+            _logger.warning(f"Failed to remove {vp}: {e}")
 
 
 class BrowserMAXError(Exception):
@@ -35,7 +173,15 @@ class ElementNotFoundError(BrowserMAXError):
 class BrowserMAX(LogMixin):
     """MAX messenger automation using Playwright"""
 
-    def __init__(self, channel_url: str, use_local_browser: bool = True):
+    def __init__(self, channel_url: str, use_local_browser: bool = False):
+        """
+        Initialize MAX browser automation.
+
+        Args:
+            channel_url: MAX channel URL
+            use_local_browser: If True, launch new Chrome. If False, connect to existing browser via CDP.
+                              Default is False (connect to existing) for seamless UX.
+        """
         self.channel_url = channel_url
         self.use_local_browser = use_local_browser
         self.playwright = None
@@ -62,8 +208,9 @@ class BrowserMAX(LogMixin):
                 )
                 self.page = context.new_page()
             else:
-                # Use CDP connection to existing Chrome (has 50MB file limit)
-                self.logger.info("Connecting via CDP (port 9222)...")
+                # Use CDP connection to existing Chrome (must be open at channel_url)
+                # This preserves existing browser state and cookies
+                self.logger.info("Connecting via CDP (port 9222) to existing browser...")
                 try:
                     self.browser = self.playwright.chromium.connect_over_cdp(
                         "http://localhost:9222",
@@ -1542,6 +1689,224 @@ class BrowserMAX(LogMixin):
                     return (False, True)  # success=False, file may be deletable
 
         return (False, True)
+
+    def send_message_with_files(self, text: str, filepaths: list[str],
+                                retries: int = 3, retry_delay: int = 10,
+                                split_threshold_mb: float = 49.0) -> tuple[bool, bool]:
+        """
+        Send text message with one or more files (supports split archives).
+
+        Files larger than split_threshold_mb will be split using 7z into volumes.
+        Each volume is sent as a separate message.
+
+        Args:
+            text: Message text
+            filepaths: List of file paths to upload
+            retries: Number of retries per file
+            retry_delay: Delay between retries (seconds)
+            split_threshold_mb: Threshold in MB to trigger splitting (default: 49)
+
+        Returns:
+            Tuple of (all_success: bool, all_files_deletable: bool)
+        """
+        all_files = []
+        volumes_to_cleanup = []
+
+        # Process each file - split if needed
+        for fp in filepaths:
+            if not os.path.exists(fp):
+                self.logger.error(f"File not found: {fp}")
+                continue
+
+            file_size_mb = os.path.getsize(fp) / 1024 / 1024
+
+            if file_size_mb > split_threshold_mb:
+                self.logger.info(f"File {os.path.basename(fp)} ({file_size_mb:.1f} MB) > {split_threshold_mb} MB - splitting...")
+
+                # Split into volumes
+                volumes = split_file_with_7z(fp, SEVEN_ZIP_VOLUME_SIZE)
+
+                if volumes:
+                    self.logger.info(f"Split into {len(volumes)} volumes")
+                    all_files.extend(volumes)
+                    volumes_to_cleanup.extend(volumes)
+                else:
+                    # Split failed, try sending original
+                    self.logger.warning("Split failed, trying original file")
+                    all_files.append(fp)
+            else:
+                all_files.append(fp)
+
+        if not all_files:
+            self.logger.error("No files to upload")
+            return (False, True)
+
+        self.logger.info(f"Uploading {len(all_files)} file(s)")
+
+        # Ensure connected
+        if not self.page:
+            self.logger.info("Connecting to MAX...")
+            if not self.connect():
+                raise ConnectionError("Failed to connect to Chrome")
+
+        self.navigate()
+        self.wait_page_ready()
+
+        # Send message text first
+        self.logger.debug("Typing message...")
+        input_elem = self._find_message_input()
+        if input_elem:
+            self._type_message(text, input_elem)
+
+        self.logger.debug("Sending about message...")
+        self._send_message()
+        time.sleep(1)
+
+        # Upload each file
+        all_success = True
+        all_deletable = True
+
+        for i, fp in enumerate(all_files, 1):
+            filename = os.path.basename(fp)
+            file_size_bytes = os.path.getsize(fp)
+            file_size_mb = file_size_bytes / 1024 / 1024
+
+            self.logger.info(f"Uploading file {i}/{len(all_files)}: {filename} ({file_size_mb:.1f} MB)")
+
+            success = self._upload_single_file(
+                fp, filename, file_size_bytes,
+                retries=retries, retry_delay=retry_delay
+            )
+
+            if not success:
+                all_success = False
+                self.logger.error(f"Failed to upload: {filename}")
+            else:
+                self.logger.info(f"✓ Uploaded: {filename}")
+
+            # Small delay between files
+            if i < len(all_files):
+                time.sleep(1)
+
+        # Cleanup split volumes
+        if volumes_to_cleanup:
+            self.logger.info("Cleaning up split volumes...")
+            cleanup_volumes(volumes_to_cleanup)
+
+        return (all_success, all_deletable)
+
+    def _upload_single_file(self, filepath: str, filename: str, file_size_bytes: int,
+                            retries: int = 3, retry_delay: int = 10) -> bool:
+        """
+        Upload a single file and wait for confirmation.
+
+        Args:
+            filepath: Absolute path to file
+            filename: Display name for the file
+            file_size_bytes: File size in bytes
+            retries: Number of retries
+            retry_delay: Delay between retries
+
+        Returns:
+            True if upload successful
+        """
+        file_size_mb = file_size_bytes / 1024 / 1024
+
+        for attempt in range(1, retries + 1):
+            try:
+                self.logger.debug(f"Attempt {attempt}/{retries}")
+
+                upload_timeout = max(60000, int(file_size_mb * 5000))
+                self.logger.debug(f"Upload timeout: {upload_timeout//1000}s")
+
+                uploaded = False
+                try:
+                    with self.page.expect_file_chooser(timeout=upload_timeout) as fc_info:
+                        self._click_upload_button()
+
+                    fc_info.value.set_files(filepath, timeout=upload_timeout)
+                    self.logger.info(f"File selected: {filename}")
+                    uploaded = True
+                except PlaywrightTimeout:
+                    self.logger.warning("File chooser timeout, trying input method...")
+                    try:
+                        file_input = self.page.locator('input[type="file"]').first
+                        file_input.set_input_files(filepath, timeout=upload_timeout)
+                        self.logger.info("File uploaded via input")
+                        uploaded = True
+                    except Exception as e2:
+                        self.logger.error(f"Input method also failed: {e2}")
+                except Exception as e:
+                    self.logger.warning(f"File chooser failed: {e}")
+                    try:
+                        file_input = self.page.locator('input[type="file"]').first
+                        file_input.set_input_files(filepath, timeout=upload_timeout)
+                        self.logger.info("File uploaded via input")
+                        uploaded = True
+                    except Exception as e2:
+                        self.logger.error(f"Input method also failed: {e2}")
+
+                if not uploaded:
+                    self.logger.error("Failed to upload file - both methods failed")
+                    if attempt < retries:
+                        time.sleep(retry_delay)
+                    continue
+
+                self.logger.debug("Waiting for upload...")
+                if not self._wait_upload_complete(expected_filename=filename, expected_size=file_size_bytes):
+                    self.logger.error("Upload did not complete in time")
+                    if attempt < retries:
+                        time.sleep(retry_delay)
+                    continue
+
+                self.logger.debug("Sending file message...")
+                self._send_message()
+
+                self.logger.debug("Waiting for file message confirmation...")
+                found, reason, msg_idx = self._wait_for_file_message(
+                    timeout=300,
+                    expected_filename=filename
+                )
+                self.logger.info(f"Result: {reason}, msg #{msg_idx}")
+
+                if found:
+                    return True
+                else:
+                    self.logger.error(f"File not found in chat: {reason}")
+                    if attempt < retries:
+                        time.sleep(retry_delay)
+                    continue
+
+            except Exception as e:
+                self.logger.error(f"Upload error: {e}", exc_info=True)
+                if attempt < retries:
+                    time.sleep(retry_delay)
+                else:
+                    return False
+
+        return False
+
+    def send_message_with_file(self, text: str, filepath: str,
+                               retries: int = 3, retry_delay: int = 10,
+                               keep_alive: bool = False) -> tuple[bool, bool]:
+        """
+        Send text message first, then file as second message.
+
+        Args:
+            keep_alive: If True, don't close connection after sending
+
+        Returns:
+            Tuple of (success: bool, file_deletable: bool)
+            file_deletable indicates if file can be safely deleted after upload
+        """
+        # Use the new multi-file method for backward compatibility
+        success, deletable = self.send_message_with_files(
+            text=text,
+            filepaths=[filepath],
+            retries=retries,
+            retry_delay=retry_delay
+        )
+        return (success, deletable)
 
     def close(self):
         """Close browser connection gracefully"""
