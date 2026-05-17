@@ -59,6 +59,55 @@ class GitHubArchiver:
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
+        # Check for orphaned 7z volumes from interrupted sessions
+        self._check_orphaned_volumes(output_dir)
+
+    def _check_orphaned_volumes(self, output_dir: str):
+        """
+        Check for orphaned 7z volume files from interrupted sessions.
+        Offer to clean them up.
+
+        Args:
+            output_dir: Directory to check for orphaned volumes
+        """
+        import glob
+        import logging
+        logger = logging.getLogger("gitax")
+
+        # Find all .7z.xxx files in temp directory
+        pattern = os.path.join(output_dir, "*.7z.*")
+        orphaned = sorted(glob.glob(pattern))
+
+        if not orphaned:
+            return
+
+        print(f"\n  ⚠ Found {len(orphaned)} orphaned 7z volume file(s):")
+        for f in orphaned[:10]:  # Show first 10
+            size_mb = os.path.getsize(f) / 1024 / 1024
+            print(f"    - {os.path.basename(f)} ({size_mb:.1f} MB)")
+        if len(orphaned) > 10:
+            print(f"    ... and {len(orphaned) - 10} more")
+
+        print("\n  These files are from interrupted upload sessions and should be cleaned up.")
+        print("  [1] Delete all orphaned volumes")
+        print("  [2] Keep for manual recovery")
+        print("  [3] Don't ask again this session")
+
+        try:
+            choice = input("  Choose [1/2/3]: ").strip()
+            if choice == '1':
+                for f in orphaned:
+                    try:
+                        os.remove(f)
+                        logger.info(f"Deleted orphaned: {f}")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete {f}: {e}")
+                print(f"  ✓ Deleted {len(orphaned)} orphaned file(s)")
+            elif choice == '3':
+                print("  Will not ask again this session")
+        except Exception as e:
+            logger.warning(f"Orphaned volume check error: {e}")
+
     def _load_config(self, config_path: str) -> dict:
         """Загрузить конфигурацию"""
         if not os.path.exists(config_path):
@@ -327,13 +376,39 @@ class GitHubArchiver:
 
         print(f"  ✓ Получено {len(top_repos)} репозиториев")
 
-        processed_names = self.journal.get_processed_names()
-        new_repos = [r for r in top_repos if r.get('full_name') not in processed_names]
+        # Получить updated_at для фильтрации дублей (без доп. API запросов)
+        repos_to_process = []
+        skipped_already_sent = 0
+        skipped_different_version = 0
 
-        print(f"  Уже в журнале: {len(processed_names)}")
-        print(f"  Осталось для загрузки: {len(new_repos)}\n")
+        for repo_info in top_repos:
+            full_name = repo_info.get('full_name', '')
+            if not full_name:
+                continue
 
-        if not new_repos:
+            # Используем updated_at вместо версии - это быстро, без доп. запросов
+            updated_at = repo_info.get('updated_at', '')
+
+            # Проверить, есть ли репозиторий с такой датой обновления
+            existing = self.journal.get_repository(full_name)
+            if existing:
+                # Репозиторий уже есть - проверить дату
+                existing_updated = existing.get('updated_at', '')
+                if existing_updated == updated_at:
+                    # Та же версия (по дате) - пропускаем
+                    skipped_already_sent += 1
+                else:
+                    # Версия изменилась - это обновление для sync_repositories
+                    skipped_different_version += 1
+                continue
+
+            repos_to_process.append(repo_info)
+
+        print(f"  Уже отправлены: {skipped_already_sent}")
+        print(f"  Другие версии в журнале: {skipped_different_version}")
+        print(f"  Осталось для загрузки: {len(repos_to_process)}\n")
+
+        if not repos_to_process:
             print("  ✓ Все репозитории уже загружены!")
             input("\n  Нажмите Enter для возврата в меню...")
             return
@@ -350,14 +425,14 @@ class GitHubArchiver:
             input("\n  Нажмите Enter для возврата в меню...")
             return
 
-        for i, repo_info in enumerate(new_repos, 1):
+        for i, repo_info in enumerate(repos_to_process, 1):
             full_name = repo_info.get('full_name', '')
             display_name = repo_info.get('name', '')
             stars = repo_info.get('stargazers_count', 0)
             desc = repo_info.get('description', '') or 'Без описания'
 
             print(f"\n  {'═' * 56}")
-            print(f"  #{i} из {len(new_repos)} | {display_name}")
+            print(f"  #{i} из {len(repos_to_process)} | {display_name}")
             print(f"  {'─' * 56}")
             print(f"  ⭐ {self._format_stars(stars)} звёзд | 🍴 {self._format_stars(repo_info.get('forks_count', 0))} форков")
             print(f"  📝 {self._format_description(desc, 50)}")
@@ -383,7 +458,7 @@ class GitHubArchiver:
 
                 if success:
                     loaded_count += 1
-                    print(f"\n  ✓ Загружено ({loaded_count}/{len(new_repos)})")
+                    print(f"\n  ✓ Загружено ({loaded_count}/{len(repos_to_process)})")
                 else:
                     error_count += 1
                     print(f"\n  ✗ Ошибка загрузки")

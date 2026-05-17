@@ -1762,7 +1762,7 @@ class BrowserMAX(LogMixin):
         self._send_message()
         time.sleep(1)
 
-        # Upload each file
+        # Upload each file - delete immediately after confirmation
         all_success = True
         all_deletable = True
 
@@ -1781,17 +1781,29 @@ class BrowserMAX(LogMixin):
             if not success:
                 all_success = False
                 self.logger.error(f"Failed to upload: {filename}")
+                # Keep failed file for potential retry
             else:
                 self.logger.info(f"✓ Uploaded: {filename}")
+                # Delete volume IMMEDIATELY after confirmation
+                # This ensures partial uploads are not lost on interrupt
+                if fp in volumes_to_cleanup:
+                    try:
+                        if os.path.exists(fp):
+                            os.remove(fp)
+                            self.logger.debug(f"Deleted: {filename}")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to delete {filename}: {e}")
 
             # Small delay between files
             if i < len(all_files):
                 time.sleep(1)
 
-        # Cleanup split volumes
+        # Cleanup any remaining volumes (should be none with immediate delete)
         if volumes_to_cleanup:
-            self.logger.info("Cleaning up split volumes...")
-            cleanup_volumes(volumes_to_cleanup)
+            remaining = [v for v in volumes_to_cleanup if os.path.exists(v)]
+            if remaining:
+                self.logger.info(f"Cleaning up {len(remaining)} remaining volumes...")
+                cleanup_volumes(remaining)
 
         return (all_success, all_deletable)
 
