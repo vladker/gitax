@@ -179,6 +179,18 @@ class GitHubArchiver:
             return f"{size_bytes / 1024:.1f} KB"
         return f"{size_bytes} B"
 
+    def _print_progress(self, current: int, total: int, updated: int, skipped: int, status: str = ""):
+        """Print progress bar for sync/load operations"""
+        if total == 0:
+            return
+        pct = int(current / total * 100)
+        filled = int(pct / 10)
+        bar = "█" * filled + "░" * (10 - filled)
+
+        print(f"\r  Синхронизация: {current}/{total} | {bar} {pct}% | ✓{updated} | –{skipped} {status}", end="", flush=True)
+        if current >= total:
+            print()
+
     def _build_message_text(self, repo_data: dict, zip_size: int | None = None) -> str:
         """Построить текст сообщения для MAX"""
         desc = self._format_description(repo_data.get('description', ''))
@@ -239,13 +251,79 @@ class GitHubArchiver:
         self._init_github()
 
         repos = self.journal.get_all_repositories()
-        print(f"\n  Загружено {len(repos)} репозиториев из журнала")
+        total_repos = len(repos)
+        print(f"\n  Загружено {total_repos} репозиториев из журнала")
         print("  Проверяю актуальные версии на GitHub...\n")
 
-        auto_update = False
-        updated_count = 0
-        skipped_count = 0
-        error_count = 0
+        # Phase 1: Проверить ВСЕ репозитории без вопросов
+        repo_updates = []  # (repo, has_new, latest_version)
+        checked_count = 0
+        has_update_count = 0
+
+        for i, repo in enumerate(repos, 1):
+            full_name = repo.get('full_name', '')
+            display_name = repo.get('display_name', '')
+            saved_version = repo.get('version', '')
+            default_branch = repo.get('default_branch', 'main')
+            owner, repo_name = full_name.split('/', 1)
+
+            try:
+                has_new, latest_version = self.github.check_new_version(
+                    owner, repo_name, default_branch, saved_version
+                )
+            except Exception as e:
+                print(f"  ✗ {full_name}: ошибка {e}")
+                repo_updates.append((repo, False, saved_version))
+                checked_count += 1
+                continue
+
+            repo_updates.append((repo, has_new, latest_version))
+            checked_count += 1
+            if has_new:
+                has_update_count += 1
+
+            # Компактный прогресс
+            pct = int(checked_count / total_repos * 100)
+            print(f"\r  Проверка: {checked_count}/{total_repos} ({pct}%) | Новых версий: {has_update_count}", end="", flush=True)
+
+        print()  # newline
+        print(f"\n  ✓ Проверка завершена: {has_update_count} обновлений доступно\n")
+
+        if has_update_count == 0:
+            print("  ✓ Все репозитории уже актуальны!")
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        # Phase 2: Показать таблицу репозиториев с обновлениями
+        print("  " + "─" * 74)
+        print(f"  {'#':<4} {'Репозиторий':<35} {'Было':<20} {'Стало':<20}")
+        print("  " + "─" * 74)
+
+        idx = 0
+        for repo, has_new, latest_version in repo_updates:
+            if has_new:
+                idx += 1
+                name = repo.get('full_name', '')[:33]
+                old_ver = repo.get('version', '')[:18]
+                new_ver = latest_version[:18]
+                print(f"  {idx:<4} {name:<35} {old_ver:<20} {new_ver:<20}")
+        print("  " + "─" * 74)
+
+        # Phase 3: Интерактивное обновление
+        print("\n  Выберите действие:")
+        print("  [Enter] Обновить ВСЕ с новыми версиями")
+        print("  [S] Пропустить синхронизацию")
+        print()
+
+        choice = input("  Ваш выбор [Enter/S]: ").strip().lower()
+
+        if choice == 's':
+            print("\n  Синхронизация отменена.")
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        # Обновляем ВСЕ с новыми версиями
+        print("\n  Начинаю обновление...\n")
 
         browser = None
         try:
@@ -255,89 +333,73 @@ class GitHubArchiver:
             input("\n  Нажмите Enter для возврата в меню...")
             return
 
-        for i, repo in enumerate(repos, 1):
+        updated_count = 0
+        error_count = 0
+        skipped_count = 0
+        total_to_update = has_update_count
+
+        for i, (repo, has_new, latest_version) in enumerate(repo_updates, 1):
+            if not has_new:
+                skipped_count += 1
+                continue
+
             full_name = repo.get('full_name', '')
             display_name = repo.get('display_name', '')
             saved_version = repo.get('version', '')
             default_branch = repo.get('default_branch', 'main')
-
-            print(f"\n  {'─' * 56}")
-            print(f"  Проверка: {display_name} ({full_name})")
-            print(f"    📌 Сохранённая версия: {saved_version}")
-
             owner, repo_name = full_name.split('/', 1)
+            stars = repo.get('stars', 0)
+            forks = repo.get('forks', 0)
+            desc = repo.get('description', '') or 'Без описания'
 
-            try:
-                has_new, latest_version = self.github.check_new_version(
-                    owner, repo_name, default_branch, saved_version
-                )
-            except Exception as e:
-                print(f"    ✗ Ошибка проверки: {e}")
+            repo_update = dict(repo)
+            repo_update['version'] = latest_version
+            repo_update['zip_size'] = None  # Will be set after download
+
+            print(f"\n  📦 {display_name}")
+            print(f"  📝 {self._format_description(desc, 50)}")
+            print("    ↓ Скачиваю ZIP...")
+
+            zip_path = self.github.download_zip(owner, repo_name, default_branch)
+
+            if not zip_path or not os.path.exists(zip_path):
+                print("    ✗ Не удалось скачать ZIP")
                 error_count += 1
                 continue
 
-            print(f"    🔍 Актуальная версия: {latest_version}")
+            zip_size = os.path.getsize(zip_path)
+            zip_size_str = self._format_file_size(zip_size)
+            print(f"    ✓ {zip_size_str}")
 
-            if not has_new:
-                print(f"    ✓ Версия актуальна, пропускаю")
-                skipped_count += 1
-                continue
+            text = self._build_message_text(repo_update, zip_size)
 
-            if auto_update:
-                choice = 'y'
+            print(f"    → Отправляю в MAX...")
+            success, _ = browser.send_message_with_file(
+                text=text,
+                filepath=zip_path,
+                retries=self.config.get('archiver', {}).get('retries', 3),
+                retry_delay=self.config.get('archiver', {}).get('retry_delay', 10)
+            )
+
+            if success:
+                self.journal.update_repository(full_name, {
+                    'version': latest_version,
+                    'status': 'sent'
+                })
+                updated_count += 1
             else:
-                print()
-                choice = input("    [Y] Обновить | [N] Пропустить | [A] Все | [S] Стоп: ").strip().lower()
+                self.journal.update_repository(full_name, {'status': 'failed'})
+                error_count += 1
 
-                if choice == 'a':
-                    auto_update = True
-                    choice = 'y'
+            if os.path.exists(zip_path):
+                try:
+                    os.remove(zip_path)
+                except Exception:
+                    pass
 
-            if choice == 'y':
-                print(f"\n    → Обновляю: {saved_version} → {latest_version}")
-                repo_update = dict(repo)
-                repo_update['version'] = latest_version
-                text = self._build_message_text(repo_update)
+            time.sleep(0.3)
 
-                print("    ↓ Скачиваю ZIP...")
-                zip_path = self.github.download_zip(owner, repo_name, default_branch)
-
-                if not zip_path or not os.path.exists(zip_path):
-                    print("    ✗ Не удалось скачать ZIP")
-                    error_count += 1
-                    continue
-
-                success, _ = browser.send_message_with_file(
-                    text=text,
-                    filepath=zip_path,
-                    retries=self.config.get('archiver', {}).get('retries', 3),
-                    retry_delay=self.config.get('archiver', {}).get('retry_delay', 10)
-                )
-
-                if success:
-                    self.journal.update_repository(full_name, {
-                        'version': latest_version,
-                        'status': 'sent'
-                    })
-                    updated_count += 1
-                    print(f"    ✓ {display_name} обновлён и отправлен")
-                else:
-                    self.journal.update_repository(full_name, {'status': 'failed'})
-                    error_count += 1
-                    print(f"    ✗ Ошибка обновления")
-
-                if os.path.exists(zip_path):
-                    try:
-                        os.remove(zip_path)
-                    except Exception as e:
-                        print(f"    ⚠ Не удалось удалить файл: {e}")
-
-            elif choice == 's':
-                print("\n  Останавливаю проверку...")
-                break
-
-            time.sleep(0.5)
-
+        print()
         print("\n" + "═" * 60)
         print("Синхронизация завершена")
         print(f"  Обновлено: {updated_count}")
@@ -571,18 +633,20 @@ class GitHubArchiver:
 
         repo_data = self.github.build_repo_data(repo_info)
 
-        print("    ↓ Downloading ZIP...")
+        print("    ↓ Скачиваю ZIP...")
         zip_path = self.github.download_zip(owner, repo_name, default_branch)
 
         if not zip_path or not os.path.exists(zip_path):
-            print("    ✗ Failed to download ZIP")
+            print("    ✗ Не удалось скачать ZIP")
             return False
 
         zip_size = os.path.getsize(zip_path)
-        text = self._build_message_text(repo_data, zip_size)
-        print("    ✓ Text prepared")
+        zip_size_str = self._format_file_size(zip_size)
+        print(f"    ✓ {zip_size_str}")
 
-        print("    → Sending to MAX...")
+        text = self._build_message_text(repo_data, zip_size)
+
+        print(f"    → Отправляю в MAX...")
 
         # Send message with file - returns (success, file_deletable)
         # Note: send_message_with_file confirms file message appears in chat before returning
