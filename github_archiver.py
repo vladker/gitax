@@ -222,10 +222,13 @@ class GitHubArchiver:
     def _show_menu(self):
         """Показать главное меню"""
         self._show_header()
+        ignored_count = self.journal.get_ignored_count()
+        ignored_str = f" ({ignored_count} в игноре)" if ignored_count else ""
         print()
         print("  [1] Синхронизировать репозитории")
         print("  [2] Загрузить новые репозитории")
-        print("  [3] Выход")
+        print(f"  [3] Список игнорирования{ignored_str}")
+        print("  [4] Выход")
         print()
 
     def _get_user_choice(self, options: list, prompt: str = "Выберите действие") -> str:
@@ -251,8 +254,12 @@ class GitHubArchiver:
         self._init_github()
 
         repos = self.journal.get_all_repositories()
+        # Отфильтровать игнорируемые
+        total_ignored = len([r for r in repos if self.journal.is_ignored(r.get('full_name', ''))])
+        repos = [r for r in repos if not self.journal.is_ignored(r.get('full_name', ''))]
         total_repos = len(repos)
-        print(f"\n  Загружено {total_repos} репозиториев из журнала")
+        print(f"\n  Загружено {total_repos} репозиториев из журнала"
+              f"{'  (' + str(total_ignored) + ' в игнор-листе)' if total_ignored else ''}")
         print("  Проверяю актуальные версии на GitHub...\n")
 
         # Phase 1: Проверить ВСЕ репозитории без вопросов
@@ -336,7 +343,9 @@ class GitHubArchiver:
         updated_count = 0
         error_count = 0
         skipped_count = 0
+        failed_names = []
         total_to_update = has_update_count
+        repo_delay = self.config.get('archiver', {}).get('repo_delay', 30)
 
         for i, (repo, has_new, latest_version) in enumerate(repo_updates, 1):
             if not has_new:
@@ -365,6 +374,7 @@ class GitHubArchiver:
             if not zip_path or not os.path.exists(zip_path):
                 print("    ✗ Не удалось скачать ZIP")
                 error_count += 1
+                failed_names.append(full_name)
                 continue
 
             zip_size = os.path.getsize(zip_path)
@@ -390,6 +400,7 @@ class GitHubArchiver:
             else:
                 self.journal.update_repository(full_name, {'status': 'failed'})
                 error_count += 1
+                failed_names.append(full_name)
 
             if os.path.exists(zip_path):
                 try:
@@ -397,7 +408,7 @@ class GitHubArchiver:
                 except Exception:
                     pass
 
-            time.sleep(0.3)
+            time.sleep(repo_delay)
 
         print()
         print("\n" + "═" * 60)
@@ -406,6 +417,9 @@ class GitHubArchiver:
         print(f"  Пропущено: {skipped_count}")
         print(f"  Ошибок: {error_count}")
         print("═" * 60)
+
+        if failed_names:
+            self._prompt_ignore_failed(failed_names)
 
         if browser:
             browser.close()
@@ -466,8 +480,13 @@ class GitHubArchiver:
 
             repos_to_process.append(repo_info)
 
+        # Фильтр игнорируемых репозиториев
+        ignored_in_new = [r for r in repos_to_process if self.journal.is_ignored(r.get('full_name', ''))]
+        repos_to_process = [r for r in repos_to_process if not self.journal.is_ignored(r.get('full_name', ''))]
+
         print(f"  Уже отправлены: {skipped_already_sent}")
         print(f"  Другие версии в журнале: {skipped_different_version}")
+        print(f"  В игнор-листе: {len(ignored_in_new)}")
         print(f"  Осталось для загрузки: {len(repos_to_process)}\n")
 
         if not repos_to_process:
@@ -478,6 +497,8 @@ class GitHubArchiver:
         auto_load = False
         loaded_count = 0
         error_count = 0
+        failed_names = []
+        repo_delay = self.config.get('archiver', {}).get('repo_delay', 30)
 
         browser = None
         try:
@@ -523,11 +544,15 @@ class GitHubArchiver:
                     print(f"\n  ✓ Загружено ({loaded_count}/{len(repos_to_process)})")
                 else:
                     error_count += 1
+                    failed_names.append(full_name)
                     print(f"\n  ✗ Ошибка загрузки")
             else:
                 success = self._download_and_send_repo_info_connected(browser, repo_info)
                 if success:
                     loaded_count += 1
+                else:
+                    error_count += 1
+                    failed_names.append(full_name)
 
             time.sleep(0.5)
 
@@ -537,6 +562,9 @@ class GitHubArchiver:
         print(f"  Успешно: {loaded_count}")
         print(f"  Ошибок: {error_count}")
         print("═" * 60)
+
+        if failed_names:
+            self._prompt_ignore_failed(failed_names)
 
         if browser:
             browser.close()
@@ -724,6 +752,114 @@ class GitHubArchiver:
 
         return success
 
+    def _prompt_ignore_failed(self, failed_names: list):
+        """Предложить добавить ошибочные репозитории в игнор-лист"""
+        if not failed_names:
+            return
+
+        print("\n  ⚠ Обнаружены ошибки при обработке:")
+        for name in failed_names:
+            print(f"    - {name}")
+
+        print()
+        print("  Добавить их в список игнорирования?")
+        print("  [1] Добавить все")
+        print("  [2] Выбрать по одному")
+        print("  [3] Пропустить")
+        print()
+
+        try:
+            choice = input("  Ваш выбор [1/2/3]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+
+        if choice == '1':
+            added = self.journal.add_ignored_batch(failed_names)
+            print(f"  ✓ Добавлено {added} репозиториев в игнор-лист")
+
+        elif choice == '2':
+            added_count = 0
+            for name in failed_names:
+                if self.journal.is_ignored(name):
+                    print(f"  • {name} — уже в игнор-листе")
+                    continue
+                try:
+                    sub = input(f"  {name} — Добавить в игнор? [Y/N/A]: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    break
+                if sub == 'a':
+                    remaining = [n for n in failed_names if n != name and not self.journal.is_ignored(n)]
+                    remaining.append(name)
+                    added = self.journal.add_ignored_batch(remaining)
+                    added_count += added
+                    print(f"  ✓ Добавлено {added} репозиториев в игнор-лист")
+                    break
+                elif sub in ('', 'y', 'yes'):
+                    self.journal.add_ignored(name)
+                    added_count += 1
+                    print(f"  ✓ Добавлен в игнор-лист")
+                else:
+                    print("  • Пропущен")
+            if added_count:
+                print(f"  ✓ Всего добавлено: {added_count}")
+
+        else:
+            print("  • Пропущено")
+
+    def _manage_ignore_list(self):
+        """Управление списком игнорирования"""
+        while True:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            print("\n" + "═" * 60)
+            print("Список игнорирования")
+            print("═" * 60)
+
+            ignored = self.journal.get_ignored()
+
+            if not ignored:
+                print("\n  Список игнорирования пуст.")
+                input("\n  Нажмите Enter для возврата в меню...")
+                return
+
+            print(f"\n  Всего репозиториев: {len(ignored)}\n")
+            for i, name in enumerate(ignored, 1):
+                print(f"  {i}. {name}")
+
+            print()
+            print("  [1] Удалить из списка (по номеру)")
+            print("  [2] Очистить весь список")
+            print("  [3] Назад")
+            print()
+
+            choice = input("  Ваш выбор [1/2/3]: ").strip()
+
+            if choice == '1':
+                try:
+                    num = int(input("\n  Введите номер для удаления: ").strip())
+                    if 1 <= num <= len(ignored):
+                        removed = ignored[num - 1]
+                        self.journal.remove_ignored(removed)
+                        print(f"\n  ✓ {removed} удалён из игнор-листа")
+                    else:
+                        print(f"\n  ✗ Неверный номер. Введите от 1 до {len(ignored)}")
+                except ValueError:
+                    print("\n  ✗ Неверный ввод")
+                input("\n  Нажмите Enter для продолжения...")
+
+            elif choice == '2':
+                confirm = input("\n  Очистить весь список игнорирования? [y/N]: ").strip().lower()
+                if confirm in ('y', 'yes'):
+                    cleared = self.journal.clear_ignored()
+                    print(f"\n  ✓ Очищено {cleared} записей")
+                    input("\n  Нажмите Enter для возврата в меню...")
+                    return
+                else:
+                    print("\n  Отменено")
+                    input("\n  Нажмите Enter для продолжения...")
+
+            elif choice == '3':
+                break
+
     def run(self):
         """Запустить главный цикл программы"""
         while True:
@@ -731,17 +867,19 @@ class GitHubArchiver:
 
             self._show_menu()
 
-            choice = input("  Выберите действие [1-3]: ").strip()
+            choice = input("  Выберите действие [1-4]: ").strip()
 
             if choice == '1':
                 self.sync_repositories()
             elif choice == '2':
                 self.load_new_repositories()
             elif choice == '3':
+                self._manage_ignore_list()
+            elif choice == '4':
                 print("\n  До свидания!\n")
                 break
             else:
-                print("\n  Неверный выбор. Нажмите 1, 2 или 3.")
+                print("\n  Неверный выбор. Нажмите 1, 2, 3 или 4.")
                 time.sleep(1)
 
 

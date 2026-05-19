@@ -995,7 +995,8 @@ class BrowserMAX(LogMixin):
 
     def _wait_for_file_message(self, timeout: int = 300,
                                 expected_msg_index: Optional[int] = None,
-                                expected_filename: Optional[str] = None) -> tuple[bool, str, int]:
+                                expected_filename: Optional[str] = None,
+                                baseline_count: Optional[int] = None) -> tuple[bool, str, int]:
         """
         Monitor chat online until file message is found.
         No hard timeout - exits when file is confirmed or error occurs.
@@ -1004,6 +1005,7 @@ class BrowserMAX(LogMixin):
             timeout: Max time to wait (default 5 min as safety fallback)
             expected_msg_index: Expected message index (0 = any new)
             expected_filename: Filename to match (if provided, only confirms if filename matches)
+            baseline_count: Message count BEFORE this upload started (to ignore old messages)
 
         Returns:
             (found: bool, reason: str, found_msg_index: int)
@@ -1041,9 +1043,25 @@ class BrowserMAX(LogMixin):
             """) or ""
             print(f"  [MONITOR] Initial: {base_count} msgs, last: {init_result[:50]}...")
 
-            # Search ALL messages (not just last 10) to find our file
-            print(f"  [SCAN] Searching all {base_count} messages...")
+            # Scan ALL messages - but we must ONLY match files that belong to THIS upload.
+            # Since base_count is captured BEFORE this upload starts, old messages
+            # from previous repos are in indices 0 to base_count-1.
+            # New messages (from this upload) will be at indices >= base_count.
+            # BUT: on reconnect (page reload), base_count resets to new count.
+            # Solution: we REQUIRE filename match if provided, otherwise accept any file message.
+            # This is fine because each upload has unique filename.
+            # Use provided baseline_count or capture current count
+            if baseline_count is None:
+                baseline_count = base_count
+
+            print(f"  [SCAN] Scanning from msg #{baseline_count + 1} (new messages only)...")
             for idx in range(base_count):
+                # Skip messages that existed BEFORE this upload started
+                # (they're from previous repos)
+                if idx < baseline_count:
+                    continue
+
+                print(f"  [SCAN] Checking msg #{idx + 1}")
                 msg_result = self.page.evaluate(f"""
                     () => {{
                         const msgs = document.querySelectorAll('[class*="message"]');
@@ -1127,14 +1145,14 @@ class BrowserMAX(LogMixin):
                     "() => document.querySelectorAll('[class*=\"message\"]').length"
                 ) or 0
 
-                if current_count > base_count:
+                if current_count > baseline_count:
                     # New message(s) appeared!
-                    print(f"  [UPDATE] New messages: {base_count} -> {current_count}")
+                    print(f"  [UPDATE] New messages: {baseline_count} -> {current_count}")
                     last_activity_time = time.time()
                     no_change_count = 0
 
-                    # Check new messages for file
-                    for idx in range(base_count, current_count):
+                    # Check new messages for file (skip old messages from previous repos)
+                    for idx in range(baseline_count, current_count):
                         msg_result = self.page.evaluate(f"""
                             () => {{
                                 const msgs = document.querySelectorAll('[class*="message"]');
@@ -1657,7 +1675,8 @@ class BrowserMAX(LogMixin):
                 # Monitor online until file message is found
                 found, reason, msg_idx = self._wait_for_file_message(
                     timeout=300,
-                    expected_filename=filename
+                    expected_filename=filename,
+                    baseline_count=self._pre_upload_msg_count
                 )
                 self.logger.info(f"Result: {reason}, msg #{msg_idx}")
 
@@ -1743,14 +1762,21 @@ class BrowserMAX(LogMixin):
 
         self.logger.info(f"Uploading {len(all_files)} file(s)")
 
-        # Ensure connected
+        # Ensure connected (reuse existing connection)
         if not self.page:
             self.logger.info("Connecting to MAX...")
             if not self.connect():
                 raise ConnectionError("Failed to connect to Chrome")
+            self.navigate()
 
-        self.navigate()
-        self.wait_page_ready()
+        self.ensure_page_ready()
+
+        # CRITICAL: Capture message count BEFORE starting uploads.
+        # Only messages >= this count belong to this batch of files.
+        self._pre_upload_msg_count = self.page.evaluate(
+            "() => document.querySelectorAll('[class*=\"message\"]').length"
+        ) or 0
+        self.logger.info(f"Pre-upload message count: {self._pre_upload_msg_count}")
 
         # Send message text first
         self.logger.debug("Typing message...")
@@ -1761,6 +1787,15 @@ class BrowserMAX(LogMixin):
         self.logger.debug("Sending about message...")
         self._send_message()
         time.sleep(1)
+
+        # CRITICAL: Update baseline AFTER text message is sent.
+        # Messages from 0 to (old baseline-1) are from previous repos.
+        # Messages from (old baseline) to (new baseline-1) are from THIS upload's text.
+        # File messages will appear after (new baseline), so we need the updated count.
+        self._pre_upload_msg_count = self.page.evaluate(
+            "() => document.querySelectorAll('[class*=\"message\"]').length"
+        ) or 0
+        self.logger.info(f"Post-text message count: {self._pre_upload_msg_count}")
 
         # Upload each file - delete immediately after confirmation
         all_success = True
@@ -1877,7 +1912,8 @@ class BrowserMAX(LogMixin):
                 self.logger.debug("Waiting for file message confirmation...")
                 found, reason, msg_idx = self._wait_for_file_message(
                     timeout=300,
-                    expected_filename=filename
+                    expected_filename=filename,
+                    baseline_count=self._pre_upload_msg_count
                 )
                 self.logger.info(f"Result: {reason}, msg #{msg_idx}")
 

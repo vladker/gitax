@@ -349,6 +349,7 @@ class GitHubAPI(LogMixin):
             "zip_url": zip_url,
             "default_branch": default_branch,
             "language": repo_info.get('language', 'N/A'),
+            "updated_at": repo_info.get('updated_at', ''),
             "status": "pending"
         }
 

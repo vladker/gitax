@@ -70,6 +70,7 @@ class Journal(LogMixin):
         """Создать пустой журнал"""
         return {
             "repositories": [],
+            "ignored": [],
             "last_updated": "",
             "total_processed": 0,
             "total_sent": 0,
@@ -192,6 +193,23 @@ class Journal(LogMixin):
         """Проверить, есть ли репозиторий в журнале"""
         return self.get_repository(full_name) is not None
 
+    def is_version_in_journal(self, full_name: str, version: str) -> bool:
+        """
+        Проверить, есть ли конкретная версия репозитория в журнале.
+        Дублем считается запись с тем же full_name И той же version.
+
+        Args:
+            full_name: Полное имя репозитория (owner/repo)
+            version: Версия (release tag или commit hash)
+
+        Returns:
+            True если версия уже есть в журнале
+        """
+        for repo in self.data.get("repositories", []):
+            if repo.get('full_name') == full_name and repo.get('version') == version:
+                return True
+        return False
+
     def get_processed_names(self) -> set:
         """Получить set имён обработанных репозиториев"""
         return {r['full_name'] for r in self.data.get("repositories", [])}
@@ -243,6 +261,56 @@ class Journal(LogMixin):
         self._update_stats()
         self.save()
         return removed
+
+    def is_ignored(self, full_name: str) -> bool:
+        """Проверить, есть ли репозиторий в списке игнорирования"""
+        return full_name in self.data.get("ignored", [])
+
+    def add_ignored(self, full_name: str) -> bool:
+        """Добавить репозиторий в список игнорирования"""
+        if not full_name:
+            return False
+        if full_name in self.data.get("ignored", []):
+            return False
+        self.data.setdefault("ignored", []).append(full_name)
+        self.save()
+        return True
+
+    def add_ignored_batch(self, full_names: list) -> int:
+        """Добавить несколько репозиториев в список игнорирования"""
+        added = 0
+        for name in full_names:
+            if name and name not in self.data.setdefault("ignored", []):
+                self.data["ignored"].append(name)
+                added += 1
+        if added:
+            self.save()
+        return added
+
+    def remove_ignored(self, full_name: str) -> bool:
+        """Удалить репозиторий из списка игнорирования"""
+        ignored = self.data.get("ignored", [])
+        if full_name in ignored:
+            self.data["ignored"] = [n for n in ignored if n != full_name]
+            self.save()
+            return True
+        return False
+
+    def get_ignored(self) -> list:
+        """Получить список игнорируемых репозиториев"""
+        return list(self.data.get("ignored", []))
+
+    def get_ignored_count(self) -> int:
+        """Получить количество игнорируемых репозиториев"""
+        return len(self.data.get("ignored", []))
+
+    def clear_ignored(self) -> int:
+        """Очистить весь список игнорирования"""
+        count = len(self.data.get("ignored", []))
+        self.data["ignored"] = []
+        if count:
+            self.save()
+        return count
 
 
 if __name__ == "__main__":
