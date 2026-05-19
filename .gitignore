@@ -33,6 +33,10 @@ config.yaml
 *.json
 *.auth-state.json
 
+# Environment variables
+.env
+*.env
+
 # Logs
 *.log
 archiver.log

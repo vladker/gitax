@@ -13,6 +13,7 @@ import shutil
 import atexit
 import signal
 from datetime import datetime
+from dotenv import load_dotenv
 from logging_config import setup_logging
 
 from journal import Journal
@@ -109,19 +110,26 @@ class GitHubArchiver:
             logger.warning(f"Orphaned volume check error: {e}")
 
     def _load_config(self, config_path: str) -> dict:
-        """Загрузить конфигурацию"""
-        if not os.path.exists(config_path):
-            print(f"✗ Файл конфигурации не найден: {config_path}")
-            print("  Создайте config.yaml на основе примера")
-            sys.exit(1)
+        """Загрузить конфигурацию (config.yaml опционален)"""
+        load_dotenv()
+        config = {}
 
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
+        if os.path.exists(config_path):
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f) or {}
 
-        # Проверить обязательные параметры
+        # Приоритет: .env / env var > config.yaml
+        env_token = os.environ.get('GITHUB_TOKEN')
+        if env_token:
+            config.setdefault('github', {})['token'] = env_token
+
+        env_channel = os.environ.get('MAX_CHANNEL_URL')
+        if env_channel:
+            config.setdefault('max', {})['channel_url'] = env_channel
+
         if not config.get('github', {}).get('token'):
-            print("✗ GitHub token не указан в config.yaml")
-            print("  Добавьте: github.token: 'ghp_...'")
+            print("✗ GitHub token не указан.")
+            print("  Укажите GITHUB_TOKEN в .env файле или переменной окружения")
             sys.exit(1)
 
         return config
@@ -885,6 +893,7 @@ class GitHubArchiver:
 
 def main():
     """Точка входа"""
+    load_dotenv()
     logger = setup_logging(log_file="archiver.log", level=10)
     config_path = "config.yaml"
 

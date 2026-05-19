@@ -8,6 +8,11 @@ Simple Python CLI tool that downloads GitHub repositories as ZIP and sends them 
 pip install -r requirements.txt
 npm install -g agent-browser
 agent-browser install
+
+# Create .env with your tokens (see .env.example)
+copy .env.example .env
+# Edit .env file with your GITHUB_TOKEN and MAX_CHANNEL_URL
+
 python github_archiver.py
 ```
 
@@ -15,11 +20,24 @@ python github_archiver.py
 
 | File | Purpose |
 |------|---------|
+| `.env` | Tokens/URLs — **not committed** (gitignored) |
+| `.env.example` | Template for .env (safe to commit) |
 | `github_archiver.py` | Entry point — run this |
 | `github_api.py` | GitHub API (REST v3) |
 | `browser_max.py` | MAX browser automation via CDP |
 | `journal.py` | Tracks processed repos (JSON) |
-| `config.yaml` | Tokens/URLs — not committed |
+| `config.yaml` | Non-sensitive settings — optional |
+
+## Token Setup
+
+Create a `.env` file in the project root (or set environment variables):
+
+```env
+GITHUB_TOKEN=github_pat_...
+MAX_CHANNEL_URL=https://web.max.ru/...
+```
+
+Priority: `.env` file / env var > `config.yaml`
 
 ## Browser Automation
 
@@ -31,7 +49,8 @@ python github_archiver.py
 ## .gitignore
 
 Sensitive files that must never be committed:
-- `config.yaml`, `*.yaml`, `*.yml` (contains GitHub PAT)
+- `.env`, `.env.*` (tokens, secrets)
+- `config.yaml`, `*.yaml`, `*.yml`
 - `*.json` (journal, auth-state)
 - `*.log`, `archiver.log`
 - `temp/`, `*.zip`
