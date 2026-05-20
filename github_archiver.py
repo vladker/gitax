@@ -212,6 +212,9 @@ class GitHubArchiver:
 🍴 Форки: {self._format_stars(repo_data.get('forks', 0))}
 🔗 GitHub: {repo_data.get('github_url', '')}"""
 
+        if zip_size:
+            text += f"\n📦 Размер: {self._format_file_size(zip_size)}"
+
         return text
 
     def _show_header(self):
@@ -401,11 +404,12 @@ class GitHubArchiver:
             if success:
                 self.journal.update_repository(full_name, {
                     'version': latest_version,
-                    'status': 'sent'
+                    'status': 'sent',
+                    'archive_size': zip_size
                 })
                 updated_count += 1
             else:
-                self.journal.update_repository(full_name, {'status': 'failed'})
+                self.journal.update_repository(full_name, {'status': 'failed', 'archive_size': zip_size})
                 error_count += 1
                 failed_names.append(full_name)
 
@@ -475,13 +479,16 @@ class GitHubArchiver:
             # Проверить, есть ли репозиторий с такой датой обновления
             existing = self.journal.get_repository(full_name)
             if existing:
-                # Репозиторий уже есть - проверить дату
+                # Репозиторий уже есть в журнале
                 existing_updated = existing.get('updated_at', '')
-                if existing_updated == updated_at:
-                    # Та же версия (по дате) - пропускаем
+                if not existing_updated:
+                    # Старая запись без updated_at — уже отправлен
+                    skipped_already_sent += 1
+                elif existing_updated == updated_at:
+                    # Та же дата — пропускаем
                     skipped_already_sent += 1
                 else:
-                    # Версия изменилась - это обновление для sync_repositories
+                    # Дата изменилась — это обновление для sync_repositories
                     skipped_different_version += 1
                 continue
 
@@ -597,6 +604,13 @@ class GitHubArchiver:
         if new_version:
             repo_data['version'] = new_version
 
+        version = repo_data.get('version', '')
+
+        # Second line of defence: check if this exact version already in journal
+        if version and self.journal.is_version_in_journal(full_name, version):
+            print(f"    ✓ Версия {version} уже загружена, пропускаю")
+            return True
+
         # Скачать ZIP
         zip_path = self.github.download_zip(owner, repo_name, default_branch)  # type: ignore
 
@@ -604,8 +618,10 @@ class GitHubArchiver:
             print("    ✗ Не удалось скачать ZIP")
             return False
 
+        zip_size = os.path.getsize(zip_path)
+
         # Подготовить данные для сообщения
-        text = self._build_message_text(repo_data)
+        text = self._build_message_text(repo_data, zip_size)
 
         # Отправить в MAX
         browser = self._init_max_browser()  # type: ignore
@@ -629,11 +645,13 @@ class GitHubArchiver:
         if success:
             self.journal.update_repository(full_name, {
                 'version': new_version or repo_data.get('version'),
-                'status': 'sent'
+                'status': 'sent',
+                'archive_size': zip_size
             })
         else:
             self.journal.update_repository(full_name, {
-                'status': 'failed'
+                'status': 'failed',
+                'archive_size': zip_size
             })
 
         return success
@@ -667,6 +685,12 @@ class GitHubArchiver:
         default_branch = repo_info.get('default_branch', 'main')
 
         repo_data = self.github.build_repo_data(repo_info)
+        version = repo_data.get('version', '')
+
+        # Second line of defence: check if this exact version already in journal
+        if version and self.journal.is_version_in_journal(full_name, version):
+            print(f"    ✓ Версия {version} уже загружена, пропускаю")
+            return True
 
         print("    ↓ Скачиваю ZIP...")
         zip_path = self.github.download_zip(owner, repo_name, default_branch)
@@ -697,6 +721,7 @@ class GitHubArchiver:
             print(f"    ⚠ Upload failed, skipping file cleanup")
             repo_data['status'] = 'failed'
             repo_data['version'] = repo_data.get('version', '') or 'unknown'
+            repo_data['archive_size'] = zip_size
             self.journal.add_repository(repo_data)
             return False
 
@@ -755,6 +780,7 @@ class GitHubArchiver:
 
         repo_data['status'] = 'sent' if success else 'failed'
         repo_data['version'] = repo_data.get('version', '') or 'unknown'
+        repo_data['archive_size'] = zip_size
         self.journal.add_repository(repo_data)
 
         return success

@@ -747,12 +747,14 @@ class BrowserMAX(LogMixin):
                 print(f"\n  [OK] File attached in composer ({elapsed}s)")
                 return True
 
-            # Check for state changes
+            # Check for state changes — only count file-relevant changes as activity
             changed, reason = self._detect_state_change(pre_state)
             if changed:
                 self.logger.info(f"DOM change detected: {reason} ({elapsed}s)")
-                last_activity_time = time.time()
-                consecutive_no_activity = 0
+                # Don't reset no-activity timer on random new messages from other users
+                if reason in ('new_attachment', 'composer_changed_with_file'):
+                    last_activity_time = time.time()
+                    consecutive_no_activity = 0
 
             # Track activity - if no progress for a while, consider it done
             time_since_activity = time.time() - last_activity_time
