@@ -6,8 +6,6 @@ Simple Python CLI tool that downloads GitHub repositories as ZIP and sends them 
 
 ```bash
 pip install -r requirements.txt
-npm install -g agent-browser
-agent-browser install
 
 # Create .env with your tokens (see .env.example)
 copy .env.example .env
@@ -24,8 +22,9 @@ python github_archiver.py
 | `.env.example` | Template for .env (safe to commit) |
 | `github_archiver.py` | Entry point — run this |
 | `github_api.py` | GitHub API (REST v3) |
-| `browser_max.py` | MAX browser automation via CDP |
+| `browser_max.py` | MAX browser automation via Playwright + CDP |
 | `journal.py` | Tracks processed repos (JSON) |
+| `logging_config.py` | Logging setup (archiver.log) |
 | `config.yaml` | Non-sensitive settings — optional |
 
 ## Token Setup
@@ -41,10 +40,50 @@ Priority: `.env` file / env var > `config.yaml`
 
 ## Browser Automation
 
-- Uses `agent-browser` CLI with CDP to existing Chrome (port 9222)
+- Uses **Playwright** with CDP to an existing Chrome instance (port 9222)
 - Browser must be open at the MAX channel URL before running
-- Hard-coded element refs exist (`e23` for message input, `e13` for attach button) — these may need updating if MAX UI changes
-- Full upload flow: connect → type text → click attach → wait for `input[type=file]` → upload → send → confirm
+- Connects via `connect_over_cdp` — preserves existing session/cookies, no login needed
+
+### Upload Flow (single file)
+
+1. Connect to Chrome via CDP (`localhost:9222`)
+2. Navigate to the MAX channel URL
+3. Type repository description message, send it (Enter)
+4. Click upload button → file chooser → select file
+5. Wait for upload to complete (MutationObserver monitors DOM)
+6. Press Enter to send the file message
+7. Wait for file message confirmation in the feed (scans new messages with **filename matching**)
+
+### Multi-Volume (7z split)
+
+Files larger than **49 MB** are split into `.7z.001`, `.7z.002`, etc. volumes using 7-Zip:
+
+- Each volume is uploaded as a separate message after the description text
+- Volumes are sent sequentially (`.001` → `.002` → `.003` ...)
+- Each volume is **deleted immediately** after its upload is confirmed
+- Split threshold is configurable via `config.yaml` → `archiver.split_threshold_mb`
+
+### Upload Confirmation
+
+The confirmation system checks that the **specific filename** (including volume number `.7z.003`) appears in the feed, preventing false matches from previously uploaded volumes:
+
+1. MutationObserver tracks DOM changes for new file messages
+2. `_check_upload_in_lenta(expected_filename)` scans the feed for a message containing the exact filename
+3. `_wait_for_file_message()` monitors new messages from a baseline count, matching by filename
+4. All three checkpoints validate the **current file's name**, not just any `.zip` message
+
+## Config Options (config.yaml)
+
+```yaml
+archiver:
+  limit: 1000               # How many repos to fetch from GitHub
+  retries: 3                # Upload retry count
+  retry_delay: 10           # Delay between retries (seconds)
+  repo_delay: 30            # Pause between repos (seconds)
+  split_threshold_mb: 49    # Files above this size are split into 7z volumes
+  use_local_browser: false  # false = CDP to existing Chrome, true = launch new
+  output_dir: "./temp"      # Temp directory for downloads
+```
 
 ## .gitignore
 

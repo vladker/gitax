@@ -82,7 +82,7 @@ class GitHubArchiver:
         if not orphaned:
             return
 
-        print(f"\n  ⚠ Found {len(orphaned)} orphaned 7z volume file(s):")
+        print(f"\n  Found {len(orphaned)} orphaned 7z volume file(s):")
         for f in orphaned[:10]:  # Show first 10
             size_mb = os.path.getsize(f) / 1024 / 1024
             print(f"    - {os.path.basename(f)} ({size_mb:.1f} MB)")
@@ -202,12 +202,11 @@ class GitHubArchiver:
     def _build_message_text(self, repo_data: dict, zip_size: int | None = None) -> str:
         """Построить текст сообщения для MAX"""
         desc = self._format_description(repo_data.get('description', ''))
-        size_str = f"\n📦 Размер: {self._format_file_size(zip_size)}" if zip_size else ""
 
         text = f"""📦 {repo_data.get('display_name', '')}
 
 📝 {desc}
-{size_str}
+
 🔖 Версия: {repo_data.get('version', 'unknown')} ({repo_data.get('version_type', 'unknown')})
 ⭐ Звёзды: {self._format_stars(repo_data.get('stars', 0))}
 🍴 Форки: {self._format_stars(repo_data.get('forks', 0))}

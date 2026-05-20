@@ -513,12 +513,10 @@ class BrowserMAX(LogMixin):
 
                                 // If we have search name, check for filename match
                                 if (searchName) {{
-                                    // Normalize for comparison (remove -master, -main, extensions)
+                                    // Normalize for comparison (remove -master, -main)
                                     const normalizedSearch = searchName.toLowerCase()
-                                        .replace('.zip', '')
                                         .replace('-master', '')
-                                        .replace('-main', '')
-                                        .replace('.git', '');
+                                        .replace('-main', '');
 
                                     // Look for repo name pattern in text
                                     const textLower = text.toLowerCase();
@@ -687,7 +685,9 @@ class BrowserMAX(LogMixin):
             return False, "error"
 
     def _wait_upload_complete(self, timeout: int = 3600, poll_interval: float = 1.0,
-                               expected_filename: str | None = None, expected_size: int | None = None) -> bool:
+                               expected_filename: str | None = None,
+                               expected_size: int | None = None,
+                               baseline_count: int | None = None) -> bool:
         """
         Wait for file upload to complete - uses PROGRESS-BASED detection.
         No fixed timeout - waits until upload is confirmed or user cancels.
@@ -697,6 +697,8 @@ class BrowserMAX(LogMixin):
             poll_interval: How often to check (seconds)
             expected_filename: Filename to match for upload confirmation
             expected_size: File size in bytes to match
+            baseline_count: Message count baseline — only check messages at or after
+                            this index (to avoid false matches on old uploads).
         """
         self._check_connection()
         self.logger.info(f"Monitoring upload progress...")
@@ -734,19 +736,13 @@ class BrowserMAX(LogMixin):
                     print(f"\n  [OK] Upload reached 100%")
                     last_activity_time = time.time()
 
-            # Check if file appeared in message feed (definitive confirmation)
+            # Check if file appeared in message feed via MutationObserver (NEW nodes only)
             done, filename = self._check_upload_done()
             if done:
                 self.logger.info(f"Upload complete: {filename} ({elapsed}s)")
                 return True
 
-            # Check lenta for file message
-            done_lenta, _ = self._check_upload_in_lenta(None)
-            if done_lenta:
-                print(f"\n  [OK] File confirmed in feed ({elapsed}s)")
-                return True
-
-            # Check DOM for attached file
+            # Check DOM for attached file in composer
             if self._check_dom_upload_ready():
                 print(f"\n  [OK] File attached in composer ({elapsed}s)")
                 return True
@@ -766,9 +762,9 @@ class BrowserMAX(LogMixin):
 
                 # After ~30-60 seconds of no activity, assume upload is done
                 if consecutive_no_activity >= 2:
-                    # Final verification
-                    done_lenta, _ = self._check_upload_in_lenta(None)
-                    if done_lenta or self._check_dom_upload_ready() or done:
+                    # Final verification — only trust composer or observer (new DOM nodes),
+                    # NOT lenta scan (can match old messages from previous runs)
+                    if self._check_dom_upload_ready() or done:
                         print(f"\n  [OK] Upload finished (no activity for {int(time_since_activity)}s)")
                         return True
 
@@ -776,9 +772,10 @@ class BrowserMAX(LogMixin):
                     if consecutive_no_activity >= 4:  # ~60 seconds
                         print(f"\n  [WARN] No upload activity for {int(time_since_activity)}s")
                         # Try one more thorough check
-                        done_lenta, _ = self._check_upload_in_lenta(None)
-                        if not done_lenta:
-                            print(f"  [INFO] Continuing to monitor...")
+                        if self._check_dom_upload_ready() or self._check_upload_done():
+                            print(f"\n  [OK] Upload confirmed after extended wait")
+                            return True
+                        print(f"  [INFO] Continuing to monitor...")
 
             # Show elapsed time every 30s if no progress
             if time.time() - last_progress_log >= 30 and elapsed > 30:
@@ -794,11 +791,6 @@ class BrowserMAX(LogMixin):
         done, filename = self._check_upload_done()
         if done:
             self.logger.info(f"Upload complete at timeout: {filename}")
-            return True
-
-        done_lenta, _ = self._check_upload_in_lenta(None)
-        if done_lenta:
-            self.logger.info("Upload confirmed in lenta at timeout")
             return True
 
         if self._check_dom_upload_ready():
@@ -929,55 +921,56 @@ class BrowserMAX(LogMixin):
             self.logger.debug(f"DOM composer check error: {e}")
             return False
 
-    def _check_upload_in_lenta(self, expected_filename: Optional[str] = None) -> tuple[bool, Optional[str]]:
+    def _check_upload_in_lenta(self, expected_filename: Optional[str] = None,
+                                min_msg_index: int = 0) -> tuple[bool, Optional[str]]:
         """
         Check if file appears in message feed (not in composer).
         This is the definitive check that file was actually uploaded.
 
         Args:
-            expected_filename: Optional filename to match
+            expected_filename: Optional filename to match.
+                               If provided, only messages containing this filename count.
+            min_msg_index: Only check messages at this index or higher
+                           (to exclude old messages from previous repos).
 
         Returns:
             (found: bool, filename: Optional[str])
         """
-        script = """
-            () => {
-                // Get ALL messages with their full details
-                const msgs = document.querySelectorAll('[class*="message"]');
-                const results = [];
+        search_name = ""
+        if expected_filename:
+            import os as _os
+            search_name = _os.path.basename(expected_filename).lower()
 
-                for (const msg of msgs) {
+        escaped = search_name.replace("\\", "\\\\").replace("'", "\\'")
+        script = f"""
+            () => {{
+                const searchName = '{escaped}';
+                const minIdx = {min_msg_index};
+                const msgs = document.querySelectorAll('[class*="message"]');
+
+                for (let i = minIdx; i < msgs.length; i++) {{
+                    const msg = msgs[i];
                     const text = msg.textContent || '';
                     const html = msg.innerHTML || '';
                     const hasFile = msg.querySelector('[class*="file"], [class*="attach"]') !== null;
                     const hasDownload = msg.querySelector('a[download], [download]') !== null;
-                    const hasSvg = msg.querySelector('svg') !== null;
-                    const hrefs = Array.from(msg.querySelectorAll('a')).map(a => a.href || '');
 
-                    results.push({
-                        text: text.slice(0, 150),
-                        hasFile: hasFile,
-                        hasDownload: hasDownload,
-                        hasSvg: hasSvg,
-                        hrefs: hrefs.slice(0, 5)
-                    });
-                }
+                    const hasArchive = /\\.(zip|tar|gz|rar|7z|zip\\.\\w+)/i.test(text) ||
+                                     /\\.(zip|tar|gz|rar|7z|zip\\.\\w+)/i.test(html);
+                    const hasFileIndicator = hasFile || hasDownload || hasArchive;
 
-                // Check if any message has file indicators
-                for (const r of results) {
-                    const hasArchive = /\\.(zip|tar|gz|rar|7z|zip\\.\\w+)/i.test(r.text) ||
-                                     /\\.(zip|tar|gz|rar|7z|zip\\.\\w+)/i.test(r.html || '');
-                    const hasFile = r.hasFile || r.hasDownload;
-                    const hasHrefArchive = r.hrefs.some(h => /\\.(zip|tar|gz|archive)/i.test(h));
+                    if (!hasFileIndicator) continue;
 
-                    if (hasFile || hasArchive || hasHrefArchive) {
-                        return { found: true, text: r.text.slice(0, 100) };
-                    }
-                }
+                    if (searchName) {{
+                        const textLower = text.toLowerCase();
+                        if (!textLower.includes(searchName)) continue;
+                    }}
 
-                // Debug: return last 3 messages for troubleshooting
-                return { found: false, lastMessages: results.slice(-3).map(r => r.text.slice(0, 80)) };
-            }
+                    return {{ found: true, text: text.slice(0, 100) }};
+                }}
+
+                return {{ found: false }};
+            }}
         """
 
         try:
@@ -987,7 +980,7 @@ class BrowserMAX(LogMixin):
                 self.logger.info(f"File found in lenta: {filename}")
                 return (True, filename)
             elif result:
-                self.logger.debug(f"Lenta check: no file, last msgs: {result.get('lastMessages', [])}")
+                self.logger.debug(f"Lenta check: no file")
             return (False, None)
         except Exception as e:
             self.logger.debug(f"Lenta check error: {e}")
@@ -1023,7 +1016,7 @@ class BrowserMAX(LogMixin):
         if expected_filename:
             import os as os_module
             basename = os_module.path.basename(expected_filename).lower()
-            search_name = basename.replace('.zip', '').replace('-master', '').replace('-main', '')
+            search_name = basename.replace('-master', '').replace('-main', '')
             print(f"  [SCAN] Looking for: {search_name}")
 
         try:
@@ -1056,8 +1049,6 @@ class BrowserMAX(LogMixin):
 
             print(f"  [SCAN] Scanning from msg #{baseline_count + 1} (new messages only)...")
             for idx in range(base_count):
-                # Skip messages that existed BEFORE this upload started
-                # (they're from previous repos)
                 if idx < baseline_count:
                     continue
 
@@ -1079,6 +1070,7 @@ class BrowserMAX(LogMixin):
 
                         return {{
                             text: text.slice(0, 150),
+                            html: html.slice(0, 200),
                             hasFileClass,
                             hasZip,
                             hasDownload,
@@ -1091,13 +1083,12 @@ class BrowserMAX(LogMixin):
                 msg_html = msg_result.get('html', '').lower()
                 msg_classes = msg_result.get('classes', '').lower()
 
-                match = re.search(r'([a-z0-9\-_]+\.zip)', msg_text)
+                match = re.search(r'([a-z0-9\-_.]+\.zip(?:\.7z\.\d+)?)', msg_text)
                 if match:
                     msg_filename = match.group(1).replace('-master', '').replace('-main', '')
                     if search_name not in msg_filename:
-                        continue  # Skip - name mismatch
+                        match = None
 
-                # Option 2: Check for download button or file icon
                 has_download_btn = (
                     'download' in msg_classes or
                     'download' in msg_html or
@@ -1106,14 +1097,7 @@ class BrowserMAX(LogMixin):
                     'download' in msg_text.lower()
                 )
 
-                # Option 3: Check for file size indicator (e.g., "388 MB", "388.2 MB")
-                has_size = re.search(r'\d+\.?\d*\s*(mb|gb|kb)', msg_text)
-                if not has_size:
-                    # Also check in HTML
-                    has_size = re.search(r'\d+\.?\d*\s*(mb|gb|kb)', msg_html)
-
-                # File message must have either download button OR size indicator
-                if not has_download_btn and not has_size:
+                if not has_download_btn and not match:
                     continue
 
                 print(f"  [OK] FILE FOUND! Message #{idx + 1}")
@@ -1151,7 +1135,6 @@ class BrowserMAX(LogMixin):
                     last_activity_time = time.time()
                     no_change_count = 0
 
-                    # Check new messages for file (skip old messages from previous repos)
                     for idx in range(baseline_count, current_count):
                         msg_result = self.page.evaluate(f"""
                             () => {{
@@ -1171,6 +1154,7 @@ class BrowserMAX(LogMixin):
 
                                 return {{
                                     text: text.slice(0, 150),
+                                    html: html.slice(0, 200),
                                     hasFileClass,
                                     hasZip,
                                     hasDownload,
@@ -1184,33 +1168,33 @@ class BrowserMAX(LogMixin):
                                   msg_result.get('hasZip') or
                                   msg_result.get('hasDownload'))
 
-                        # Apply same robust checks as initial scan
-                        if is_file:
-                            msg_text = msg_result.get('text', '').lower()
-                            msg_html = (msg_result.get('html') or '').lower()
+                        if not is_file:
+                            continue
 
-                            # Check for download indicator
-                            has_download = msg_result.get('hasDownload')
-                            if not has_download:
-                                has_download = 'download' in msg_text or 'скачать' in msg_text
+                        msg_text = msg_result.get('text', '').lower()
+                        msg_html = (msg_result.get('html') or '').lower()
 
-                            # Check for file size (e.g., "388 MB", "388.2 MB")
-                            has_size = re.search(r'\d+\.?\d*\s*(mb|gb|kb)', msg_text)
-                            if not has_size:
-                                has_size = re.search(r'\d+\.?\d*\s*(mb|gb|kb)', msg_html)
+                        match = None
+                        if search_name:
+                            match = re.search(r'([a-z0-9\-_.]+\.zip(?:\.7z\.\d+)?)', msg_text)
+                            if match:
+                                msg_filename = match.group(1).replace('-master', '').replace('-main', '')
+                                if search_name not in msg_filename:
+                                    match = None
 
-                            # File must have download OR size
-                            if not has_download and not has_size:
-                                print(f"  [SKIP] Msg #{idx + 1}: no download/size indicator")
-                                continue
+                        has_download = msg_result.get('hasDownload')
+                        if not has_download:
+                            has_download = 'download' in msg_text or 'скачать' in msg_text
 
-                            print(f"  [OK] FILE FOUND! Message #{idx + 1}")
-                            print(f"       {msg_result.get('text', '')[:100]}...")
-                            return (True, "found", idx + 1)
+                        if not has_download and not match:
+                            print(f"  [SKIP] Msg #{idx + 1}: no download/.zip indicator")
+                            continue
 
-                        print(f"  [INFO] Msg #{idx + 1}: {msg_result.get('text', '')[:60]}...")
+                        print(f"  [OK] FILE FOUND! Message #{idx + 1}")
+                        print(f"       {msg_result.get('text', '')[:100]}...")
+                        return (True, "found", idx + 1)
 
-                    base_count = current_count
+                    baseline_count = current_count
 
                 # Check for timeout
                 if timeout_reached:
@@ -1233,7 +1217,7 @@ class BrowserMAX(LogMixin):
                                 const hasZip = /\\.zip/i.test(text) || /\\.zip/i.test(html);
                                 const hasDownload = msg.querySelector('[download]') !== null;
                                 return {{
-                                    text: text.slice(0, 150),
+                                    text: text.slice(0, 200),
                                     hasFileClass,
                                     hasZip,
                                     hasDownload
@@ -1241,9 +1225,19 @@ class BrowserMAX(LogMixin):
                             }}
                         """) or {}
 
-                        if msg_result.get('hasFileClass') or msg_result.get('hasZip') or msg_result.get('hasDownload'):
-                            print(f"  [OK] File found at timeout! Msg #{idx + 1}")
-                            return (True, "found", idx + 1)
+                        if not (msg_result.get('hasFileClass') or msg_result.get('hasZip') or msg_result.get('hasDownload')):
+                            continue
+
+                        if search_name:
+                            msg_text = (msg_result.get('text') or '').lower()
+                            match = re.search(r'([a-z0-9\-_.]+\.zip(?:\.7z\.\d+)?)', msg_text)
+                            if match:
+                                msg_filename = match.group(1).replace('-master', '').replace('-main', '')
+                                if search_name not in msg_filename:
+                                    match = None
+
+                        print(f"  [OK] File found at timeout! Msg #{idx + 1}")
+                        return (True, "found", idx + 1)
 
                     print(f"  [WARN] No file found. Messages: {base_count} -> {final_count}")
                     return (False, "timeout", 0)
@@ -1810,7 +1804,8 @@ class BrowserMAX(LogMixin):
 
             success = self._upload_single_file(
                 fp, filename, file_size_bytes,
-                retries=retries, retry_delay=retry_delay
+                retries=retries, retry_delay=retry_delay,
+                baseline_count=self._pre_upload_msg_count
             )
 
             if not success:
@@ -1819,6 +1814,11 @@ class BrowserMAX(LogMixin):
                 # Keep failed file for potential retry
             else:
                 self.logger.info(f"✓ Uploaded: {filename}")
+                # Update baseline so next volume only looks at messages AFTER this one
+                self._pre_upload_msg_count = self.page.evaluate(
+                    "() => document.querySelectorAll('[class*=\"message\"]').length"
+                ) or 0
+                self.logger.debug(f"Updated baseline: {self._pre_upload_msg_count}")
                 # Delete volume IMMEDIATELY after confirmation
                 # This ensures partial uploads are not lost on interrupt
                 if fp in volumes_to_cleanup:
@@ -1843,7 +1843,8 @@ class BrowserMAX(LogMixin):
         return (all_success, all_deletable)
 
     def _upload_single_file(self, filepath: str, filename: str, file_size_bytes: int,
-                            retries: int = 3, retry_delay: int = 10) -> bool:
+                            retries: int = 3, retry_delay: int = 10,
+                            baseline_count: int = 0) -> bool:
         """
         Upload a single file and wait for confirmation.
 
@@ -1853,6 +1854,8 @@ class BrowserMAX(LogMixin):
             file_size_bytes: File size in bytes
             retries: Number of retries
             retry_delay: Delay between retries
+            baseline_count: Message count baseline — passed to _wait_upload_complete
+                            to avoid false matches on old messages
 
         Returns:
             True if upload successful
@@ -1900,7 +1903,8 @@ class BrowserMAX(LogMixin):
                     continue
 
                 self.logger.debug("Waiting for upload...")
-                if not self._wait_upload_complete(expected_filename=filename, expected_size=file_size_bytes):
+                if not self._wait_upload_complete(expected_filename=filename, expected_size=file_size_bytes,
+                                                     baseline_count=baseline_count):
                     self.logger.error("Upload did not complete in time")
                     if attempt < retries:
                         time.sleep(retry_delay)

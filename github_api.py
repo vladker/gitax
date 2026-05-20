@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 from typing import Optional
 from pathlib import Path
+from tqdm import tqdm
 from logging_config import LogMixin, setup_logging
 
 
@@ -285,9 +286,13 @@ class GitHubAPI(LogMixin):
                 response = self.session.get(alt_url, stream=True, timeout=120)
 
             if response.status_code == 200:
+                total = int(response.headers.get('content-length', 0))
+                desc = filename[:40]
                 with open(filepath, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
+                    with tqdm(total=total, unit='B', unit_scale=True, desc=desc, leave=False) as pbar:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                            pbar.update(len(chunk))
 
                 file_size = os.path.getsize(filepath)
                 if file_size < 1000:
