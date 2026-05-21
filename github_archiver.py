@@ -6,6 +6,7 @@ GitHub Archiver — Резервное копирование репозитор
 """
 
 import os
+import re
 import sys
 import yaml
 import time
@@ -238,7 +239,8 @@ class GitHubArchiver:
         print("  [1] Синхронизировать репозитории")
         print("  [2] Загрузить новые репозитории")
         print(f"  [3] Список игнорирования{ignored_str}")
-        print("  [4] Выход")
+        print("  [4] Аудит и восстановление публикаций")
+        print("  [5] Выход")
         print()
 
     def _get_user_choice(self, options: list, prompt: str = "Выберите действие") -> str:
@@ -893,6 +895,444 @@ class GitHubArchiver:
             elif choice == '3':
                 break
 
+    # ──────────────────────────────────────────────
+    # Audit & Restore Publications
+    # ──────────────────────────────────────────────
+
+    def _extract_repo_from_filename(self, filename: str) -> str | None:
+        """
+        Extract owner/repo from a filename like 'owner-repo-main.zip'.
+        Tries all possible split positions, checks against journal + GitHub API.
+        """
+        name = re.sub(r'\.zip(?:\.7z\.\d+)?$', '', filename)
+
+        for suffix in ('-main', '-master'):
+            if name.endswith(suffix):
+                prefix = name[:-len(suffix)]
+                break
+        else:
+            parts = name.rsplit('-', 1)
+            if len(parts) != 2:
+                return None
+            prefix = parts[0]
+
+        parts = prefix.split('-')
+        if len(parts) < 2:
+            return None
+
+        candidates = []
+        for i in range(1, len(parts)):
+            owner = '-'.join(parts[:i])
+            repo = '-'.join(parts[i:])
+            candidates.append(f"{owner}/{repo}")
+
+        # 1) Check against known repos in journal (fastest)
+        known = {e.get('full_name', '').lower()
+                 for e in self.journal.get_all_repositories() if e.get('full_name')}
+        for c in candidates:
+            if c.lower() in known:
+                return c
+
+        # 2) Verify via GitHub API
+        for c in candidates:
+            try:
+                resp = self.github_api.get(f"repos/{c}")
+                if resp and resp.get('id'):
+                    return c
+            except Exception:
+                continue
+
+        # 3) Fallback: shortest owner first (most common pattern)
+        return candidates[0]
+
+    def _show_audit_table(self, grouped: dict):
+        """Display audit results in a formatted table."""
+        complete = grouped.get("complete", [])
+        incomplete = grouped.get("incomplete", [])
+        all_found = set()
+        for item in [*complete, *incomplete]:
+            fn = item.get("full_name", "")
+            if "/" in fn:
+                all_found.add(fn)
+
+        # Also collect repo names from journal to show fully missing ones
+        journal_missing = []
+        known_journal = self.journal.get_all_repositories()
+        for entry in known_journal:
+            fn = entry.get("full_name", "")
+            if fn and "/" in fn and fn not in all_found:
+                journal_missing.append(entry)
+
+        print("\n" + "═" * 60)
+        print("          АУДИТ ЦЕЛОСТНОСТИ ПУБЛИКАЦИЙ")
+        print("═" * 60)
+        print(f"  ✅ Полных публикаций: {len(complete)}")
+        print(f"  ⚠ Неполных публикаций: {len(incomplete)}")
+        if journal_missing:
+            print(f"  ❌ Из журнала не опубликовано: {len(journal_missing)}")
+        print("─" * 60)
+
+        if not incomplete and not journal_missing:
+            print("\n  ✓ Все публикации целостны!")
+            return
+
+        # ── Summary by issue type ──
+        missing_file_items = [i for i in incomplete if i.get("issue") == "missing_file"]
+        missing_volumes_items = [i for i in incomplete if i.get("issue") == "missing_volumes"]
+        missing_text_items = [i for i in incomplete if i.get("issue") == "missing_text"]
+
+        if missing_file_items:
+            print(f"\n  📁 Нет файлов ({len(missing_file_items)}):")
+            for item in missing_file_items:
+                fn = item.get("full_name", "?")
+                display = item.get("display_name", fn.split("/")[-1])
+                print(f"    {display:20s}  ({fn})")
+
+        if missing_volumes_items:
+            print(f"\n  📦 Не все тома ({len(missing_volumes_items)}):")
+            for item in missing_volumes_items:
+                fn = item.get("full_name", "?")
+                display = item.get("display_name", fn.split("/")[-1])
+                missing = ", ".join(item.get("missing_volumes", []))
+                have = len(item.get("file_idxs", []))
+                print(f"    {display:20s}  есть {have} томов, не хватает: {missing}")
+
+        if missing_text_items:
+            # Group orphans by filename for compact display
+            orphan_groups: dict[str, int] = {}
+            for item in missing_text_items:
+                fn = item.get("full_name", item.get("display_name", "?"))
+                orphan_groups[fn] = orphan_groups.get(fn, 0) + 1
+
+            print(f"\n  🗑 Файлы-сироты (без описания):")
+            for fn, count in sorted(orphan_groups.items(), key=lambda x: -x[1]):
+                # Try to extract a readable name
+                short = fn.replace("-main.zip", ".zip").replace("-master.zip", ".zip")
+                # Remove 7z suffixes for readability
+                short = short.replace(".7z.", ".")
+                if short.endswith(".002") or short.endswith(".001"):
+                    base = short.rsplit(".", 1)[0]
+                    print(f"    {base:35s}  ({count} копий)")
+                else:
+                    print(f"    {short:40s}  ({count} копий)")
+
+        if journal_missing:
+            print(f"\n  ❌ Не найдены в канале ({len(journal_missing)}):")
+            for entry in journal_missing[:20]:
+                fn = entry.get("full_name", "?")
+                stars = entry.get("stars", 0)
+                print(f"    {fn:45s}  ⭐ {stars}")
+            if len(journal_missing) > 20:
+                print(f"    ... и ещё {len(journal_missing) - 20}")
+
+        print()
+
+    def audit_and_restore_publications(self):
+        """Audit the channel, display results, and restore incomplete publications."""
+        print("\n" + "═" * 60)
+        print("          АУДИТ И ВОССТАНОВЛЕНИЕ ПУБЛИКАЦИЙ")
+        print("═" * 60)
+
+        self._init_github()
+
+        browser = None
+        try:
+            browser = self._ensure_max_connected()
+        except Exception as e:
+            print(f"\n  ✗ Не удалось подключиться к MAX: {e}")
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        grouped = browser.audit_channel_completeness()
+
+        self._show_audit_table(grouped)
+
+        incomplete = grouped.get("incomplete", [])
+        if not incomplete:
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        # Ask user what to do with each incomplete publication
+        print("\n  ⚠ Обнаружены неполные публикации.")
+        print("  Для каждой можно:")
+        print("    [Enter] — удалить сообщения и переопубликовать")
+        print("    [S]     — пропустить")
+        print("    [A]     — восстановить все")
+        print("    [Q]     — выйти из аудита")
+        print()
+
+        restore_all = False
+        restored_count = 0
+        skipped_count = 0
+        error_count = 0
+
+        for i, item in enumerate(incomplete, 1):
+            fn = item.get("full_name", "?")
+            display = item.get("display_name", fn.split("/")[-1])
+            issue = item.get("issue", "?")
+
+            if restore_all:
+                choice = 'y'
+            else:
+                print(f"\n  {'─' * 56}")
+                print(f"  #{i}: {display} ({fn})")
+                print(f"       причина: {issue}")
+                choice = input("  [Enter] восстановить | [S] пропустить | [A] все | [Q] выход: ").strip().lower()
+
+            if choice == 'a':
+                restore_all = True
+                choice = 'y'
+
+            if choice in ('', 'y', 'enter'):
+                # Build repo context for restoration
+                repo_ctx = self._build_restore_context(item)
+
+                success = self._restore_publication(browser, item, repo_ctx)
+
+                if success:
+                    restored_count += 1
+                    print(f"  ✓ {display} — восстановлен")
+                else:
+                    error_count += 1
+                    print(f"  ✗ {display} — ошибка восстановления")
+            elif choice == 's':
+                skipped_count += 1
+                print(f"  • Пропущен")
+            elif choice == 'q':
+                print("\n  Выход из аудита...")
+                break
+
+        print("\n" + "═" * 60)
+        print("АУДИТ И ВОССТАНОВЛЕНИЕ ЗАВЕРШЕНЫ")
+        print(f"  Восстановлено: {restored_count}")
+        print(f"  Пропущено: {skipped_count}")
+        print(f"  Ошибок: {error_count}")
+        print("═" * 60)
+
+        # Optional: run a final verification
+        if restored_count > 0:
+            print("\n  Выполняю финальную верификацию...")
+            final = browser.audit_channel_completeness()
+            remaining = len(final.get("incomplete", []))
+            if remaining == 0:
+                print("  ✓ Все публикации целостны!")
+            else:
+                print(f"  ⚠ Осталось {remaining} неполных публикаций")
+
+        if browser:
+            browser.close()
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def _build_restore_context(self, item: dict) -> dict:
+        """
+        Build repo context from audit item for restoration.
+        Tries to get data from journal first, then from GitHub API.
+        """
+        fn = item.get("full_name", "")
+
+        # Orphaned file (full_name is actually a filename like owner-repo-main.zip)
+        if fn and "/" not in fn:
+            extracted = self._extract_repo_from_filename(fn)
+            if extracted and "/" in extracted:
+                fn = extracted
+            else:
+                return {}
+
+        if not fn or "/" not in fn:
+            return {}
+
+        owner, repo_name = fn.split("/", 1)
+
+        # Try journal first
+        journal_entry = self.journal.get_repository(fn)
+        if journal_entry:
+            return {
+                "full_name": fn,
+                "owner": owner,
+                "repo": repo_name,
+                "display_name": journal_entry.get("display_name", repo_name),
+                "description": journal_entry.get("description", ""),
+                "version": journal_entry.get("version", ""),
+                "version_type": journal_entry.get("version_type", ""),
+                "stars": journal_entry.get("stars", 0),
+                "forks": journal_entry.get("forks", 0),
+                "default_branch": journal_entry.get("default_branch", "main"),
+                "from_journal": True,
+            }
+
+        # Fetch from GitHub API
+        return self._fetch_repo_from_github(fn, owner, repo_name)
+
+    def _fetch_repo_from_github(self, full_name: str, owner: str, repo: str) -> dict:
+        """Fetch repo details from GitHub API."""
+        try:
+            details = self.github.get_repository_details(owner, repo)
+            if details:
+                version, version_type = self.github.get_version_info(
+                    owner, repo, details.get("default_branch", "main")
+                )
+                return {
+                    "full_name": full_name,
+                    "owner": owner,
+                    "repo": repo,
+                    "display_name": details.get("name", repo),
+                    "description": details.get("description", "") or "Без описания",
+                    "version": version,
+                    "version_type": version_type,
+                    "stars": details.get("stargazers_count", 0),
+                    "forks": details.get("forks_count", 0),
+                    "default_branch": details.get("default_branch", "main"),
+                    "from_journal": False,
+                }
+        except Exception as e:
+            self.logger.warning(f"Failed to fetch repo from GitHub: {e}")
+
+        return {
+            "full_name": full_name,
+            "owner": owner,
+            "repo": repo,
+            "display_name": repo,
+            "description": "Без описания",
+            "version": "unknown",
+            "version_type": "unknown",
+            "stars": 0,
+            "forks": 0,
+            "default_branch": "main",
+            "from_journal": False,
+        }
+
+    def _restore_publication(self, browser, item: dict, repo_ctx: dict) -> bool:
+        """
+        Delete incomplete messages and re-publish the repo.
+
+        Args:
+            browser: BrowserMAX instance (connected)
+            item: Audit item dict with message indices to delete
+            repo_ctx: Repo context dict with owner, repo, branch, etc.
+
+        Returns:
+            True on success
+        """
+        fn = repo_ctx.get("full_name", "")
+        display = repo_ctx.get("display_name", fn.split("/")[-1]) if fn else "?"
+        owner = repo_ctx.get("owner", "")
+        repo_name = repo_ctx.get("repo", "")
+        branch = repo_ctx.get("default_branch", "main")
+
+        print(f"\n  {'═' * 56}")
+        print(f"  Восстановление: {display if display != '?' else item.get('full_name', '?')}")
+        print(f"  {'─' * 56}")
+
+        # Validate: if we can't identify the repo, skip deletion to avoid data loss
+        if not fn or not owner or not repo_name:
+            print(f"    ⚠ Не удалось определить репозиторий — пропускаю удаление")
+            return False
+
+        # Step 1: Delete ALL messages for this repo (text + files)
+        search_terms = []
+        if fn:
+            search_terms.append(fn)  # "vitejs/vite" matches text descriptions
+        if owner and repo_name:
+            search_terms.append(f"{owner}-{repo_name}")  # "vitejs-vite" matches files
+
+        if search_terms:
+            print(f"    → Удаляю все сообщения ({len(search_terms)} поисковых запросов)...")
+            try:
+                browser.navigate()
+                browser.wait_page_ready()
+            except Exception:
+                pass
+            browser.scroll_to_top()
+            deleted = browser.delete_messages_by_content(
+                search_terms, label=display
+            )
+            if deleted:
+                print(f"    ✓ Удалено: {deleted}")
+            else:
+                print(f"    ⚠ Сообщения не найдены (возможно уже удалены)")
+            time.sleep(1)
+
+        # Step 2: Download fresh ZIP
+        print(f"    ↓ Скачиваю ZIP...")
+        zip_path = self.github.download_zip(owner, repo_name, branch)
+
+        if not zip_path or not os.path.exists(zip_path):
+            print(f"    ✗ Не удалось скачать ZIP")
+            return False
+
+        zip_size = os.path.getsize(zip_path)
+        zip_size_str = self._format_file_size(zip_size)
+        print(f"    ✓ {zip_size_str}")
+
+        # Step 3: Build and send message
+        repo_data = {
+            "full_name": fn,
+            "display_name": display,
+            "description": repo_ctx.get("description", ""),
+            "version": repo_ctx.get("version", "unknown"),
+            "version_type": repo_ctx.get("version_type", "unknown"),
+            "stars": repo_ctx.get("stars", 0),
+            "forks": repo_ctx.get("forks", 0),
+            "github_url": f"https://github.com/{fn}",
+        }
+
+        text = self._build_message_text(repo_data, zip_size)
+
+        print(f"    → Отправляю в MAX...")
+
+        # Navigate back to channel (page may have shifted after deletion)
+        try:
+            browser.navigate()
+            browser.wait_page_ready()
+        except Exception:
+            pass
+
+        split_threshold_mb = self.config.get("archiver", {}).get("split_threshold_mb", 49)
+        success, _ = browser.send_message_with_files(
+            text=text,
+            filepaths=[zip_path],
+            retries=self.config.get("archiver", {}).get("retries", 3),
+            retry_delay=self.config.get("archiver", {}).get("retry_delay", 10),
+            split_threshold_mb=split_threshold_mb,
+        )
+
+        # Step 4: Verify (retry up to 3 times with delay)
+        verified = False
+        if success:
+            for attempt in range(3):
+                time.sleep(3)
+                verified = browser.verify_repo_publication(fn)
+                if verified:
+                    print(f"    ✓ Верификация пройдена (попытка {attempt + 1})")
+                    break
+                else:
+                    print(f"    ⚠ Верификация: попытка {attempt + 1}/3 — не найдено")
+
+        # Step 5: Update journal
+        if success:
+            new_status = "restored"
+            self.journal.update_repository(fn, {
+                "version": repo_ctx.get("version", "unknown"),
+                "status": new_status,
+                "archive_size": zip_size,
+                "restored_at": datetime.now().isoformat(),
+            })
+        else:
+            self.journal.update_repository(fn, {
+                "status": "failed",
+                "archive_size": zip_size,
+            })
+
+        # Cleanup
+        try:
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+        except Exception:
+            pass
+
+        return success and verified
+
     def run(self):
         """Запустить главный цикл программы"""
         while True:
@@ -900,7 +1340,7 @@ class GitHubArchiver:
 
             self._show_menu()
 
-            choice = input("  Выберите действие [1-4]: ").strip()
+            choice = input("  Выберите действие [1-5]: ").strip()
 
             if choice == '1':
                 self.sync_repositories()
@@ -909,10 +1349,12 @@ class GitHubArchiver:
             elif choice == '3':
                 self._manage_ignore_list()
             elif choice == '4':
+                self.audit_and_restore_publications()
+            elif choice == '5':
                 print("\n  До свидания!\n")
                 break
             else:
-                print("\n  Неверный выбор. Нажмите 1, 2, 3 или 4.")
+                print("\n  Неверный выбор. Нажмите 1, 2, 3, 4 или 5.")
                 time.sleep(1)
 
 

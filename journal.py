@@ -19,6 +19,8 @@ class RepoStatus(Enum):
     SENT = "sent"
     FAILED = "failed"
     PENDING = "pending"
+    INCOMPLETE = "incomplete"
+    RESTORED = "restored"
 
 
 class Journal(LogMixin):
@@ -236,6 +238,14 @@ class Journal(LogMixin):
             r for r in repos
             if r.get('status') == RepoStatus.FAILED.value
         ])
+        self.data["total_restored"] = len([
+            r for r in repos
+            if r.get('status') == RepoStatus.RESTORED.value
+        ])
+        self.data["total_incomplete"] = len([
+            r for r in repos
+            if r.get('status') == RepoStatus.INCOMPLETE.value
+        ])
 
     def get_stats(self) -> dict:
         """Получить статистику журнала"""
@@ -243,6 +253,8 @@ class Journal(LogMixin):
             "total": self.data.get("total_processed", 0),
             "sent": self.data.get("total_sent", 0),
             "failed": self.data.get("total_failed", 0),
+            "restored": self.data.get("total_restored", 0),
+            "incomplete": self.data.get("total_incomplete", 0),
             "last_updated": self.data.get("last_updated", "")
         }
 

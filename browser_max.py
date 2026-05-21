@@ -1962,6 +1962,828 @@ class BrowserMAX(LogMixin):
         )
         return (success, deletable)
 
+    # ──────────────────────────────────────────────
+    # Audit & Restore — scroll, collect, verify
+    # ──────────────────────────────────────────────
+
+    def _find_scroll_container(self) -> str | None:
+        """
+        Find the CSS selector of the scrollable container holding messages.
+        Returns a CSS selector string or None.
+        """
+        result = self.page.evaluate("""
+            () => {
+                const msgs = document.querySelectorAll('[class*="message"]');
+                if (msgs.length === 0) return null;
+
+                const first = msgs[0];
+                let el = first.parentElement;
+                let depth = 0;
+                while (el && depth < 20) {
+                    const style = window.getComputedStyle(el);
+                    const ov = style.overflowY + ' ' + style.overflow;
+                    const scrollable = el.scrollHeight > el.clientHeight + 20;
+                    const hasScrollStyle = ov.includes('auto') || ov.includes('scroll');
+                    if (scrollable && hasScrollStyle) {
+                        return el.tagName + '#' + (el.id || '') + '.' + (el.className || '').replace(/\\s+/g, '.');
+                    }
+                    el = el.parentElement;
+                    depth++;
+                }
+                return null;
+            }
+        """)
+        return result
+
+    def scroll_to_top(self, max_steps: int = 500) -> int:
+        """
+        Scroll chat to top by repeatedly scrolling up.
+        Uses text-based deduplication — works with virtual lists
+        (where DOM elements are recycled, so count stays constant).
+
+        Collects ALL unique message texts seen during the scroll.
+
+        Returns:
+            Total number of unique messages found.
+        """
+        self._check_connection()
+        print(f"  [SCROLL] Загрузка всех сообщений, скролл вверх...")
+
+        # Collect ALL unique message signatures (text snippet for dedup)
+        all_signatures: set[str] = set()
+        no_new = 0
+        container_info = None
+
+        # Try to focus the scroll container first
+        self.page.evaluate("""
+            () => {
+                const containers = document.querySelectorAll(
+                    '[class*="messages"],[class*="lenta"],[class*="feed"],' +
+                    '[class*="chat"],[class*="dialog"],[class*="scroll"]'
+                );
+                let best = null;
+                let bestH = 0;
+                for (const c of containers) {
+                    if (c.scrollHeight > c.clientHeight + 50 && c.scrollHeight > bestH) {
+                        best = c;
+                        bestH = c.scrollHeight;
+                    }
+                }
+                if (best) {
+                    window.__gitax_scroll = best;
+                    best.setAttribute('tabindex', '-1');
+                    best.focus();
+                } else {
+                    window.__gitax_scroll = null;
+                }
+            }
+        """)
+        self.page.wait_for_timeout(300)
+
+        for step in range(max_steps):
+            try:
+                # Get all currently-rendered messages' text signatures
+                current = self.page.evaluate("""
+                    () => {
+                        const msgs = document.querySelectorAll('[class*="message"]');
+                        const sigs = [];
+                        for (const m of msgs) {
+                            const t = (m.textContent || '').trim();
+                            // Use first 120 chars as signature
+                            sigs.push(t.slice(0, 120));
+                        }
+                        return sigs;
+                    }
+                """) or []
+
+                # Find new unique signatures
+                new_sigs = list(set(s for s in current if s and s not in all_signatures))
+                if new_sigs:
+                    all_signatures.update(new_sigs)
+                    no_new = 0
+                    if step % 15 == 0:
+                        print(f"  [SCROLL] Шаг {step}: +{len(new_sigs)} новых, всего {len(all_signatures)}")
+                else:
+                    no_new += 1
+                    if no_new >= 10:
+                        print(f"  [SCROLL] Достигнут верх (шаг {step}) — {len(all_signatures)} уникальных сообщений")
+                        break
+
+                # Scroll up — try multiple methods
+                scrolled = self.page.evaluate("""
+                    () => {
+                        const c = window.__gitax_scroll;
+                        if (c) {
+                            const step = Math.max(100, c.clientHeight * 0.7);
+                            const before = c.scrollTop;
+                            c.scrollBy(0, -step);
+                            return c.scrollTop !== before;
+                        }
+                        // Fallback: try known selectors
+                        const containers = document.querySelectorAll(
+                            '[class*="messages"],[class*="lenta"],[class*="feed"],' +
+                            '[class*="chat"],[class*="dialog"],[class*="scroll"]'
+                        );
+                        for (const c2 of containers) {
+                            if (c2.scrollHeight > c2.clientHeight + 50) {
+                                c2.scrollBy(0, -c2.clientHeight * 0.7);
+                                return true;
+                            }
+                        }
+                        window.scrollBy(0, -window.innerHeight * 0.7);
+                        return true;
+                    }
+                """)
+
+                if not scrolled:
+                    self.logger.debug(f"Scroll method returned false at step {step}")
+                    no_new += 1
+                    if no_new >= 10:
+                        break
+
+                self.page.wait_for_timeout(500)
+
+            except Exception as e:
+                self.logger.debug(f"Scroll error: {e}")
+                no_new += 1
+                if no_new >= 10:
+                    break
+
+        total = len(all_signatures)
+        print(f"  [SCROLL] Итого: {total} уникальных сообщений")
+        self.logger.info(f"Total unique messages collected: {total}")
+
+        if total < 100:
+            # Try keyboard PageUp as fallback
+            self.logger.info("Trying keyboard PageUp fallback...")
+            print(f"  [SCROLL] Клавиатурный скролл (PageUp)...")
+            no_new_kb = 0
+
+            for kb in range(200):
+                try:
+                    self.page.keyboard.press("PageUp")
+                    self.page.wait_for_timeout(300)
+
+                    current_kb = self.page.evaluate("""
+                        () => {
+                            const msgs = document.querySelectorAll('[class*="message"]');
+                            const sigs = [];
+                            for (const m of msgs) {
+                                sigs.push((m.textContent || '').trim().slice(0, 120));
+                            }
+                            return sigs;
+                        }
+                    """) or []
+
+                    new_kb = list(set(s for s in current_kb if s and s not in all_signatures))
+                    if new_kb:
+                        all_signatures.update(new_kb)
+                        no_new_kb = 0
+                        if kb % 20 == 0:
+                            print(f"  [SCROLL] PageUp {kb}: +{len(new_kb)}, всего {len(all_signatures)}")
+                    else:
+                        no_new_kb += 1
+                        if no_new_kb >= 8:
+                            break
+                except Exception:
+                    no_new_kb += 1
+                    if no_new_kb >= 8:
+                        break
+
+            total = len(all_signatures)
+            print(f"  [SCROLL] После PageUp: {total} сообщений")
+
+        return total
+
+    def collect_all_messages(self) -> list[dict]:
+        """
+        Load ALL messages by scrolling to top, then collect every message element.
+
+        Returns:
+            List of dicts, oldest-first (index 0 = first message in channel).
+            Each dict: { idx, text, html, classes }
+        """
+        self._check_connection()
+        total = self.scroll_to_top()
+
+        raw = self.page.evaluate("""
+            () => {
+                const msgs = document.querySelectorAll('[class*="message"]');
+                const result = [];
+                for (let i = 0; i < msgs.length; i++) {
+                    const m = msgs[i];
+                    result.push({
+                        idx: i,
+                        text: m.textContent || '',
+                        html: m.innerHTML || '',
+                        classes: m.className || ''
+                    });
+                }
+                return result;
+            }
+        """) or []
+
+        self.logger.info(f"Collected {len(raw)} messages")
+        return raw
+
+    def parse_message(self, msg: dict) -> dict:
+        """
+        Classify a single message and extract structured data.
+
+        Returns dict with at least:
+            type: "repo_text" | "file" | "other"
+            full_name: str | None
+            display_name: str | None
+            filename: str | None    (file messages)
+            volume: str | None      (split volumes, e.g. "001")
+        """
+        text = msg.get("text", "")
+        html = msg.get("html", "")
+        idx = msg.get("idx", -1)
+
+        result = {
+            "idx": idx,
+            "type": "other",
+            "full_name": None,
+            "display_name": None,
+            "filename": None,
+            "volume": None,
+        }
+
+        # ── Repo text message (contains 📦 and GitHub URL) ──
+        repo_url_match = re.search(
+            r'github\.com[\/:]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)',
+            text
+        )
+        if repo_url_match and ("📦" in text or "⭐" in text or "🍴" in text):
+            full_name = repo_url_match.group(1).lower()
+            # Extract display name from 📦 <name>
+            display_match = re.search(r'📦\s*(\S+)', text)
+            display_name = display_match.group(1) if display_match else full_name.split("/")[-1]
+
+            version_match = re.search(r'🔖\s*Версия:\s*(\S+)', text)
+            version = version_match.group(1) if version_match else ""
+
+            result.update({
+                "type": "repo_text",
+                "full_name": full_name,
+                "display_name": display_name,
+                "version": version,
+            })
+            return result
+
+        # ── File message ──
+        file_match = re.search(r'([A-Za-z0-9._-]+\.zip(?:\.7z\.(\d+))?)', text, re.IGNORECASE)
+        if file_match:
+            full_filename = file_match.group(1)
+            volume = file_match.group(2)
+
+            result.update({
+                "type": "file",
+                "filename": full_filename,
+                "volume": volume,
+            })
+            return result
+
+        return result
+
+    def _resolve_file_owner(self, filename: str, known_repos: dict[str, str]) -> str | None:
+        """
+        Match a filename (owner-repo-branch.zip) to a known repo from text messages.
+        known_repos: {full_name: display_name}
+        Matches longest prefix first to avoid false matches (e.g. a/b-c vs a/b).
+        """
+        name_lower = filename.lower()
+        # Sort by prefix length descending — most specific first
+        sorted_repos = sorted(known_repos.items(), key=lambda x: len(x[0]), reverse=True)
+        for full_name in sorted_repos:
+            owner, repo = full_name[0].split("/", 1)
+            prefix = f"{owner}-{repo}-"
+            if name_lower.startswith(prefix.lower()):
+                return full_name[0]
+        return None
+
+    def group_messages_by_repo(self, messages: list[dict]) -> dict:
+        """
+        Group parsed messages by repository.
+
+        Returns:
+            {
+                "complete": [ ... ],
+                "incomplete": [ ... ]
+            }
+        Each group dict:
+            full_name, display_name, text_idx, file_idxs, volumes, version, issue
+        """
+        # Pass 1: collect all repo_text entries and build full_name lookup
+        repo_texts: dict[str, dict] = {}
+        file_msgs: list[dict] = []
+
+        for msg in messages:
+            parsed = self.parse_message(msg)
+            if parsed["type"] == "repo_text":
+                fn = parsed["full_name"]
+                if fn not in repo_texts:
+                    repo_texts[fn] = parsed
+            elif parsed["type"] == "file":
+                file_msgs.append(parsed)
+
+        # Build known_repos lookup for filename matching
+        known_repos = {fn: rt.get("display_name", fn.split("/")[-1]) for fn, rt in repo_texts.items()}
+
+        # Pass 2: assign files to repos
+        repo_files: dict[str, list[dict]] = {fn: [] for fn in repo_texts}
+        orphaned_files: list[dict] = []
+
+        for fm in file_msgs:
+            fn = None
+            if fm["filename"]:
+                fn = self._resolve_file_owner(fm["filename"], known_repos)
+            if fn:
+                repo_files.setdefault(fn, []).append(fm)
+            else:
+                orphaned_files.append(fm)
+
+        # Pass 3: build result groups
+        complete = []
+        incomplete = []
+
+        for fn, rt in repo_texts.items():
+            files = repo_files.get(fn, [])
+            file_idxs = [f["idx"] for f in files]
+            volumes = [f["volume"] for f in files if f.get("volume")]
+
+            if not files:
+                incomplete.append({
+                    "full_name": fn,
+                    "display_name": rt.get("display_name", fn.split("/")[-1]),
+                    "text_idx": rt["idx"],
+                    "file_idxs": [],
+                    "volumes": [],
+                    "version": rt.get("version", ""),
+                    "issue": "missing_file",
+                })
+            elif volumes:
+                # Check for missing volumes
+                vol_nums = sorted(set(v for v in volumes if v))
+                if vol_nums:
+                    expected = set(f"{i:03d}" for i in range(1, int(vol_nums[-1]) + 1))
+                    missing = expected - set(vol_nums)
+                    if missing:
+                        incomplete.append({
+                            "full_name": fn,
+                            "display_name": rt.get("display_name", fn.split("/")[-1]),
+                            "text_idx": rt["idx"],
+                            "file_idxs": file_idxs,
+                            "volumes": vol_nums,
+                            "missing_volumes": sorted(missing),
+                            "version": rt.get("version", ""),
+                            "issue": "missing_volumes",
+                        })
+                        continue
+                complete.append({
+                    "full_name": fn,
+                    "display_name": rt.get("display_name", fn.split("/")[-1]),
+                    "text_idx": rt["idx"],
+                    "file_idxs": file_idxs,
+                    "volumes": volumes,
+                    "version": rt.get("version", ""),
+                    "issue": None,
+                })
+            else:
+                complete.append({
+                    "full_name": fn,
+                    "display_name": rt.get("display_name", fn.split("/")[-1]),
+                    "text_idx": rt["idx"],
+                    "file_idxs": file_idxs,
+                    "volumes": [],
+                    "version": rt.get("version", ""),
+                    "issue": None,
+                })
+
+        # Orphaned files (no text message found)
+        for of in orphaned_files:
+            incomplete.append({
+                "full_name": of.get("full_name") or of.get("filename", "unknown"),
+                "display_name": of.get("filename", "unknown"),
+                "text_idx": None,
+                "file_idxs": [of["idx"]],
+                "volumes": [of["volume"]] if of.get("volume") else [],
+                "filename": of.get("filename", ""),
+                "issue": "missing_text",
+            })
+
+        return {"complete": complete, "incomplete": incomplete}
+
+    def audit_channel_completeness(self) -> dict:
+        """
+        Full audit of the MAX channel:
+          1. Scroll to top (load all messages)
+          2. Classify every message
+          3. Group by repo
+          4. Check completeness
+
+        Returns:
+            { "complete": [...], "incomplete": [...] }
+        """
+        print("\n  [SCAN] Загрузка всех сообщений канала... (может занять время)")
+        print("  [SCAN] Программа скроллит ленту вверх — пожалуйста, не трогайте браузер")
+
+        messages = self.collect_all_messages()
+        print(f"  [SCAN] Загружено {len(messages)} сообщений, классифицирую...")
+
+        grouped = self.group_messages_by_repo(messages)
+
+        print(f"  [AUDIT] Complete: {len(grouped['complete'])}, "
+              f"Incomplete: {len(grouped['incomplete'])}")
+
+        return grouped
+
+    def verify_repo_publication(self, full_name: str) -> bool:
+        """
+        Quick check after upload: verify the repo has both text + file in the feed.
+        Only scans recent messages (last 20) — does NOT scroll to top.
+        """
+        self._check_connection()
+
+        script = f"""
+            () => {{
+                const msgs = document.querySelectorAll('[class*="message"]');
+                const lastN = Math.min(msgs.length, 20);
+                const startIdx = msgs.length - lastN;
+
+                let foundText = false;
+                let foundFile = false;
+
+                const searchLower = '{full_name.lower()}'.replace('/', '-');
+
+                for (let i = startIdx; i < msgs.length; i++) {{
+                    const text = msgs[i].textContent || '';
+
+                    if (text.includes('📦') && text.toLowerCase().includes('{full_name.lower()}')) {{
+                        foundText = true;
+                        continue;
+                    }}
+
+                    if (text.toLowerCase().includes(searchLower) && /\\.zip/i.test(text)) {{
+                        foundFile = true;
+                        continue;
+                    }}
+                }}
+
+                return foundText && foundFile;
+            }}
+        """
+
+        try:
+            return bool(self.page.evaluate(script))
+        except Exception:
+            return False
+
+    def _click_delete_element(self, x: float, y: float) -> bool:
+        """
+        Click an element found near the message, then handle the confirmation dialog.
+        After clicking delete, waits for confirmation popup and clicks it.
+        """
+        self.page.mouse.click(x, y)
+        self.page.wait_for_timeout(500)
+        return self._handle_delete_confirmation()
+
+    def _find_delete_button_after_hover(self) -> dict | None:
+        """
+        After hovering over a message, scan the page for any clickable
+        delete-related element (button, icon, text, etc.).
+        """
+        return self.page.evaluate("""
+            () => {
+                const all = document.querySelectorAll('*');
+                const msgRect = window.__gitax_hovered_rect;
+                const nearY = msgRect ? msgRect.y : 0;
+                const nearH = msgRect ? msgRect.h : 200;
+
+                for (const el of all) {
+                    if (el.offsetHeight === 0 || el.offsetParent === null) continue;
+                    if (el.offsetWidth > 400 && el.offsetHeight > 200) continue;
+
+                    const text = (el.textContent || '').trim();
+                    const cls = el.getAttribute('class') || '';
+                    const aria = el.getAttribute('aria-label') || '';
+                    const title = el.getAttribute('title') || '';
+                    const tag = el.tagName.toLowerCase();
+
+                    const allText = text + ' ' + cls + ' ' + aria + ' ' + title;
+
+                    // Must be near the hovered message
+                    if (msgRect) {
+                        try {
+                            const r = el.getBoundingClientRect();
+                            if (Math.abs(r.y - nearY) > nearH * 4) continue;
+                        } catch(e) { continue; }
+                    }
+
+                    // Check text (including "Delete for all")
+                    if (/delete|удалить|remove|trash|✕|×|🗑|delete for all|удалить для всех|удалить сообщение/i.test(allText)) {
+                        const r = el.getBoundingClientRect();
+                        return { x: r.x + r.width / 2, y: r.y + r.height / 2, w: r.width, h: r.height, text: text.slice(0, 40) };
+                    }
+
+                    // Check for SVG trash icon
+                    if (tag === 'svg' || tag === 'path' || tag === 'use') {
+                        const parentText = (el.parentElement?.textContent || '').trim();
+                        const parentCls = (el.parentElement?.getAttribute('class') || '');
+                        if (/delete|trash|remove|удалить/i.test(parentCls) || /delete|trash|remove|удалить/i.test(parentText)) {
+                            const r = el.getBoundingClientRect();
+                            return { x: r.x + r.width / 2, y: r.y + r.height / 2, w: r.width, h: r.height, text: '(svg)', fromSvg: true };
+                        }
+                    }
+                }
+                return null;
+            }
+        """)
+
+    def _handle_delete_confirmation(self) -> bool:
+        """
+        Handle the "Delete for all" / "Удалить для всех" confirmation dialog
+        that appears after clicking the delete button.
+        Waits, finds the confirm button, clicks it with real mouse.
+        Returns True if confirmation was handled.
+        """
+        self.page.wait_for_timeout(800)
+
+        for attempt in range(8):
+            btn_rect = self.page.evaluate("""
+                () => {
+                    const all = document.querySelectorAll('*');
+                    for (const el of all) {
+                        if (el.offsetHeight === 0 || el.offsetParent === null) continue;
+                        const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                        const t = (el.textContent || '').trim().toLowerCase();
+                        // Look for the confirm button via aria or exact text
+                        if (aria === 'delete for all' || aria === 'удалить для всех') {
+                            const r = el.getBoundingClientRect();
+                            return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+                        }
+                        // Fallback: button element with matching text
+                        if (el.tagName === 'BUTTON' && (t === 'delete for all' || t === 'удалить для всех')) {
+                            const r = el.getBoundingClientRect();
+                            return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+                        }
+                    }
+                    return null;
+                }
+            """)
+
+            if btn_rect:
+                self.page.mouse.click(btn_rect['x'], btn_rect['y'])
+                self.logger.debug("Delete confirmed")
+                self.page.wait_for_timeout(500)
+                return True
+
+            self.page.wait_for_timeout(400)
+
+        self.logger.warning("Delete confirmation dialog not found")
+        return False
+
+    def _locate_and_delete_by_text(self, search_text: str) -> bool:
+        """
+        Find a visible message element containing search_text,
+        hover, open action menu (three dots), find Delete, click, confirm.
+
+        MAX flow: Hover → click "Действия с сообщением" (3-dot button) →
+        popup menu with "Delete" (danger style) → click → confirm dialog.
+
+        Returns True if deleted.
+        """
+        # Step 1: Find the message in visible DOM
+        rect = self.page.evaluate(f"""
+            () => {{
+                const msgs = document.querySelectorAll('[class*="message"]');
+                const search = {repr(search_text.lower())};
+                for (const msg of msgs) {{
+                    const t = (msg.textContent || '').toLowerCase();
+                    if (t.includes(search)) {{
+                        msg.scrollIntoView({{ block: 'center', behavior: 'instant' }});
+                        const r = msg.getBoundingClientRect();
+                        window.__gitax_hovered_rect = {{ x: r.x, y: r.y, w: r.width, h: r.height }};
+                        return {{ x: r.x + r.width / 2, y: r.y + r.height / 2 }};
+                    }}
+                }}
+                return null;
+            }}
+        """)
+        if not rect:
+            return False
+
+        # Step 2: Hover to reveal action buttons
+        self.page.mouse.move(rect['x'], rect['y'])
+        self.page.wait_for_timeout(800)
+
+        # Step 3: Click "Действия с сообщением" button (the 3-dot menu)
+        actions_btn = self.page.evaluate("""
+            () => {
+                const all = document.querySelectorAll('*');
+                const msgR = window.__gitax_hovered_rect;
+                for (const el of all) {
+                    if (el.offsetHeight === 0 || el.offsetParent === null) continue;
+                    const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                    if (aria.includes('действия с сообщением') || aria.includes('message actions')) {
+                        const r = el.getBoundingClientRect();
+                        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+                    }
+                }
+                return null;
+            }
+        """)
+        if actions_btn:
+            self.page.mouse.click(actions_btn['x'], actions_btn['y'])
+            self.page.wait_for_timeout(600)
+
+            # Step 4: Find "Delete" in the popup menu and CLICK it with real mouse
+            delete_btn_rect = self.page.evaluate("""
+                () => {
+                    const all = document.querySelectorAll('*');
+                    for (const el of all) {
+                        if (el.offsetHeight === 0 || el.offsetParent === null) continue;
+                        const t = (el.textContent || '').trim().toLowerCase();
+                        const role = el.getAttribute('role') || '';
+                        if (t === 'delete' && role === 'menuitem') {
+                            const r = el.getBoundingClientRect();
+                            return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+                        }
+                    }
+                    return null;
+                }
+            """)
+            if delete_btn_rect:
+                self.page.mouse.click(delete_btn_rect['x'], delete_btn_rect['y'])
+                self.page.wait_for_timeout(800)
+                return self._handle_delete_confirmation()
+
+        # Step 5: Try right-click context menu (may work for file messages)
+        self.page.mouse.click(rect['x'], rect['y'], button='right')
+        self.page.wait_for_timeout(700)
+
+        ctx_delete = self.page.evaluate("""
+            () => {
+                const all = document.querySelectorAll('*');
+                for (const el of all) {
+                    if (el.offsetHeight === 0 || el.offsetParent === null) continue;
+                    const t = (el.textContent || '').trim().toLowerCase();
+                    const role = el.getAttribute('role') || '';
+                    if (t === 'delete' && role === 'menuitem') {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            }
+        """)
+        if ctx_delete:
+            self.page.wait_for_timeout(300)
+            return self._handle_delete_confirmation()
+
+        return False
+
+    def delete_messages_by_content(self, search_terms: list[str], label: str = "") -> int:
+        """
+        Scroll down through the feed, find and DELETE ALL messages
+        matching any of the search_terms (case-insensitive).
+
+        Each term can match MULTIPLE messages (e.g. all 20 file volumes).
+        Keeps deleting until the entire feed is exhausted.
+
+        Returns count of deleted messages.
+        """
+        self._check_connection()
+        label_str = f" ({label})" if label else ""
+        print(f"  [DELETE{label_str}] Поиск и удаление сообщений...")
+
+        deleted = 0
+        failed_sigs: set[str] = set()
+        no_new = 0
+        no_delete_in_row = 0
+        scroll_sigs: set[str] = set()
+
+        for step in range(500):
+            if no_delete_in_row >= 10:
+                break
+
+            # Find all messages matching ANY search term in the visible DOM
+            matches = self.page.evaluate(f"""
+                () => {{
+                    const terms = {[s.lower() for s in search_terms]};
+                    const msgs = document.querySelectorAll('[class*="message"]');
+                    const result = [];
+                    for (const msg of msgs) {{
+                        const t = (msg.textContent || '').trim();
+                        if (!t) continue;
+                        const lower = t.toLowerCase();
+                        for (const term of terms) {{
+                            if (lower.includes(term)) {{
+                                result.push({{ sig: t.slice(0, 80), idx: result.length }});
+                                break;
+                            }}
+                        }}
+                    }}
+                    return result;
+                }}
+            """) or []
+
+            if matches:
+                no_new = 0
+                found_and_deleted = False
+
+                for m in matches:
+                    sig = m['sig']
+                    if sig in failed_sigs:
+                        continue
+
+                    print(f"    [DELETE{label_str}] Найдено: \"{sig[:50]}...\"")
+                    if self._locate_and_delete_by_text(sig[:50]):
+                        deleted += 1
+                        found_and_deleted = True
+                        no_delete_in_row = 0
+                        print(f"    ✓ Удалено ({deleted})")
+                        self.page.wait_for_timeout(800)
+                        break  # DOM changed, re-evaluate in next step
+                    else:
+                        failed_sigs.add(sig)
+                        print(f"    ⚠ Не удалось удалить")
+
+                if not found_and_deleted:
+                    no_delete_in_row += 1
+
+                # Track scroll sigs for end-of-feed detection
+                for m in matches:
+                    scroll_sigs.add(m['sig'])
+            else:
+                no_new += 1
+                if no_new >= 10:
+                    break
+
+            # Scroll down one viewport
+            self.page.evaluate("""
+                () => {
+                    const c = window.__gitax_scroll;
+                    if (c) {
+                        const step = Math.max(100, c.clientHeight * 0.7);
+                        c.scrollBy(0, step);
+                    } else {
+                        window.scrollBy(0, window.innerHeight * 0.7);
+                    }
+                }
+            """)
+            self.page.wait_for_timeout(400)
+
+        print(f"  [DELETE{label_str}] Итого удалено: {deleted}")
+        return deleted
+
+    def inspect_message_actions(self, msg_index: int):
+        """
+        Debug helper — prints all visible elements near a message.
+        Call after hovering over a message to see what MAX shows.
+        """
+        self._check_connection()
+        info = self.page.evaluate(f"""
+            () => {{
+                const msgs = document.querySelectorAll('[class*="message"]');
+                const msg = msgs[{msg_index}];
+                if (!msg) return 'message_not_found';
+
+                msg.scrollIntoView({{ block: 'center', behavior: 'instant' }});
+                const rect = msg.getBoundingClientRect();
+
+                const visible = [];
+                const all = document.querySelectorAll('*');
+                for (const el of all) {{
+                    if (el.offsetHeight === 0 || el.offsetParent === null) continue;
+                    const r = el.getBoundingClientRect();
+                    if (Math.abs(r.y - rect.y) < rect.h * 3) {{
+                        const t = (el.textContent || '').trim().slice(0, 60);
+                        const cls = (el.getAttribute('class') || '').slice(0, 60);
+                        const tag = el.tagName;
+                        visible.push({{ tag: tag, text: t || '(no text)', cls: cls, x: r.x, y: r.y, w: r.width, h: r.height }});
+                    }}
+                    if (visible.length > 40) break;
+                }}
+                return visible;
+            }}
+        """)
+
+        if isinstance(info, str):
+            print(f"  [INSPECT] {info}")
+            return
+
+        print(f"\n  [INSPECT] Elements near message #{msg_index}:")
+        for el in info:
+            print(f"    <{el['tag']}> text=\"{el['text']}\"")
+            print(f"      class={el['cls']}")
+            print(f"      pos=({el['x']:.0f},{el['y']:.0f}) size={el['w']}x{el['h']}")
+
+    def _confirm_delete(self):
+        """Legacy — delegates to _handle_delete_confirmation."""
+        self._handle_delete_confirmation()
+
     def close(self):
         """Close browser connection gracefully"""
         self.logger.debug("Closing connection...")
