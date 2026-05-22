@@ -274,6 +274,21 @@ class BrowserMAX(LogMixin):
             self.page.goto(self.channel_url, wait_until="domcontentloaded", timeout=30000)
             time.sleep(2)
 
+    def _try_navigate(self) -> bool:
+        """
+        Safely navigate to MAX channel. Reconnects if needed.
+        Returns True if navigation succeeded.
+        """
+        if not self._ensure_alive():
+            return False
+        try:
+            self.page.goto(self.channel_url, wait_until="domcontentloaded", timeout=30000)
+            time.sleep(2)
+            return True
+        except Exception as e:
+            self.logger.warning(f"Navigation failed: {e}")
+            return False
+
     def wait_page_ready(self, timeout: int = 30):
         """Wait for page to be ready"""
         if not self._ensure_alive():
@@ -516,6 +531,152 @@ class BrowserMAX(LogMixin):
 
         return messages
 
+    def _collect_via_page_state(self) -> list[dict]:
+        """
+        Try to extract message data from the page's internal JavaScript state.
+        Checks React fibers, Vue stores, and common global variables.
+        All heavy lifting happens inside page.evaluate (JS context) where
+        DOM objects are directly accessible. Returns only serializable data.
+
+        Returns list of dicts (same format as collect_all_messages) or empty list.
+        """
+        try:
+            raw = self.page.evaluate("""
+                () => {
+                    const results = [];
+
+                    // Helper to extract messages from a state tree
+                    function extractTexts(obj, depth) {
+                        if (!obj || depth > 8) return [];
+                        let texts = [];
+                        if (Array.isArray(obj)) {
+                            for (const item of obj) {
+                                if (item && typeof item === 'object') {
+                                    const t = item.text || item.content || item.body || item.message || '';
+                                    if (typeof t === 'string' && t.length > 20) texts.push(t);
+                                    texts = texts.concat(extractTexts(item, depth + 1));
+                                }
+                            }
+                        } else if (obj && typeof obj === 'object') {
+                            for (const key of Object.keys(obj)) {
+                                const kl = key.toLowerCase();
+                                if (['messages','items','feed','lenta','chat','history',
+                                     'entries','results','data','records','rows',
+                                     'collection','nodes','edges'].includes(kl)) {
+                                    texts = texts.concat(extractTexts(obj[key], depth + 1));
+                                }
+                            }
+                        }
+                        return texts;
+                    }
+
+                    // 1) Common SSR / SPA initial state globals
+                    const globals = [
+                        '__INITIAL_STATE__', '__INITIAL_DATA__', '__DATA__',
+                        '__STORE__', '__STATE__', '__APP_STATE__', '__DATA_STATE__',
+                        '__INITIAL_PROPS__', '__NEXT_DATA__', '__NUXT__',
+                        '___INITIAL_STATE___', 'window.__INITIAL_STORE__'
+                    ];
+                    for (const g of globals) {
+                        try {
+                            if (window[g] !== undefined) {
+                                const texts = extractTexts(window[g], 0);
+                                if (texts.length) {
+                                    results.push({ source: g, data: texts });
+                                }
+                            }
+                        } catch(e) {}
+                    }
+
+                    // 2) React fiber: walk the root fiber for cached message state
+                    const roots = document.querySelectorAll('#root, #__next, #app, #__nuxt');
+                    for (const root of roots) {
+                        try {
+                            const key = Object.keys(root).find(k => k.startsWith('__reactFiber$'));
+                            if (!key || !root[key]) continue;
+
+                            function walkFiber(fiber, depth) {
+                                if (!fiber || depth > 30) return [];
+                                let texts = [];
+                                try {
+                                    let state = fiber.memoizedState;
+                                    while (state) {
+                                        if (state.queue && state.queue.lastRenderedState) {
+                                            const st = state.queue.lastRenderedState;
+                                            if (st && typeof st === 'object') {
+                                                texts = texts.concat(extractTexts(st, 0));
+                                            }
+                                        }
+                                        state = state.next;
+                                    }
+                                    texts = texts.concat(walkFiber(fiber.child, depth + 1));
+                                    texts = texts.concat(walkFiber(fiber.sibling, depth + 1));
+                                } catch(e) {}
+                                return texts;
+                            }
+
+                            const fiberTexts = walkFiber(root[key], 0);
+                            if (fiberTexts.length) {
+                                results.push({ source: 'reactFiber', data: fiberTexts });
+                            }
+                        } catch(e) {}
+                    }
+
+                    // 3) Vue app
+                    try {
+                        const app = document.getElementById('__nuxt') || document.getElementById('app');
+                        if (app && app.__vue_app__) {
+                            const state = app.__vue_app__.config.globalProperties;
+                            const texts = extractTexts(state, 0);
+                            if (texts.length) results.push({ source: 'vueApp', data: texts });
+                        }
+                    } catch(e) {}
+
+                    // 4) Redux store (if exposed via window)
+                    try {
+                        if (window.__store__ && window.__store__.getState) {
+                            const texts = extractTexts(window.__store__.getState(), 0);
+                            if (texts.length) results.push({ source: 'redux', data: texts });
+                        }
+                    } catch(e) {}
+
+                    return results;
+                }
+            """) or []
+        except Exception as e:
+            self.logger.debug(f"Page state extraction error: {e}")
+            return []
+
+        if not raw:
+            return []
+
+        messages = []
+        seen_sigs: set[str] = set()
+
+        for entry in raw:
+            data = entry.get('data', [])
+            source = entry.get('source', '')
+            if isinstance(data, list):
+                for text in data:
+                    if isinstance(text, str) and text.strip():
+                        sig = text[:120]
+                        if sig not in seen_sigs:
+                            seen_sigs.add(sig)
+                            messages.append({
+                                "idx": len(messages),
+                                "text": text,
+                                "html": '',
+                                "classes": '',
+                            })
+
+        if messages:
+            print(f"  [STATE] Извлечено {len(messages)} сообщений из состояния страницы ({len(raw)} источников)")
+            self.logger.info(f"Extracted {len(messages)} messages from page state ({len(raw)} sources)")
+        else:
+            self.logger.info(f"No messages found in page state ({len(raw)} sources checked)")
+
+        return messages
+
     def _scroll_to_bottom(self):
         """Scroll the feed to the bottom to trigger content reload."""
         self.page.evaluate("""
@@ -556,6 +717,7 @@ class BrowserMAX(LogMixin):
 
     def _click_upload_button(self):
         """Find and click upload/file button - handles dropdown menu"""
+        self._ensure_alive()
         self._check_connection()
         self.logger.info("Looking for upload button...")
 
@@ -584,9 +746,10 @@ class BrowserMAX(LogMixin):
         try:
             upload_btn = self.page.locator('[aria-label="Upload file"]').first
             upload_btn.click()
-            time.sleep(0.3)
+            time.sleep(0.5)
 
-            file_btn = self.page.get_by_text("File")
+            self.logger.info("Looking for File menu item...")
+            file_btn = self.page.get_by_role("menuitem", name="File", exact=True).first
             file_btn.click(timeout=5000)
             self.logger.info("Upload > File clicked")
             return True
@@ -2077,6 +2240,22 @@ class BrowserMAX(LogMixin):
             try:
                 self.logger.debug(f"Attempt {attempt}/{retries}")
 
+                # Reconnect and re-navigate if page was closed during previous attempt
+                if not self._ensure_alive():
+                    self.logger.error("Cannot reconnect to Chrome")
+                    if attempt < retries:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        return False
+                if not self._try_navigate():
+                    self.logger.error("Cannot navigate to channel after reconnect")
+                    if attempt < retries:
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        return False
+
                 upload_timeout = max(60000, int(file_size_mb * 5000))
                 self.logger.debug(f"Upload timeout: {upload_timeout//1000}s")
 
@@ -2364,12 +2543,17 @@ class BrowserMAX(LogMixin):
 
         return total
 
-    def collect_all_messages(self, passes: int = 1) -> list[dict]:
+    def collect_all_messages(self, passes: int = 1, max_stale: int = 0) -> list[dict]:
         """
         Load ALL messages by scrolling to top while collecting message data
         at each scroll position. Supports multiple passes — after scrolling to
         top, scrolls back to bottom and repeats to load content that MAX may
         have cached differently on subsequent passes.
+
+        Supports two modes:
+          - Exact passes:  passes=N, max_stale=0 — runs exactly N passes
+          - Auto converge:  passes=0, max_stale=N — runs until N consecutive
+            passes yield zero new signatures
 
         Unlike scroll_to_top() which only collects text signatures, this captures
         full message data (text, html, classes) for every unique message that
@@ -2380,8 +2564,8 @@ class BrowserMAX(LogMixin):
         most messages.
 
         Args:
-            passes: Number of scroll passes (default 1). 3 passes typically
-                   reveals 2-3x more messages than a single pass.
+            passes: Number of scroll passes (default 1). Set to 0 for auto.
+            max_stale: Stop after N passes with no new signatures (0 = disabled).
 
         Returns:
             List of dicts in detection order.
@@ -2392,19 +2576,25 @@ class BrowserMAX(LogMixin):
         all_signatures: set[str] = set()
         all_messages: list[dict] = []
         max_steps = 500
+        stale_count = 0
+        total_passes = 0
+        pass_limit = passes if passes > 0 else 999  # upper bound for auto mode
 
-        for current_pass in range(passes):
-            if current_pass > 0:
-                # Scroll to bottom to reload content between passes
+        while True:
+            current_pass = total_passes
+            if total_passes > 0:
                 self._scroll_to_bottom()
                 self.page.wait_for_timeout(2000)
 
-            pass_label = f"проход {current_pass + 1}/{passes}" if passes > 1 else ""
-            if pass_label:
-                print(f"  [SCROLL] {pass_label}, скролл вверх...")
-            else:
-                print(f"  [SCROLL] Загрузка всех сообщений, скролл вверх...")
+            total_passes += 1
+            auto_mode = passes == 0 and max_stale > 0
+            pass_label = f"проход {total_passes}/{pass_limit}" if passes > 0 else f"проход {total_passes}"
 
+            print(f"  [SCROLL] {pass_label}, скролл вверх...")
+
+            # Count signatures before this pass (to detect stale)
+            sigs_before = len(all_signatures)
+            found_any = False
             no_new = 0
 
             # Try to focus the scroll container
@@ -2435,7 +2625,6 @@ class BrowserMAX(LogMixin):
 
             for step in range(max_steps):
                 try:
-                    # Get all currently-rendered message signatures (lightweight)
                     current_sigs = self.page.evaluate("""
                         () => {
                             const msgs = document.querySelectorAll('[class*="message"]');
@@ -2445,7 +2634,6 @@ class BrowserMAX(LogMixin):
                         }
                     """) or []
 
-                    # Find new signatures
                     new_sig_set: set[str] = set()
                     for s in current_sigs:
                         if s and s not in all_signatures:
@@ -2454,11 +2642,8 @@ class BrowserMAX(LogMixin):
 
                     if new_sig_set:
                         no_new = 0
+                        found_any = True
 
-                        # Get full message data only for new entries
-                        # Filter to top-level message containers (parent does not
-                        # have "message" in class) to avoid collecting nested
-                        # header/body/footer sub-elements as separate entries.
                         new_data = self.page.evaluate("""
                             (newSigs) => {
                                 const newSet = new Set(newSigs);
@@ -2467,7 +2652,6 @@ class BrowserMAX(LogMixin):
                                 const result = [];
                                 for (const m of msgs) {
                                     const p = m.parentElement;
-                                    // Skip nested message elements (header, body, footer, etc.)
                                     if (p && p.matches && p.matches('[class*="message"]')) continue;
                                     const t = (m.textContent || '').trim();
                                     const sig = t.slice(0, 120);
@@ -2497,10 +2681,10 @@ class BrowserMAX(LogMixin):
                     else:
                         no_new += 1
                         if no_new >= 15:
-                            print(f"  [SCROLL] Достигнут верх (шаг {step}) — {len(all_signatures)} уникальных сообщений")
+                            if step > 0:
+                                print(f"  [SCROLL] Достигнут верх (шаг {step}) — {len(all_signatures)} уникальных сообщений")
                             break
 
-                    # Scroll up
                     scrolled = self.page.evaluate("""
                         () => {
                             const c = window.__gitax_scroll;
@@ -2538,12 +2722,32 @@ class BrowserMAX(LogMixin):
                     if no_new >= 15:
                         break
 
-            if pass_label:
-                print(f"  [SCROLL] {pass_label} завершён: +{len(all_signatures)} всего")
-            total = len(all_signatures)
+            sigs_after = len(all_signatures)
+            new_in_pass = sigs_after - sigs_before
 
-        print(f"  [SCROLL] Итого: {total} уникальных сообщений")
-        self.logger.info(f"Total unique messages collected via scroll: {len(all_messages)} ({passes} pass(es))")
+            print(f"  [SCROLL] {pass_label} завершён: +{new_in_pass} новых сигнатур, всего {sigs_after}")
+
+            # Convergence check
+            if auto_mode:
+                if new_in_pass == 0:
+                    stale_count += 1
+                    print(f"  [SCROLL] Без прогресса ({stale_count}/{max_stale})")
+                    if stale_count >= max_stale:
+                        print(f"  [SCROLL] {max_stale} проходов без прогресса — остановка")
+                        break
+                else:
+                    stale_count = 0
+
+                if total_passes >= pass_limit:
+                    print(f"  [SCROLL] Достигнут лимит проходов ({pass_limit}) — остановка")
+                    break
+            else:
+                if total_passes >= passes:
+                    break
+
+        total = len(all_signatures)
+        print(f"  [SCROLL] Итого: {total} уникальных сообщений за {total_passes} проходов")
+        self.logger.info(f"Total unique messages: {len(all_messages)} ({total_passes} passes)")
 
         return all_messages
 
@@ -2746,36 +2950,129 @@ class BrowserMAX(LogMixin):
 
         return {"complete": complete, "incomplete": incomplete}
 
-    def audit_channel_completeness(self) -> dict:
+    def _quick_extract_repos(self, messages: list[dict]) -> set[str]:
+        """
+        Fast extraction of repo full_names from a list of message dicts.
+        Uses the same regex as parse_message but without full classification.
+        Returns a set of "owner/repo" strings.
+        """
+        found: set[str] = set()
+        for msg in messages:
+            text = msg.get("text", "")
+            match = re.search(
+                r'github\.com[\/:]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)',
+                text
+            )
+            if match:
+                fn = match.group(1).lower()
+                if "/" in fn:
+                    found.add(fn)
+        return found
+
+    def audit_channel_completeness(self, known_repos: set[str] | None = None) -> dict:
         """
         Full audit of the MAX channel:
-          1. Try API response interception (fast, covers all history)
-          2. If API fails → scroll with 3 passes (slower, partial coverage)
-          3. Classify every message
-          4. Group by repo
-          5. Check completeness
+          1. API response interception (fast, covers API-served history)
+          2. Internal page state (React/Vue stores)
+          3. Iterative DOM scroll until convergence (stale detection)
+          4. Classify every message
+          5. Group by repo
+          6. Show progress against known_repos if provided
+
+        The 3-source approach ensures ANY length feed is fully audited:
+          - API: unlimited, catches all messages ever loaded by the page
+          - Page state: catches what MAX holds in memory/React store
+          - DOM scroll: catches everything MAX renders, iterates until stale
+
+        Args:
+            known_repos: Set of "owner/repo" full_names from journal.
+                         If provided, shows coverage progress per pass.
 
         Returns:
             { "complete": [...], "incomplete": [...] }
         """
-        print("\n  [SCAN] Проверка целостности публикаций...")
+        print("\n  [SCAN] Проверка целостности публикаций (3 источника)...")
 
-        # Strategy 1: API interception — do one scroll pass to trigger API calls
-        print("  [SCAN] Сбор сообщений через API...")
-        self.collect_all_messages(passes=1)
-        messages = self._parse_messages_from_api()
-        source = "API"
+        all_by_sig: dict[str, dict] = {}
+        total_known = len(known_repos) if known_repos else 0
 
-        if not messages:
-            # Strategy 2: Multi-pass DOM scroll
-            print("  [SCAN] API не дал результатов, многопроходный скролл DOM...")
+        def _add(m: dict):
+            sig = (m.get("text", "") or "")[:120]
+            if sig and sig not in all_by_sig:
+                all_by_sig[sig] = m
+
+        def _cover():
+            if total_known == 0:
+                return 0, 0
+            found = self._quick_extract_repos(list(all_by_sig.values()))
+            covered = len(found & known_repos) if known_repos else 0
+            return covered, len(found)
+
+        # ── Источник A: API-перехват ──
+        print("  [SCAN] Источник A: перехват сетевых ответов...")
+        self.collect_all_messages(passes=1)  # triggers API calls via one scroll pass
+        api_msgs = self._parse_messages_from_api()
+        for m in api_msgs:
+            _add(m)
+        covered, found = _cover()
+        if total_known:
+            print(f"  [AUDIT] API: найдено {covered}/{total_known} репозиториев")
+        else:
+            print(f"  [AUDIT] API: {len(api_msgs)} сообщений")
+
+        # ── Источник B: Внутреннее состояние страницы ──
+        print("  [SCAN] Источник B: состояние страницы...")
+        state_msgs = self._collect_via_page_state()
+        for m in state_msgs:
+            _add(m)
+        covered_b, found_b = _cover()
+        if total_known:
+            print(f"  [AUDIT] State: +{covered_b - covered} репозиториев (всего {covered_b}/{total_known})")
+        else:
+            print(f"  [AUDIT] State: {len(state_msgs)} сообщений")
+
+        # ── Источник C: DOM-скролл до схождения ──
+        if total_known and covered_b >= total_known:
+            print(f"  [AUDIT] ✓ Все {total_known} репозиториев найдены, скролл не требуется")
+        else:
+            print("  [SCAN] Источник C: итеративный скролл DOM до схождения...")
             print("  [SCAN] Пожалуйста, не трогайте браузер")
-            messages = self.collect_all_messages(passes=3)
-            source = "DOM (3 прохода)"
 
-        print(f"  [SCAN] Загружено {len(messages)} сообщений ({source}), классифицирую...")
+            scroll_msgs = self.collect_all_messages(passes=0, max_stale=3)
+            prev_covered = covered_b
+            for m in scroll_msgs:
+                _add(m)
+            covered_c, found_c = _cover()
+            new_from_scroll = covered_c - prev_covered
+            if total_known:
+                print(f"  [AUDIT] DOM скролл: +{new_from_scroll} репозиториев (всего {covered_c}/{total_known})")
+            else:
+                print(f"  [AUDIT] DOM скролл: {len(scroll_msgs)} сообщений")
 
+        # ── Результат ──
+        messages = list(all_by_sig.values())
+        print(f"  [SCAN] Всего собрано: {len(messages)} сообщений")
+
+        if total_known > 0:
+            found_final = self._quick_extract_repos(messages)
+            truly_missing = known_repos - found_final
+            print(f"  [AUDIT] Найдено репозиториев: {len(found_final)}/{total_known}")
+            if truly_missing:
+                print(f"  [AUDIT] Не найдено в канале: {len(truly_missing)} — будут помечены для восстановления")
+                # Show top 5 missing
+                for fn in sorted(truly_missing)[:5]:
+                    print(f"           {fn}")
+                if len(truly_missing) > 5:
+                    print(f"           ... и ещё {len(truly_missing) - 5}")
+
+        print(f"  [SCAN] Классифицирую...")
         grouped = self.group_messages_by_repo(messages)
+
+        # Attach truly_missing to the result (for caller to use in restoration)
+        if total_known > 0:
+            grouped["truly_missing"] = truly_missing if 'truly_missing' in locals() else set()
+            grouped["found_count"] = len(found_final) if 'found_final' in locals() else 0
+            grouped["total_known"] = total_known
 
         print(f"  [AUDIT] Complete: {len(grouped['complete'])}, "
               f"Incomplete: {len(grouped['incomplete'])}")

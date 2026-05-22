@@ -955,30 +955,42 @@ class GitHubArchiver:
         """Display audit results in a formatted table."""
         complete = grouped.get("complete", [])
         incomplete = grouped.get("incomplete", [])
-        all_found = set()
-        for item in [*complete, *incomplete]:
-            fn = item.get("full_name", "")
-            if "/" in fn:
-                all_found.add(fn)
+        truly_missing = grouped.get("truly_missing", None)
+        found_count = grouped.get("found_count", 0)
+        total_known = grouped.get("total_known", 0)
 
-        # Also collect repo names from journal to show fully missing ones
-        journal_missing = []
-        known_journal = self.journal.get_all_repositories()
-        for entry in known_journal:
-            fn = entry.get("full_name", "")
-            if fn and "/" in fn and fn not in all_found:
-                journal_missing.append(entry)
+        # If audit_channel_completeness was called with known_repos, use truly_missing
+        # (more accurate — computed across all 3 sources). Otherwise fall back to
+        # journal scan (only DOM-scanned repos).
+        if truly_missing is not None:
+            journal_missing_names = sorted(truly_missing)
+        else:
+            all_found = set()
+            for item in [*complete, *incomplete]:
+                fn = item.get("full_name", "")
+                if "/" in fn:
+                    all_found.add(fn)
+            journal_missing_names = sorted(
+                e.get('full_name', '') for e in self.journal.get_all_repositories()
+                if e.get('full_name') and '/' in e['full_name'] and e['full_name'] not in all_found
+            )
 
         print("\n" + "═" * 60)
         print("          АУДИТ ЦЕЛОСТНОСТИ ПУБЛИКАЦИЙ")
         print("═" * 60)
         print(f"  ✅ Полных публикаций: {len(complete)}")
         print(f"  ⚠ Неполных публикаций: {len(incomplete)}")
-        if journal_missing:
-            print(f"  ❌ Из журнала не опубликовано: {len(journal_missing)}")
+        if truly_missing is not None and total_known:
+            print(f"  📊 Найдено: {found_count}/{total_known} репозиториев")
+        if journal_missing_names:
+            print(f"  ❌ Из журнала не опубликовано: {len(journal_missing_names)}")
         print("─" * 60)
 
-        if not incomplete and not journal_missing:
+        no_issues = not incomplete and not journal_missing_names
+        if truly_missing is not None and total_known and found_count >= total_known:
+            no_issues = True
+
+        if no_issues:
             print("\n  ✓ Все публикации целостны!")
             return
 
@@ -1004,7 +1016,6 @@ class GitHubArchiver:
                 print(f"    {display:20s}  есть {have} томов, не хватает: {missing}")
 
         if missing_text_items:
-            # Group orphans by filename, count actual file copies
             orphan_groups: dict[str, int] = {}
             for item in missing_text_items:
                 fn = item.get("full_name", item.get("display_name", "?"))
@@ -1012,9 +1023,7 @@ class GitHubArchiver:
 
             print(f"\n  🗑 Файлы-сироты (без описания):")
             for fn, count in sorted(orphan_groups.items(), key=lambda x: -x[1]):
-                # Try to extract a readable name
                 short = fn.replace("-main.zip", ".zip").replace("-master.zip", ".zip")
-                # Remove 7z suffixes for readability
                 short = short.replace(".7z.", ".")
                 if short.endswith(".002") or short.endswith(".001"):
                     base = short.rsplit(".", 1)[0]
@@ -1022,14 +1031,15 @@ class GitHubArchiver:
                 else:
                     print(f"    {short:40s}  ({count} копий)")
 
-        if journal_missing:
-            print(f"\n  ❌ Не найдены в канале ({len(journal_missing)}):")
-            for entry in journal_missing[:20]:
-                fn = entry.get("full_name", "?")
-                stars = entry.get("stars", 0)
+        if journal_missing_names:
+            print(f"\n  ❌ Не найдены в канале ({len(journal_missing_names)}):")
+            for fn in journal_missing_names[:20]:
+                # Try to get stars from journal
+                entry = self.journal.get_repository(fn)
+                stars = entry.get("stars", 0) if entry else 0
                 print(f"    {fn:45s}  ⭐ {stars}")
-            if len(journal_missing) > 20:
-                print(f"    ... и ещё {len(journal_missing) - 20}")
+            if len(journal_missing_names) > 20:
+                print(f"    ... и ещё {len(journal_missing_names) - 20}")
 
         print()
 
@@ -1049,7 +1059,13 @@ class GitHubArchiver:
             input("\n  Нажмите Enter для возврата в меню...")
             return
 
-        grouped = browser.audit_channel_completeness()
+        # Build known_repos from journal for progress tracking
+        journal_repos = {
+            e['full_name'] for e in self.journal.get_all_repositories()
+            if e.get('full_name') and '/' in e['full_name']
+        }
+
+        grouped = browser.audit_channel_completeness(known_repos=journal_repos)
 
         self._show_audit_table(grouped)
 
@@ -1132,12 +1148,15 @@ class GitHubArchiver:
         # Optional: run a final verification
         if restored_count > 0:
             print("\n  Выполняю финальную верификацию...")
-            final = browser.audit_channel_completeness()
+            final = browser.audit_channel_completeness(known_repos=journal_repos)
             remaining = len(final.get("incomplete", []))
+            truly_missing = final.get("truly_missing", set())
             if remaining == 0:
                 print("  ✓ Все публикации целостны!")
             else:
                 print(f"  ⚠ Осталось {remaining} неполных публикаций")
+            if truly_missing:
+                print(f"  ⚠ Не найдено в канале: {len(truly_missing)} репозиториев")
 
         if browser:
             browser.close()
