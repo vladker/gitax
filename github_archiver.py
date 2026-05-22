@@ -912,9 +912,14 @@ class GitHubArchiver:
                 break
         else:
             parts = name.rsplit('-', 1)
-            if len(parts) != 2:
-                return None
-            prefix = parts[0]
+            if len(parts) == 2:
+                prefix = parts[0]
+            else:
+                # Try underscore as separator for names like 'test_full'
+                parts = name.rsplit('_', 1)
+                if len(parts) != 2:
+                    return None
+                prefix = parts[0]
 
         parts = prefix.split('-')
         if len(parts) < 2:
@@ -936,8 +941,9 @@ class GitHubArchiver:
         # 2) Verify via GitHub API
         for c in candidates:
             try:
-                resp = self.github_api.get(f"repos/{c}")
-                if resp and resp.get('id'):
+                o, r = c.split("/", 1)
+                details = self.github.get_repository_details(o, r)
+                if details and details.get('id'):
                     return c
             except Exception:
                 continue
@@ -998,11 +1004,11 @@ class GitHubArchiver:
                 print(f"    {display:20s}  есть {have} томов, не хватает: {missing}")
 
         if missing_text_items:
-            # Group orphans by filename for compact display
+            # Group orphans by filename, count actual file copies
             orphan_groups: dict[str, int] = {}
             for item in missing_text_items:
                 fn = item.get("full_name", item.get("display_name", "?"))
-                orphan_groups[fn] = orphan_groups.get(fn, 0) + 1
+                orphan_groups[fn] = orphan_groups.get(fn, 0) + len(item.get("file_idxs", []))
 
             print(f"\n  🗑 Файлы-сироты (без описания):")
             for fn, count in sorted(orphan_groups.items(), key=lambda x: -x[1]):
@@ -1065,11 +1071,24 @@ class GitHubArchiver:
         restored_count = 0
         skipped_count = 0
         error_count = 0
+        restored_repos: set[str] = set()
 
         for i, item in enumerate(incomplete, 1):
             fn = item.get("full_name", "?")
             display = item.get("display_name", fn.split("/")[-1])
             issue = item.get("issue", "?")
+
+            # Resolve canonical repo name, especially for orphans (filename → owner/repo)
+            canonical_fn = fn
+            if canonical_fn and "/" not in canonical_fn:
+                extracted = self._extract_repo_from_filename(canonical_fn)
+                if extracted and "/" in extracted:
+                    canonical_fn = extracted
+
+            # Skip if this repo was already restored (prevents N uploads for N orphan copies)
+            if canonical_fn and "/" in canonical_fn and canonical_fn in restored_repos:
+                skipped_count += 1
+                continue
 
             if restore_all:
                 choice = 'y'
@@ -1091,6 +1110,7 @@ class GitHubArchiver:
 
                 if success:
                     restored_count += 1
+                    restored_repos.add(canonical_fn)
                     print(f"  ✓ {display} — восстановлен")
                 else:
                     error_count += 1

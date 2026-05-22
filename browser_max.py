@@ -225,6 +225,9 @@ class BrowserMAX(LogMixin):
                 context = self.browser.contexts[0] if self.browser.contexts else self.browser.new_context()
                 self.page = context.pages[0] if context.pages else context.new_page()
 
+            # Install API response interceptor before any navigation
+            self._install_api_interceptor()
+
             self._connected = True
             self.logger.info("Connected successfully")
             return True
@@ -332,6 +335,212 @@ class BrowserMAX(LogMixin):
         except Exception as e:
             self.logger.debug(f"Safe evaluate error: {e}")
             return default
+
+    def _install_api_interceptor(self):
+        """
+        Install script that intercepts JSON API responses (fetch + XHR)
+        and stores them in window.__gitax_api_responses.
+        Called once before page navigation.
+        """
+        if not self.page:
+            return
+        try:
+            self.page.add_init_script("""
+                () => {
+                    // Avoid double-install
+                    if (window.__gitax_api_interceptor_installed) return;
+                    window.__gitax_api_interceptor_installed = true;
+                    window.__gitax_api_responses = [];
+
+                    // Intercept fetch JSON responses
+                    const origFetch = window.fetch.bind(window);
+                    window.fetch = function(resource, init) {
+                        return origFetch(resource, init).then(response => {
+                            const ct = response.headers.get('content-type') || '';
+                            if (ct.includes('json')) {
+                                response.clone().json().then(body => {
+                                    const url = typeof resource === 'string'
+                                        ? resource
+                                        : (resource && resource.url) || '';
+                                    window.__gitax_api_responses.push({
+                                        url: url,
+                                        body: body,
+                                        time: Date.now()
+                                    });
+                                }).catch(() => {});
+                            }
+                            return response;
+                        });
+                    };
+
+                    // Intercept XMLHttpRequest JSON responses
+                    const origOpen = XMLHttpRequest.prototype.open;
+                    const origSend = XMLHttpRequest.prototype.send;
+                    XMLHttpRequest.prototype.open = function(method, url) {
+                        this._gitax_url = typeof url === 'string' ? url : (url ? '' + url : '');
+                        return origOpen.apply(this, arguments);
+                    };
+                    XMLHttpRequest.prototype.send = function() {
+                        if (this._gitax_url) {
+                            this.addEventListener('load', function() {
+                                if (this.readyState === 4) {
+                                    const ct = this.getResponseHeader('content-type') || '';
+                                    if (ct.includes('json')) {
+                                        try {
+                                            const body = JSON.parse(this.responseText);
+                                            window.__gitax_api_responses.push({
+                                                url: this._gitax_url,
+                                                body: body,
+                                                time: Date.now()
+                                            });
+                                        } catch(e) {}
+                                    }
+                                }
+                            });
+                        }
+                        return origSend.apply(this, arguments);
+                    };
+                }
+            """)
+        except Exception as e:
+            self.logger.debug(f"Failed to install API interceptor: {e}")
+
+    def _extract_messages_from_body(self, body, depth: int = 0) -> list[dict]:
+        """
+        Recursively extract message-like objects from an API response body.
+        Tries common field names and structures used by chat APIs.
+        """
+        if depth > 5:
+            return []
+
+        results = []
+
+        if isinstance(body, dict):
+            for key in body:
+                val = body[key]
+
+                # Try arrays of messages
+                if isinstance(val, list) and key.lower() in (
+                    'messages', 'items', 'data', 'results', 'list',
+                    'entries', 'feed', 'response', 'records', 'rows',
+                    'collection', 'elements', 'nodes', 'edges',
+                ):
+                    for item in val:
+                        if isinstance(item, dict):
+                            text = (
+                                item.get('text') or item.get('content')
+                                or item.get('body') or item.get('message')
+                                or item.get('description') or item.get('caption')
+                            )
+                            if text and isinstance(text, str) and len(text) > 10:
+                                results.append({
+                                    'text': text,
+                                    'html': item.get('html') or item.get('htmlContent')
+                                            or item.get('rendered') or '',
+                                })
+                            else:
+                                results.extend(self._extract_messages_from_body(item, depth + 1))
+                else:
+                    results.extend(self._extract_messages_from_body(val, depth + 1))
+
+        elif isinstance(body, list):
+            for item in body:
+                if isinstance(item, dict):
+                    text = (
+                        item.get('text') or item.get('content')
+                        or item.get('body') or item.get('message')
+                        or item.get('description') or item.get('caption')
+                    )
+                    if text and isinstance(text, str) and len(text) > 10:
+                        results.append({
+                            'text': text,
+                            'html': item.get('html') or item.get('htmlContent')
+                                    or item.get('rendered') or '',
+                        })
+
+        return results
+
+    def _parse_messages_from_api(self) -> list[dict]:
+        """
+        Extract messages from captured API responses.
+        Returns list of dicts in the same format as collect_all_messages()
+        or empty list if API data is unavailable/unparseable.
+        """
+        try:
+            raw = self.page.evaluate("() => window.__gitax_api_responses || []")
+        except Exception:
+            return []
+
+        if not raw:
+            return []
+
+        # Log captured URLs for debugging
+        seen_urls = set()
+        for entry in raw:
+            url = entry.get('url', '')
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                self.logger.info(f"[API] Captured response: {url[:200]}")
+
+        messages = []
+        seen_sigs: set[str] = set()
+
+        for entry in raw:
+            body = entry.get('body', {})
+            extracted = self._extract_messages_from_body(body)
+            for msg in extracted:
+                text = msg.get('text', '')
+                sig = text[:120]
+                if sig and sig not in seen_sigs:
+                    seen_sigs.add(sig)
+                    messages.append({
+                        "idx": len(messages),
+                        "text": text,
+                        "html": msg.get('html', ''),
+                        "classes": '',
+                    })
+
+        if messages:
+            print(f"  [API] Извлечено {len(messages)} сообщений из {len(raw)} сетевых ответов")
+            self.logger.info(f"Extracted {len(messages)} messages from {len(raw)} API responses")
+        else:
+            print(f"  [API] API-ответы не содержат сообщений ({len(raw)} ответов перехвачено)")
+            self.logger.info(f"No messages found in {len(raw)} API responses")
+            # Log first response keys for debugging
+            if raw:
+                first = raw[0].get('body', {})
+                if isinstance(first, dict):
+                    self.logger.info(f"First response keys: {list(first.keys())[:10]}")
+                elif isinstance(first, list):
+                    self.logger.info(f"First response is array of {len(first)} items")
+
+        return messages
+
+    def _scroll_to_bottom(self):
+        """Scroll the feed to the bottom to trigger content reload."""
+        self.page.evaluate("""
+            () => {
+                const c = window.__gitax_scroll;
+                if (c) {
+                    c.scrollTop = c.scrollHeight;
+                    return true;
+                }
+                const containers = document.querySelectorAll(
+                    '[class*="messages"],[class*="lenta"],[class*="feed"],' +
+                    '[class*="chat"],[class*="dialog"],[class*="scroll"]'
+                );
+                for (const c2 of containers) {
+                    if (c2.scrollHeight > c2.clientHeight + 50) {
+                        c2.scrollTop = c2.scrollHeight;
+                        return true;
+                    }
+                }
+                window.scrollTo(0, document.body.scrollHeight);
+                return true;
+            }
+        """)
+        print("  [SCROLL] Скролл вниз для перезагрузки контента...")
+        time.sleep(2)
 
     def get_message_count(self) -> int:
         """Get current message count in chat"""
@@ -2155,36 +2364,188 @@ class BrowserMAX(LogMixin):
 
         return total
 
-    def collect_all_messages(self) -> list[dict]:
+    def collect_all_messages(self, passes: int = 1) -> list[dict]:
         """
-        Load ALL messages by scrolling to top, then collect every message element.
+        Load ALL messages by scrolling to top while collecting message data
+        at each scroll position. Supports multiple passes — after scrolling to
+        top, scrolls back to bottom and repeats to load content that MAX may
+        have cached differently on subsequent passes.
+
+        Unlike scroll_to_top() which only collects text signatures, this captures
+        full message data (text, html, classes) for every unique message that
+        ever appears in the DOM during scrolling.
+
+        This is essential for virtual-list UIs (like MAX) where DOM elements
+        are recycled — only collecting at the final scroll position would miss
+        most messages.
+
+        Args:
+            passes: Number of scroll passes (default 1). 3 passes typically
+                   reveals 2-3x more messages than a single pass.
 
         Returns:
-            List of dicts, oldest-first (index 0 = first message in channel).
+            List of dicts in detection order.
             Each dict: { idx, text, html, classes }
         """
         self._check_connection()
-        total = self.scroll_to_top()
 
-        raw = self.page.evaluate("""
-            () => {
-                const msgs = document.querySelectorAll('[class*="message"]');
-                const result = [];
-                for (let i = 0; i < msgs.length; i++) {
-                    const m = msgs[i];
-                    result.push({
-                        idx: i,
-                        text: m.textContent || '',
-                        html: m.innerHTML || '',
-                        classes: m.className || ''
-                    });
+        all_signatures: set[str] = set()
+        all_messages: list[dict] = []
+        max_steps = 500
+
+        for current_pass in range(passes):
+            if current_pass > 0:
+                # Scroll to bottom to reload content between passes
+                self._scroll_to_bottom()
+                self.page.wait_for_timeout(2000)
+
+            pass_label = f"проход {current_pass + 1}/{passes}" if passes > 1 else ""
+            if pass_label:
+                print(f"  [SCROLL] {pass_label}, скролл вверх...")
+            else:
+                print(f"  [SCROLL] Загрузка всех сообщений, скролл вверх...")
+
+            no_new = 0
+
+            # Try to focus the scroll container
+            self.page.evaluate("""
+                () => {
+                    const containers = document.querySelectorAll(
+                        '[class*="messages"],[class*="lenta"],[class*="feed"],' +
+                        '[class*="chat"],[class*="dialog"],[class*="scroll"]'
+                    );
+                    let best = null;
+                    let bestH = 0;
+                    for (const c of containers) {
+                        if (c.scrollHeight > c.clientHeight + 50 && c.scrollHeight > bestH) {
+                            best = c;
+                            bestH = c.scrollHeight;
+                        }
+                    }
+                    if (best) {
+                        window.__gitax_scroll = best;
+                        best.setAttribute('tabindex', '-1');
+                        best.focus();
+                    } else {
+                        window.__gitax_scroll = null;
+                    }
                 }
-                return result;
-            }
-        """) or []
+            """)
+            self.page.wait_for_timeout(300)
 
-        self.logger.info(f"Collected {len(raw)} messages")
-        return raw
+            for step in range(max_steps):
+                try:
+                    # Get all currently-rendered message signatures (lightweight)
+                    current_sigs = self.page.evaluate("""
+                        () => {
+                            const msgs = document.querySelectorAll('[class*="message"]');
+                            return Array.from(msgs).map(
+                                m => (m.textContent || '').trim().slice(0, 120)
+                            );
+                        }
+                    """) or []
+
+                    # Find new signatures
+                    new_sig_set: set[str] = set()
+                    for s in current_sigs:
+                        if s and s not in all_signatures:
+                            all_signatures.add(s)
+                            new_sig_set.add(s)
+
+                    if new_sig_set:
+                        no_new = 0
+
+                        # Get full message data only for new entries
+                        # Filter to top-level message containers (parent does not
+                        # have "message" in class) to avoid collecting nested
+                        # header/body/footer sub-elements as separate entries.
+                        new_data = self.page.evaluate("""
+                            (newSigs) => {
+                                const newSet = new Set(newSigs);
+                                const seen = new Set();
+                                const msgs = document.querySelectorAll('[class*="message"]');
+                                const result = [];
+                                for (const m of msgs) {
+                                    const p = m.parentElement;
+                                    // Skip nested message elements (header, body, footer, etc.)
+                                    if (p && p.matches && p.matches('[class*="message"]')) continue;
+                                    const t = (m.textContent || '').trim();
+                                    const sig = t.slice(0, 120);
+                                    if (newSet.has(sig) && !seen.has(sig)) {
+                                        seen.add(sig);
+                                        result.push({
+                                            text: t,
+                                            html: m.innerHTML || '',
+                                            classes: m.className || ''
+                                        });
+                                    }
+                                }
+                                return result;
+                            }
+                        """, list(new_sig_set))
+
+                        for d in (new_data or []):
+                            all_messages.append({
+                                "idx": len(all_messages),
+                                "text": d.get("text", ""),
+                                "html": d.get("html", ""),
+                                "classes": d.get("classes", ""),
+                            })
+
+                        if step % 15 == 0:
+                            print(f"  [SCROLL] Шаг {step}: +{len(new_sig_set)} новых, всего {len(all_signatures)}")
+                    else:
+                        no_new += 1
+                        if no_new >= 15:
+                            print(f"  [SCROLL] Достигнут верх (шаг {step}) — {len(all_signatures)} уникальных сообщений")
+                            break
+
+                    # Scroll up
+                    scrolled = self.page.evaluate("""
+                        () => {
+                            const c = window.__gitax_scroll;
+                            if (c) {
+                                const step = Math.max(100, c.clientHeight * 0.7);
+                                const before = c.scrollTop;
+                                c.scrollBy(0, -step);
+                                return c.scrollTop !== before;
+                            }
+                            const containers = document.querySelectorAll(
+                                '[class*="messages"],[class*="lenta"],[class*="feed"],' +
+                                '[class*="chat"],[class*="dialog"],[class*="scroll"]'
+                            );
+                            for (const c2 of containers) {
+                                if (c2.scrollHeight > c2.clientHeight + 50) {
+                                    c2.scrollBy(0, -c2.clientHeight * 0.7);
+                                    return true;
+                                }
+                            }
+                            window.scrollBy(0, -window.innerHeight * 0.7);
+                            return true;
+                        }
+                    """)
+
+                    if not scrolled:
+                        no_new += 1
+                        if no_new >= 15:
+                            break
+
+                    self.page.wait_for_timeout(800)
+
+                except Exception as e:
+                    self.logger.debug(f"Scroll error in collect_all_messages: {e}")
+                    no_new += 1
+                    if no_new >= 15:
+                        break
+
+            if pass_label:
+                print(f"  [SCROLL] {pass_label} завершён: +{len(all_signatures)} всего")
+            total = len(all_signatures)
+
+        print(f"  [SCROLL] Итого: {total} уникальных сообщений")
+        self.logger.info(f"Total unique messages collected via scroll: {len(all_messages)} ({passes} pass(es))")
+
+        return all_messages
 
     def parse_message(self, msg: dict) -> dict:
         """
@@ -2361,36 +2722,58 @@ class BrowserMAX(LogMixin):
                     "issue": None,
                 })
 
-        # Orphaned files (no text message found)
+        # Orphaned files (no text message found) — group by filename to avoid N duplicate entries
+        orphan_groups: dict[str, dict] = {}
         for of in orphaned_files:
-            incomplete.append({
-                "full_name": of.get("full_name") or of.get("filename", "unknown"),
-                "display_name": of.get("filename", "unknown"),
-                "text_idx": None,
-                "file_idxs": [of["idx"]],
-                "volumes": [of["volume"]] if of.get("volume") else [],
-                "filename": of.get("filename", ""),
-                "issue": "missing_text",
-            })
+            fn_key = of.get("filename", "unknown")
+            if fn_key not in orphan_groups:
+                orphan_groups[fn_key] = {
+                    "full_name": fn_key,
+                    "display_name": fn_key,
+                    "text_idx": None,
+                    "file_idxs": [],
+                    "volumes": set(),
+                    "filename": fn_key,
+                    "issue": "missing_text",
+                }
+            orphan_groups[fn_key]["file_idxs"].append(of["idx"])
+            if of.get("volume"):
+                orphan_groups[fn_key]["volumes"].add(of["volume"])
+
+        for entry in orphan_groups.values():
+            entry["volumes"] = sorted(entry["volumes"])
+            incomplete.append(entry)
 
         return {"complete": complete, "incomplete": incomplete}
 
     def audit_channel_completeness(self) -> dict:
         """
         Full audit of the MAX channel:
-          1. Scroll to top (load all messages)
-          2. Classify every message
-          3. Group by repo
-          4. Check completeness
+          1. Try API response interception (fast, covers all history)
+          2. If API fails → scroll with 3 passes (slower, partial coverage)
+          3. Classify every message
+          4. Group by repo
+          5. Check completeness
 
         Returns:
             { "complete": [...], "incomplete": [...] }
         """
-        print("\n  [SCAN] Загрузка всех сообщений канала... (может занять время)")
-        print("  [SCAN] Программа скроллит ленту вверх — пожалуйста, не трогайте браузер")
+        print("\n  [SCAN] Проверка целостности публикаций...")
 
-        messages = self.collect_all_messages()
-        print(f"  [SCAN] Загружено {len(messages)} сообщений, классифицирую...")
+        # Strategy 1: API interception — do one scroll pass to trigger API calls
+        print("  [SCAN] Сбор сообщений через API...")
+        self.collect_all_messages(passes=1)
+        messages = self._parse_messages_from_api()
+        source = "API"
+
+        if not messages:
+            # Strategy 2: Multi-pass DOM scroll
+            print("  [SCAN] API не дал результатов, многопроходный скролл DOM...")
+            print("  [SCAN] Пожалуйста, не трогайте браузер")
+            messages = self.collect_all_messages(passes=3)
+            source = "DOM (3 прохода)"
+
+        print(f"  [SCAN] Загружено {len(messages)} сообщений ({source}), классифицирую...")
 
         grouped = self.group_messages_by_repo(messages)
 
