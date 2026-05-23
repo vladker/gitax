@@ -21,6 +21,7 @@ class RepoStatus(Enum):
     PENDING = "pending"
     INCOMPLETE = "incomplete"
     RESTORED = "restored"
+    CLEANED = "cleaned"
 
 
 class Journal(LogMixin):

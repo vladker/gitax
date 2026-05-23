@@ -2383,13 +2383,15 @@ class BrowserMAX(LogMixin):
         """)
         return result
 
-    def scroll_to_top(self, max_steps: int = 500) -> int:
+    def scroll_to_top(self) -> int:
         """
         Scroll chat to top by repeatedly scrolling up.
         Uses text-based deduplication — works with virtual lists
         (where DOM elements are recycled, so count stays constant).
 
         Collects ALL unique message texts seen during the scroll.
+        When the visible top is reached, performs overscroll cycles
+        to force MAX to load older messages, then continues scrolling.
 
         Returns:
             Total number of unique messages found.
@@ -2399,8 +2401,8 @@ class BrowserMAX(LogMixin):
 
         # Collect ALL unique message signatures (text snippet for dedup)
         all_signatures: set[str] = set()
-        no_new = 0
-        container_info = None
+        overscroll_stale = 0
+        MAX_OVERSCROLL_STALE = 3
 
         # Try to focus the scroll container first
         self.page.evaluate("""
@@ -2428,74 +2430,130 @@ class BrowserMAX(LogMixin):
         """)
         self.page.wait_for_timeout(300)
 
-        for step in range(max_steps):
-            try:
-                # Get all currently-rendered messages' text signatures
-                current = self.page.evaluate("""
-                    () => {
-                        const msgs = document.querySelectorAll('[class*="message"]');
-                        const sigs = [];
-                        for (const m of msgs) {
-                            const t = (m.textContent || '').trim();
-                            // Use first 120 chars as signature
-                            sigs.push(t.slice(0, 120));
-                        }
-                        return sigs;
-                    }
-                """) or []
+        step = 0
+        while overscroll_stale < MAX_OVERSCROLL_STALE:
+            no_new = 0
 
-                # Find new unique signatures
-                new_sigs = list(set(s for s in current if s and s not in all_signatures))
-                if new_sigs:
-                    all_signatures.update(new_sigs)
-                    no_new = 0
-                    if step % 15 == 0:
-                        print(f"  [SCROLL] Шаг {step}: +{len(new_sigs)} новых, всего {len(all_signatures)}")
-                else:
-                    no_new += 1
-                    if no_new >= 10:
-                        print(f"  [SCROLL] Достигнут верх (шаг {step}) — {len(all_signatures)} уникальных сообщений")
-                        break
-
-                # Scroll up — try multiple methods
-                scrolled = self.page.evaluate("""
-                    () => {
-                        const c = window.__gitax_scroll;
-                        if (c) {
-                            const step = Math.max(100, c.clientHeight * 0.7);
-                            const before = c.scrollTop;
-                            c.scrollBy(0, -step);
-                            return c.scrollTop !== before;
-                        }
-                        // Fallback: try known selectors
-                        const containers = document.querySelectorAll(
-                            '[class*="messages"],[class*="lenta"],[class*="feed"],' +
-                            '[class*="chat"],[class*="dialog"],[class*="scroll"]'
-                        );
-                        for (const c2 of containers) {
-                            if (c2.scrollHeight > c2.clientHeight + 50) {
-                                c2.scrollBy(0, -c2.clientHeight * 0.7);
-                                return true;
+            while True:
+                try:
+                    # Get all currently-rendered messages' text signatures
+                    current = self.page.evaluate("""
+                        () => {
+                            const msgs = document.querySelectorAll('[class*="message"]');
+                            const sigs = [];
+                            for (const m of msgs) {
+                                const t = (m.textContent || '').trim();
+                                sigs.push(t.slice(0, 120));
                             }
+                            return sigs;
                         }
-                        window.scrollBy(0, -window.innerHeight * 0.7);
-                        return true;
-                    }
-                """)
+                    """) or []
 
-                if not scrolled:
-                    self.logger.debug(f"Scroll method returned false at step {step}")
+                    # Find new unique signatures
+                    new_sigs = list(set(s for s in current if s and s not in all_signatures))
+                    if new_sigs:
+                        all_signatures.update(new_sigs)
+                        no_new = 0
+                        if step % 15 == 0:
+                            print(f"  [SCROLL] Шаг {step}: +{len(new_sigs)} новых, всего {len(all_signatures)}")
+                    else:
+                        no_new += 1
+                        if no_new >= 15:
+                            print(f"  [SCROLL] Видимый верх на шаге {step} — {len(all_signatures)} уникальных")
+                            break
+
+                    # Scroll up — try multiple methods
+                    scrolled = self.page.evaluate("""
+                        () => {
+                            const c = window.__gitax_scroll;
+                            if (c) {
+                                const st = Math.max(100, c.clientHeight * 0.7);
+                                const before = c.scrollTop;
+                                c.scrollBy(0, -st);
+                                return c.scrollTop !== before;
+                            }
+                            const containers = document.querySelectorAll(
+                                '[class*="messages"],[class*="lenta"],[class*="feed"],' +
+                                '[class*="chat"],[class*="dialog"],[class*="scroll"]'
+                            );
+                            for (const c2 of containers) {
+                                if (c2.scrollHeight > c2.clientHeight + 50) {
+                                    c2.scrollBy(0, -c2.clientHeight * 0.7);
+                                    return true;
+                                }
+                            }
+                            window.scrollBy(0, -window.innerHeight * 0.7);
+                            return true;
+                        }
+                    """)
+
+                    if not scrolled:
+                        self.logger.debug(f"Scroll method returned false at step {step}")
+                        no_new += 1
+                        if no_new >= 15:
+                            break
+
+                    step += 1
+                    self.page.wait_for_timeout(500)
+
+                except Exception as e:
+                    self.logger.debug(f"Scroll error: {e}")
                     no_new += 1
-                    if no_new >= 10:
+                    if no_new >= 15:
                         break
 
-                self.page.wait_for_timeout(500)
+            # ── Overscroll cycle: force MAX to load older history ──
+            print(f"  [OVERSCROLL] Попытка #{overscroll_stale + 1}/{MAX_OVERSCROLL_STALE}...")
 
-            except Exception as e:
-                self.logger.debug(f"Scroll error: {e}")
-                no_new += 1
-                if no_new >= 10:
-                    break
+            sigs_before = len(all_signatures)
+
+            self.page.evaluate("""
+                () => {
+                    const c = window.__gitax_scroll;
+                    function overscroll() {
+                        if (c) {
+                            c.scrollTop = 0;
+                            c.scrollBy(0, -100);
+                            c.dispatchEvent(new WheelEvent('wheel', {
+                                deltaY: -500, deltaMode: 0,
+                                bubbles: true, cancelable: true
+                            }));
+                        } else {
+                            window.scrollBy(0, -200);
+                        }
+                    }
+                    // Fire multiple overscroll events with delays
+                    overscroll();
+                    setTimeout(overscroll, 300);
+                    setTimeout(overscroll, 700);
+                }
+            """)
+
+            time.sleep(3)
+
+            # Collect signatures after overscroll
+            current_after = self.page.evaluate("""
+                () => {
+                    const msgs = document.querySelectorAll('[class*="message"]');
+                    const sigs = [];
+                    for (const m of msgs) {
+                        const t = (m.textContent || '').trim();
+                        sigs.push(t.slice(0, 120));
+                    }
+                    return sigs;
+                }
+            """) or []
+
+            new_after = set(s for s in current_after if s and s not in all_signatures)
+            if new_after:
+                all_signatures.update(new_after)
+                overscroll_stale = 0
+                print(f"  [OVERSCROLL] +{len(new_after)} новых сообщений — продолжаем скролл")
+                continue  # Back to main scroll loop
+
+            overscroll_stale += 1
+            print(f"  [OVERSCROLL] Новых нет ({overscroll_stale}/{MAX_OVERSCROLL_STALE})")
+            time.sleep(2)
 
         total = len(all_signatures)
         print(f"  [SCROLL] Итого: {total} уникальных сообщений")
@@ -2543,29 +2601,92 @@ class BrowserMAX(LogMixin):
 
         return total
 
-    def collect_all_messages(self, passes: int = 1, max_stale: int = 0) -> list[dict]:
+    def _collect_pass_sigs(self) -> list[str]:
+        """Get current message text signatures from DOM."""
+        return self.page.evaluate("""
+            () => {
+                const msgs = document.querySelectorAll('[class*="message"]');
+                const sigs = [];
+                for (const m of msgs) {
+                    const t = (m.textContent || '').trim();
+                    sigs.push(t.slice(0, 120));
+                }
+                return sigs;
+            }
+        """) or []
+
+    def _collect_new_message_data(self, new_sigs: list[str]) -> list[dict]:
+        """Collect full message data for new signatures from DOM."""
+        result = self.page.evaluate("""
+            (newSigs) => {
+                const newSet = new Set(newSigs);
+                const seen = new Set();
+                const msgs = document.querySelectorAll('[class*="message"]');
+                const result = [];
+                for (const m of msgs) {
+                    const p = m.parentElement;
+                    if (p && p.matches && p.matches('[class*="message"]')) continue;
+                    const t = (m.textContent || '').trim();
+                    const sig = t.slice(0, 120);
+                    if (newSet.has(sig) && !seen.has(sig)) {
+                        seen.add(sig);
+                        result.push({
+                            text: t,
+                            html: m.innerHTML || '',
+                            classes: m.className || ''
+                        });
+                    }
+                }
+                return result;
+            }
+        """, list(new_sigs))
+        return result or []
+
+    def _do_overscroll(self) -> None:
+        """Trigger overscroll events to force MAX to load older messages."""
+        self.page.evaluate("""
+            () => {
+                const c = window.__gitax_scroll;
+                function fire() {
+                    if (c) {
+                        c.scrollTop = 0;
+                        c.scrollBy(0, -100);
+                        c.dispatchEvent(new WheelEvent('wheel', {
+                            deltaY: -500, deltaMode: 0,
+                            bubbles: true, cancelable: true
+                        }));
+                    } else {
+                        window.scrollBy(0, -200);
+                    }
+                }
+                fire();
+                setTimeout(fire, 300);
+                setTimeout(fire, 700);
+            }
+        """)
+
+    def collect_all_messages(self, passes: int = 1, max_stale: int = 0,
+                              overscroll_cycles: int = 3,
+                              max_reloads: int = 0) -> list[dict]:
         """
         Load ALL messages by scrolling to top while collecting message data
         at each scroll position. Supports multiple passes — after scrolling to
         top, scrolls back to bottom and repeats to load content that MAX may
         have cached differently on subsequent passes.
 
-        Supports two modes:
+        When the visible top is reached, performs overscroll cycles to force
+        MAX to load older messages. Optionally reloads the page for more coverage.
+
+        Supports two pass modes:
           - Exact passes:  passes=N, max_stale=0 — runs exactly N passes
           - Auto converge:  passes=0, max_stale=N — runs until N consecutive
             passes yield zero new signatures
 
-        Unlike scroll_to_top() which only collects text signatures, this captures
-        full message data (text, html, classes) for every unique message that
-        ever appears in the DOM during scrolling.
-
-        This is essential for virtual-list UIs (like MAX) where DOM elements
-        are recycled — only collecting at the final scroll position would miss
-        most messages.
-
         Args:
             passes: Number of scroll passes (default 1). Set to 0 for auto.
             max_stale: Stop after N passes with no new signatures (0 = disabled).
+            overscroll_cycles: Max overscroll attempts before declaring end (0 = skip).
+            max_reloads: Max page reload fallback attempts (0 = skip).
 
         Returns:
             List of dicts in detection order.
@@ -2575,29 +2696,41 @@ class BrowserMAX(LogMixin):
 
         all_signatures: set[str] = set()
         all_messages: list[dict] = []
-        max_steps = 500
         stale_count = 0
         total_passes = 0
-        pass_limit = passes if passes > 0 else 999  # upper bound for auto mode
+        os_stale_count = 0
+        pass_limit = passes if passes > 0 else 999
+        reload_count = 0
 
         while True:
-            current_pass = total_passes
-            if total_passes > 0:
+            # ── Determine if this is a new pass or a reload pass ──
+            is_reload = reload_count > 0 and total_passes == 0
+            if is_reload:
+                self.navigate()
+                self.wait_page_ready()
+                self._scroll_to_bottom()
+                self.page.wait_for_timeout(3000)
+                total_passes += 1
+            elif total_passes > 0:
                 self._scroll_to_bottom()
                 self.page.wait_for_timeout(2000)
+                total_passes += 1
+            else:
+                total_passes += 1
 
-            total_passes += 1
             auto_mode = passes == 0 and max_stale > 0
             pass_label = f"проход {total_passes}/{pass_limit}" if passes > 0 else f"проход {total_passes}"
+            if is_reload:
+                pass_label = f"reload #{reload_count}"
 
             print(f"  [SCROLL] {pass_label}, скролл вверх...")
 
-            # Count signatures before this pass (to detect stale)
             sigs_before = len(all_signatures)
             found_any = False
             no_new = 0
+            overscrolled_this_pass = False
 
-            # Try to focus the scroll container
+            # Focus scroll container
             self.page.evaluate("""
                 () => {
                     const containers = document.querySelectorAll(
@@ -2623,16 +2756,11 @@ class BrowserMAX(LogMixin):
             """)
             self.page.wait_for_timeout(300)
 
-            for step in range(max_steps):
+            step_in_pass = -1
+            while True:
+                step_in_pass += 1
                 try:
-                    current_sigs = self.page.evaluate("""
-                        () => {
-                            const msgs = document.querySelectorAll('[class*="message"]');
-                            return Array.from(msgs).map(
-                                m => (m.textContent || '').trim().slice(0, 120)
-                            );
-                        }
-                    """) or []
+                    current_sigs = self._collect_pass_sigs()
 
                     new_sig_set: set[str] = set()
                     for s in current_sigs:
@@ -2644,31 +2772,8 @@ class BrowserMAX(LogMixin):
                         no_new = 0
                         found_any = True
 
-                        new_data = self.page.evaluate("""
-                            (newSigs) => {
-                                const newSet = new Set(newSigs);
-                                const seen = new Set();
-                                const msgs = document.querySelectorAll('[class*="message"]');
-                                const result = [];
-                                for (const m of msgs) {
-                                    const p = m.parentElement;
-                                    if (p && p.matches && p.matches('[class*="message"]')) continue;
-                                    const t = (m.textContent || '').trim();
-                                    const sig = t.slice(0, 120);
-                                    if (newSet.has(sig) && !seen.has(sig)) {
-                                        seen.add(sig);
-                                        result.push({
-                                            text: t,
-                                            html: m.innerHTML || '',
-                                            classes: m.className || ''
-                                        });
-                                    }
-                                }
-                                return result;
-                            }
-                        """, list(new_sig_set))
-
-                        for d in (new_data or []):
+                        new_data = self._collect_new_message_data(list(new_sig_set))
+                        for d in new_data:
                             all_messages.append({
                                 "idx": len(all_messages),
                                 "text": d.get("text", ""),
@@ -2676,22 +2781,23 @@ class BrowserMAX(LogMixin):
                                 "classes": d.get("classes", ""),
                             })
 
-                        if step % 15 == 0:
-                            print(f"  [SCROLL] Шаг {step}: +{len(new_sig_set)} новых, всего {len(all_signatures)}")
+                        if step_in_pass % 15 == 0:
+                            print(f"  [SCROLL] Шаг {step_in_pass}: +{len(new_sig_set)} новых, всего {len(all_signatures)}")
                     else:
                         no_new += 1
                         if no_new >= 15:
-                            if step > 0:
-                                print(f"  [SCROLL] Достигнут верх (шаг {step}) — {len(all_signatures)} уникальных сообщений")
+                            if step_in_pass > 0:
+                                print(f"  [SCROLL] Достигнут верх (шаг {step_in_pass}) — {len(all_signatures)} уникальных сообщений")
                             break
 
+                    # Scroll up
                     scrolled = self.page.evaluate("""
                         () => {
                             const c = window.__gitax_scroll;
                             if (c) {
-                                const step = Math.max(100, c.clientHeight * 0.7);
+                                const st = Math.max(100, c.clientHeight * 0.7);
                                 const before = c.scrollTop;
-                                c.scrollBy(0, -step);
+                                c.scrollBy(0, -st);
                                 return c.scrollTop !== before;
                             }
                             const containers = document.querySelectorAll(
@@ -2727,9 +2833,44 @@ class BrowserMAX(LogMixin):
 
             print(f"  [SCROLL] {pass_label} завершён: +{new_in_pass} новых сигнатур, всего {sigs_after}")
 
-            # Convergence check
+            # ── Overscroll cycles (if enabled) ──
+            if overscroll_cycles > 0 and found_any:
+                ov_stale = 0
+                while ov_stale < overscroll_cycles:
+                    print(f"  [OVERSCROLL] Попытка #{ov_stale + 1}/{overscroll_cycles}...")
+                    self._do_overscroll()
+                    time.sleep(3)
+
+                    os_sigs = self._collect_pass_sigs()
+                    new_os = set(s for s in os_sigs if s and s not in all_signatures)
+                    if new_os:
+                        all_signatures.update(new_os)
+                        os_data = self._collect_new_message_data(list(new_os))
+                        for d in os_data:
+                            all_messages.append({
+                                "idx": len(all_messages),
+                                "text": d.get("text", ""),
+                                "html": d.get("html", ""),
+                                "classes": d.get("classes", ""),
+                            })
+                        print(f"  [OVERSCROLL] +{len(new_os)} новых — ещё один проход")
+                        ov_stale = 0
+                        # Start a new pass (continue outer while True)
+                        overscrolled_this_pass = True
+                        break
+                    else:
+                        ov_stale += 1
+                        print(f"  [OVERSCROLL] Новых нет ({ov_stale}/{overscroll_cycles})")
+
+                if overscrolled_this_pass:
+                    # Reset stale counters and start a fresh pass
+                    if auto_mode:
+                        stale_count = 0
+                    continue
+
+            # ── Convergence check ──
             if auto_mode:
-                if new_in_pass == 0:
+                if new_in_pass == 0 and not overscrolled_this_pass:
                     stale_count += 1
                     print(f"  [SCROLL] Без прогресса ({stale_count}/{max_stale})")
                     if stale_count >= max_stale:
@@ -2743,11 +2884,17 @@ class BrowserMAX(LogMixin):
                     break
             else:
                 if total_passes >= passes:
+                    # ── Page reload fallback ──
+                    if max_reloads > 0 and reload_count < max_reloads:
+                        reload_count += 1
+                        print(f"\n  [SCROLL RELOAD] Перезагрузка страницы ({reload_count}/{max_reloads})...")
+                        total_passes = 0  # Reset pass counter for reload cycle
+                        break  # Out of inner loop, outer while will handle reload
                     break
 
         total = len(all_signatures)
-        print(f"  [SCROLL] Итого: {total} уникальных сообщений за {total_passes} проходов")
-        self.logger.info(f"Total unique messages: {len(all_messages)} ({total_passes} passes)")
+        print(f"  [SCROLL] Итого: {total} уникальных сообщений за {total_passes + reload_count} проходов")
+        self.logger.info(f"Total unique messages: {len(all_messages)} ({total_passes + reload_count} passes)")
 
         return all_messages
 
@@ -3010,7 +3157,7 @@ class BrowserMAX(LogMixin):
 
         # ── Источник A: API-перехват ──
         print("  [SCAN] Источник A: перехват сетевых ответов...")
-        self.collect_all_messages(passes=1)  # triggers API calls via one scroll pass
+        self.collect_all_messages(passes=1, overscroll_cycles=3)  # triggers API calls via one scroll pass
         api_msgs = self._parse_messages_from_api()
         for m in api_msgs:
             _add(m)
@@ -3038,7 +3185,7 @@ class BrowserMAX(LogMixin):
             print("  [SCAN] Источник C: итеративный скролл DOM до схождения...")
             print("  [SCAN] Пожалуйста, не трогайте браузер")
 
-            scroll_msgs = self.collect_all_messages(passes=0, max_stale=3)
+            scroll_msgs = self.collect_all_messages(passes=0, max_stale=3, overscroll_cycles=3, max_reloads=3)
             prev_covered = covered_b
             for m in scroll_msgs:
                 _add(m)
@@ -3076,6 +3223,8 @@ class BrowserMAX(LogMixin):
 
         print(f"  [AUDIT] Complete: {len(grouped['complete'])}, "
               f"Incomplete: {len(grouped['incomplete'])}")
+
+        grouped["channel_messages"] = messages
 
         return grouped
 
@@ -3417,6 +3566,112 @@ class BrowserMAX(LogMixin):
 
         print(f"  [DELETE{label_str}] Итого удалено: {deleted}")
         return deleted
+
+    def delete_messages_by_texts(self, target_texts: set[str], label: str = "") -> int:
+        """
+        Multi-pass deletion: scroll to top, traverse down deleting matching messages.
+        After reaching the bottom, repeats from the top if any targets remain,
+        up to MAX_PASSES times. Targets that fail deletion are kept for retry.
+
+        Uses exact text matching (not substring) — eliminates false positives
+        from search terms matching unrelated messages.
+
+        Args:
+            target_texts: Set of exact message full texts to match and delete.
+            label: Optional display label for logging.
+
+        Returns:
+            Set of message texts that were successfully deleted.
+        """
+        self._check_connection()
+        label_str = f" ({label})" if label else ""
+        total_targets = len(target_texts)
+
+        if not target_texts:
+            return 0
+
+        remaining = set(target_texts)
+        deleted = 0
+        MAX_PASSES = 3
+        MAX_STALE_SCROLLS = 10
+
+        for current_pass in range(1, MAX_PASSES + 1):
+            if not remaining:
+                break
+
+            if current_pass == 1:
+                print(f"  [DELETE{label_str}] Удаление {total_targets} сообщений, проход {current_pass}/{MAX_PASSES}...")
+                self.navigate()
+                self.wait_page_ready()
+            else:
+                print(f"  [DELETE{label_str}] Повторный проход {current_pass}/{MAX_PASSES}, осталось: {len(remaining)}...")
+
+            self.scroll_to_top()
+            self.page.wait_for_timeout(500)
+
+            no_match_in_row = 0
+
+            while True:
+                if not remaining:
+                    print(f"  [DELETE{label_str}] ✓ Все цели удалены")
+                    break
+
+                visible = self.page.evaluate("""
+                    () => {
+                        const msgs = document.querySelectorAll('[class*="message"]');
+                        const result = [];
+                        for (const m of msgs) {
+                            const t = (m.textContent || '').trim();
+                            if (t) {
+                                result.push(t);
+                            }
+                        }
+                        return result;
+                    }
+                """) or []
+
+                match_found = False
+                for v in visible:
+                    if v in remaining:
+                        match_found = True
+                        no_match_in_row = 0
+                        snippet = v[:60]
+                        print(f"  [DELETE{label_str}] Найдено совпадение: \"{snippet}...\"")
+                        if self._locate_and_delete_by_text(v[:50]):
+                            deleted += 1
+                            remaining.discard(v)
+                            print(f"  ✓ Удалено ({deleted}/{total_targets})")
+                            self.page.wait_for_timeout(800)
+                        else:
+                            print(f"  ⚠ Не удалось удалить (будет повторено)")
+                        break
+
+                if not match_found:
+                    no_match_in_row += 1
+                    if no_match_in_row >= MAX_STALE_SCROLLS:
+                        print(f"  [DELETE{label_str}] Проход {current_pass} завершён, осталось целей: {len(remaining)}")
+                        break
+
+                self.page.evaluate("""
+                    () => {
+                        const c = window.__gitax_scroll;
+                        if (c) {
+                            const st = Math.max(100, c.clientHeight * 0.7);
+                            c.scrollBy(0, st);
+                        } else {
+                            window.scrollBy(0, window.innerHeight * 0.7);
+                        }
+                    }
+                """)
+                self.page.wait_for_timeout(400)
+
+        if remaining:
+            print(f"  [DELETE{label_str}] Не удалось удалить {len(remaining)} сообщений после {MAX_PASSES} проходов:")
+            for r in sorted(remaining):
+                print(f"       \"{r[:60]}...\"")
+
+        print(f"  [DELETE{label_str}] Итого удалено: {deleted}/{total_targets}")
+        return set(target_texts) - remaining
 
     def inspect_message_actions(self, msg_index: int):
         """

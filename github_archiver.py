@@ -20,6 +20,7 @@ from logging_config import setup_logging
 from journal import Journal
 from github_api import GitHubAPI
 from browser_max import BrowserMAX
+from scroll_registry import ScrollRegistry
 
 
 class GracefulShutdown:
@@ -239,7 +240,7 @@ class GitHubArchiver:
         print("  [1] Синхронизировать репозитории")
         print("  [2] Загрузить новые репозитории")
         print(f"  [3] Список игнорирования{ignored_str}")
-        print("  [4] Аудит и восстановление публикаций")
+        print("  [4] Аудит — очистка / восстановление публикаций")
         print("  [5] Выход")
         print()
 
@@ -1046,7 +1047,7 @@ class GitHubArchiver:
     def audit_and_restore_publications(self):
         """Audit the channel, display results, and restore incomplete publications."""
         print("\n" + "═" * 60)
-        print("          АУДИТ И ВОССТАНОВЛЕНИЕ ПУБЛИКАЦИЙ")
+        print("          АУДИТ — ОЧИСТКА / ВОССТАНОВЛЕНИЕ ПУБЛИКАЦИЙ")
         print("═" * 60)
 
         self._init_github()
@@ -1067,27 +1068,172 @@ class GitHubArchiver:
 
         grouped = browser.audit_channel_completeness(known_repos=journal_repos)
 
+        registry = ScrollRegistry()
+        channel_msgs = grouped.pop("channel_messages", [])
+        if channel_msgs:
+            registry.from_messages(channel_msgs)
+
         self._show_audit_table(grouped)
 
         incomplete = grouped.get("incomplete", [])
-        if not incomplete:
+        truly_missing = grouped.get("truly_missing", set())
+
+        if not incomplete and not truly_missing:
+            input("\n  Нажмите Enter для возврата в меню...")
+            if browser:
+                browser.close()
+            return
+
+        # Coverage check
+        total_known = grouped.get("total_known", 0)
+        found_count = grouped.get("found_count", 0)
+        coverage = found_count / total_known if total_known > 0 else 0
+        scan_complete = coverage >= 0.8
+        can_restore_missing = scan_complete and bool(truly_missing)
+
+        if not scan_complete:
+            print(f"\n  ⚠ Сканирование неполное: найдено {found_count}/{total_known} "
+                  f"({coverage:.0%})")
+            print("  Потерянные репозитории не будут дозагружаться — "
+                  "они могут быть в канале, но не загружены браузером")
+
+        # Mode selection
+        print()
+        print("  Выберите режим работы:")
+        print("  [1] Только очистка — удалить неполные/битые публикации из канала")
+        if can_restore_missing:
+            print("  [2] Полное восстановление — очистка + дозагрузка потерянных из журнала")
+        elif incomplete:
+            print("  [2] Полное восстановление — удалить и перезалить неполные")
+        print("  [S] Пропустить")
+        print()
+
+        # Build valid mode list
+        valid_modes = ['1', 's']
+        if incomplete:
+            valid_modes.append('2')
+
+        mode = input(f"  Ваш выбор [{'/'.join(valid_modes)}]: ").strip().lower()
+
+        if mode == 's':
+            print("\n  Пропущено.")
+            if browser:
+                browser.close()
             input("\n  Нажмите Enter для возврата в меню...")
             return
 
-        # Ask user what to do with each incomplete publication
-        print("\n  ⚠ Обнаружены неполные публикации.")
-        print("  Для каждой можно:")
-        print("    [Enter] — удалить сообщения и переопубликовать")
+        if mode == '1':
+            # ── Cleanup mode ──
+            self._cleanup_publications(browser, grouped, registry)
+
+            print("\n" + "═" * 60)
+            print("ОЧИСТКА ЗАВЕРШЕНА")
+            print("═" * 60)
+
+            print("\n  Выполняю финальную проверку...")
+            final = browser.audit_channel_completeness(known_repos=journal_repos)
+            remaining = len(final.get("incomplete", []))
+            if remaining == 0:
+                print("  ✓ Канал чист, неполных публикаций не осталось")
+            else:
+                print(f"  ⚠ Осталось {remaining} неполных публикаций (не удалось удалить)")
+
+        elif mode == '2':
+            # ── Restore mode ──
+            restored_count = 0
+            error_count = 0
+            skipped_count = 0
+
+            if incomplete:
+                restored_count, error_count, skipped_count = self._restore_incomplete_publications(
+                    browser, incomplete, registry
+                )
+
+            uploaded_count = 0
+            missing_error_count = 0
+            if can_restore_missing and truly_missing:
+                print("\n" + "─" * 56)
+                print("Дозагрузка потерянных репозиториев:")
+                print("─" * 56)
+
+                for full_name in sorted(truly_missing):
+                    print(f"\n  📦 {full_name}")
+                    success = self._upload_missing_publication(browser, full_name)
+                    if success:
+                        uploaded_count += 1
+                        print(f"  ✓ Загружен")
+                    else:
+                        missing_error_count += 1
+                        print(f"  ✗ Ошибка загрузки")
+
+            print("\n" + "═" * 60)
+            print("ВОССТАНОВЛЕНИЕ ЗАВЕРШЕНО")
+            print(f"  Восстановлено неполных: {restored_count}")
+            print(f"  Дозагружено потерянных: {uploaded_count}")
+            if error_count or missing_error_count:
+                print(f"  Ошибок: {error_count + missing_error_count}")
+            print(f"  Пропущено: {skipped_count}")
+            print("═" * 60)
+
+            if restored_count > 0 or uploaded_count > 0:
+                print("\n  Выполняю финальную верификацию...")
+                final = browser.audit_channel_completeness(known_repos=journal_repos)
+                remaining = len(final.get("incomplete", []))
+                truly_missing_final = final.get("truly_missing", set())
+                if remaining == 0:
+                    print("  ✓ Все публикации целостны!")
+                else:
+                    print(f"  ⚠ Осталось {remaining} неполных публикаций")
+                if truly_missing_final:
+                    print(f"  ⚠ Не найдено в канале: {len(truly_missing_final)} репозиториев")
+
+        if browser:
+            browser.close()
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def _restore_incomplete_publications(self, browser, incomplete: list,
+                                         registry: ScrollRegistry) -> tuple[int, int, int]:
+        """
+        Restore incomplete publications: bulk delete old messages,
+        then re-download and re-upload per repo.
+
+        Args:
+            browser: Connected BrowserMAX instance
+            incomplete: List of incomplete audit items
+            registry: ScrollRegistry with all channel messages
+
+        Returns:
+            (restored_count, error_count, skipped_count)
+        """
+        # ── Step 1: Bulk delete all incomplete messages in one pass ──
+        print("\n" + "─" * 56)
+        print("Шаг 1: удаление старых неполных публикаций:")
+        print("─" * 56)
+
+        target_texts = registry.find_target_texts(incomplete)
+        if target_texts:
+            print(f"  → Найдено {len(target_texts)} сообщений для удаления")
+            browser.delete_messages_by_texts(target_texts, label="восстановление")
+        else:
+            print("  ⚠ Нет текстов для удаления (реестр пуст)")
+
+        # ── Step 2: Interactive re-upload ──
+        restored_count = 0
+        error_count = 0
+        skipped_count = 0
+        restored_repos: set[str] = set()
+        restore_all = False
+
+        print(f"\n  {'─' * 56}")
+        print("Шаг 2: перезаливка репозиториев:")
+        print("─" * 56)
+        print("\n  Для каждого можно:")
+        print("    [Enter] — переопубликовать")
         print("    [S]     — пропустить")
         print("    [A]     — восстановить все")
-        print("    [Q]     — выйти из аудита")
+        print("    [Q]     — выйти из восстановления")
         print()
-
-        restore_all = False
-        restored_count = 0
-        skipped_count = 0
-        error_count = 0
-        restored_repos: set[str] = set()
 
         for i, item in enumerate(incomplete, 1):
             fn = item.get("full_name", "?")
@@ -1112,6 +1258,7 @@ class GitHubArchiver:
                 print(f"\n  {'─' * 56}")
                 print(f"  #{i}: {display} ({fn})")
                 print(f"       причина: {issue}")
+                print("       (старое сообщение уже удалено)")
                 choice = input("  [Enter] восстановить | [S] пропустить | [A] все | [Q] выход: ").strip().lower()
 
             if choice == 'a':
@@ -1122,7 +1269,7 @@ class GitHubArchiver:
                 # Build repo context for restoration
                 repo_ctx = self._build_restore_context(item)
 
-                success = self._restore_publication(browser, item, repo_ctx)
+                success = self._restore_publication(browser, item, repo_ctx, skip_delete=True)
 
                 if success:
                     restored_count += 1
@@ -1135,33 +1282,173 @@ class GitHubArchiver:
                 skipped_count += 1
                 print(f"  • Пропущен")
             elif choice == 'q':
-                print("\n  Выход из аудита...")
+                print("\n  Выход из восстановления...")
                 break
 
-        print("\n" + "═" * 60)
-        print("АУДИТ И ВОССТАНОВЛЕНИЕ ЗАВЕРШЕНЫ")
-        print(f"  Восстановлено: {restored_count}")
-        print(f"  Пропущено: {skipped_count}")
-        print(f"  Ошибок: {error_count}")
-        print("═" * 60)
+        return restored_count, error_count, skipped_count
 
-        # Optional: run a final verification
-        if restored_count > 0:
-            print("\n  Выполняю финальную верификацию...")
-            final = browser.audit_channel_completeness(known_repos=journal_repos)
-            remaining = len(final.get("incomplete", []))
-            truly_missing = final.get("truly_missing", set())
-            if remaining == 0:
-                print("  ✓ Все публикации целостны!")
-            else:
-                print(f"  ⚠ Осталось {remaining} неполных публикаций")
-            if truly_missing:
-                print(f"  ⚠ Не найдено в канале: {len(truly_missing)} репозиториев")
+    def _cleanup_publications(self, browser, grouped: dict, registry: ScrollRegistry):
+        """
+        Cleanup mode: delete incomplete publications from channel in one pass,
+        then mark in journal. Does NOT re-upload anything.
 
-        if browser:
-            browser.close()
+        Args:
+            browser: Connected BrowserMAX instance
+            grouped: Audit results dict with 'incomplete' key
+            registry: ScrollRegistry with all channel messages
+        """
+        incomplete = grouped.get("incomplete", [])
 
-        input("\n  Нажмите Enter для возврата в меню...")
+        if not incomplete:
+            print("  ✓ Нечего чистить")
+            return
+
+        print("\n" + "─" * 56)
+        print("Удаление неполных публикаций из канала:")
+        print("─" * 56)
+
+        print(f"\n  Всего неполных: {len(incomplete)}")
+        for i, item in enumerate(incomplete, 1):
+            fn = item.get("full_name", "?")
+            display = item.get("display_name", fn.split("/")[-1])
+            issue = item.get("issue", "?")
+            print(f"  #{i}: {display} ({fn}) — {issue}")
+
+        target_texts = registry.find_target_texts(incomplete)
+        if not target_texts:
+            print("\n  ⚠ Нет текстов для удаления (реестр пуст)")
+            return
+
+        print(f"\n  → Найдено {len(target_texts)} сообщений для удаления")
+        deleted_texts = browser.delete_messages_by_texts(target_texts, label="очистка")
+
+        cleaned_repos: set[str] = set()
+        for item in incomplete:
+            fn = item.get("full_name", "")
+            canonical = ""
+            if fn and "/" in fn:
+                canonical = fn
+            elif fn:
+                extracted = self._extract_repo_from_filename(fn)
+                if extracted and "/" in extracted:
+                    canonical = extracted
+            if not canonical:
+                continue
+
+            item_texts: set[str] = set()
+            text_idx = item.get("text_idx")
+            if text_idx is not None and 0 <= text_idx < len(registry.messages):
+                t = registry.messages[text_idx].get("text", "").strip()
+                if t:
+                    item_texts.add(t)
+            for fidx in item.get("file_idxs", []):
+                if 0 <= fidx < len(registry.messages):
+                    t = registry.messages[fidx].get("text", "").strip()
+                    if t:
+                        item_texts.add(t)
+
+            if item_texts and item_texts <= deleted_texts:
+                cleaned_repos.add(canonical)
+
+        for repo in cleaned_repos:
+            self.journal.update_repository(repo, {"status": "cleaned"})
+
+        print(f"\n  ✓ Очищено из канала: {len(cleaned_repos)} репозиториев, удалено сообщений: {len(deleted_texts)}")
+
+    def _upload_missing_publication(self, browser, full_name: str) -> bool:
+        """
+        Upload a missing repository (truly_missing) — download from GitHub and send to MAX.
+
+        Args:
+            browser: Connected BrowserMAX instance
+            full_name: Repository full name (owner/repo)
+
+        Returns:
+            True on success
+        """
+        item = {"full_name": full_name}
+        repo_ctx = self._build_restore_context(item)
+        if not repo_ctx or not repo_ctx.get("owner") or not repo_ctx.get("repo"):
+            print(f"    ✗ Не удалось получить данные репозитория")
+            return False
+
+        owner = repo_ctx["owner"]
+        repo_name = repo_ctx["repo"]
+        branch = repo_ctx.get("default_branch", "main")
+        display = repo_ctx.get("display_name", repo_name)
+
+        print(f"    ↓ Скачиваю ZIP...")
+        zip_path = self.github.download_zip(owner, repo_name, branch)
+
+        if not zip_path or not os.path.exists(zip_path):
+            print(f"    ✗ Не удалось скачать ZIP")
+            return False
+
+        zip_size = os.path.getsize(zip_path)
+        zip_size_str = self._format_file_size(zip_size)
+        print(f"    ✓ {zip_size_str}")
+
+        repo_data = {
+            "full_name": full_name,
+            "display_name": display,
+            "description": repo_ctx.get("description", ""),
+            "version": repo_ctx.get("version", "unknown"),
+            "version_type": repo_ctx.get("version_type", "unknown"),
+            "stars": repo_ctx.get("stars", 0),
+            "forks": repo_ctx.get("forks", 0),
+            "github_url": f"https://github.com/{full_name}",
+        }
+
+        text = self._build_message_text(repo_data, zip_size)
+
+        print(f"    → Отправляю в MAX...")
+
+        try:
+            browser.navigate()
+            browser.wait_page_ready()
+        except Exception:
+            pass
+
+        split_threshold_mb = self.config.get("archiver", {}).get("split_threshold_mb", 49)
+        success, _ = browser.send_message_with_files(
+            text=text,
+            filepaths=[zip_path],
+            retries=self.config.get("archiver", {}).get("retries", 3),
+            retry_delay=self.config.get("archiver", {}).get("retry_delay", 10),
+            split_threshold_mb=split_threshold_mb,
+        )
+
+        verified = False
+        if success:
+            for attempt in range(3):
+                time.sleep(3)
+                verified = browser.verify_repo_publication(full_name)
+                if verified:
+                    print(f"    ✓ Верификация пройдена (попытка {attempt + 1})")
+                    break
+                else:
+                    print(f"    ⚠ Верификация: попытка {attempt + 1}/3 — не найдено")
+
+        if success:
+            self.journal.update_repository(full_name, {
+                "version": repo_ctx.get("version", "unknown"),
+                "status": "restored" if self.journal.is_in_journal(full_name) else "sent",
+                "archive_size": zip_size,
+                "restored_at": datetime.now().isoformat(),
+            })
+        else:
+            self.journal.update_repository(full_name, {
+                "status": "failed",
+                "archive_size": zip_size,
+            })
+
+        try:
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+        except Exception:
+            pass
+
+        return success and verified
 
     def _build_restore_context(self, item: dict) -> dict:
         """
@@ -1241,14 +1528,17 @@ class GitHubArchiver:
             "from_journal": False,
         }
 
-    def _restore_publication(self, browser, item: dict, repo_ctx: dict) -> bool:
+    def _restore_publication(self, browser, item: dict, repo_ctx: dict,
+                             skip_delete: bool = False) -> bool:
         """
-        Delete incomplete messages and re-publish the repo.
+        Re-publish the repo (download + upload). Optionally skip deletion
+        when old messages were already removed in a bulk pass.
 
         Args:
             browser: BrowserMAX instance (connected)
             item: Audit item dict with message indices to delete
             repo_ctx: Repo context dict with owner, repo, branch, etc.
+            skip_delete: If True, skip the deletion step (messages already gone)
 
         Returns:
             True on success
@@ -1263,34 +1553,34 @@ class GitHubArchiver:
         print(f"  Восстановление: {display if display != '?' else item.get('full_name', '?')}")
         print(f"  {'─' * 56}")
 
-        # Validate: if we can't identify the repo, skip deletion to avoid data loss
         if not fn or not owner or not repo_name:
-            print(f"    ⚠ Не удалось определить репозиторий — пропускаю удаление")
+            print(f"    ⚠ Не удалось определить репозиторий — пропускаю")
             return False
 
-        # Step 1: Delete ALL messages for this repo (text + files)
-        search_terms = []
-        if fn:
-            search_terms.append(fn)  # "vitejs/vite" matches text descriptions
-        if owner and repo_name:
-            search_terms.append(f"{owner}-{repo_name}")  # "vitejs-vite" matches files
+        # Step 1: Delete old messages (skipped if already done in bulk)
+        if not skip_delete:
+            search_terms = []
+            if fn:
+                search_terms.append(fn)
+            if owner and repo_name:
+                search_terms.append(f"{owner}-{repo_name}")
 
-        if search_terms:
-            print(f"    → Удаляю все сообщения ({len(search_terms)} поисковых запросов)...")
-            try:
-                browser.navigate()
-                browser.wait_page_ready()
-            except Exception:
-                pass
-            browser.scroll_to_top()
-            deleted = browser.delete_messages_by_content(
-                search_terms, label=display
-            )
-            if deleted:
-                print(f"    ✓ Удалено: {deleted}")
-            else:
-                print(f"    ⚠ Сообщения не найдены (возможно уже удалены)")
-            time.sleep(1)
+            if search_terms:
+                print(f"    → Удаляю старые сообщения...")
+                try:
+                    browser.navigate()
+                    browser.wait_page_ready()
+                except Exception:
+                    pass
+                browser.scroll_to_top()
+                deleted = browser.delete_messages_by_content(
+                    search_terms, label=display
+                )
+                if deleted:
+                    print(f"    ✓ Удалено: {deleted}")
+                else:
+                    print(f"    ⚠ Сообщения не найдены (возможно уже удалены)")
+                time.sleep(1)
 
         # Step 2: Download fresh ZIP
         print(f"    ↓ Скачиваю ZIP...")
