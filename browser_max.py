@@ -3673,6 +3673,117 @@ class BrowserMAX(LogMixin):
         print(f"  [DELETE{label_str}] Итого удалено: {deleted}/{total_targets}")
         return set(target_texts) - remaining
 
+    # ──────────────────────────────────────────────
+    # Delete ALL messages
+    # ──────────────────────────────────────────────
+
+    def _ensure_messages_loaded(self, timeout: float = 25) -> bool:
+        """Wait until at least one message with text appears in the DOM."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            ok = self.page.evaluate("""
+                () => {
+                    const msgs = document.querySelectorAll('[class*="message"]');
+                    for (const m of msgs)
+                        if ((m.textContent || '').trim().length > 5) return true;
+                    return false;
+                }
+            """)
+            if ok:
+                return True
+            self.page.wait_for_timeout(500)
+        return False
+
+    def delete_all_messages(self) -> int:
+        """
+        Delete ALL messages in the channel feed.
+        Stays at the bottom (newest messages), deletes the last visible
+        message, repeats until the viewport runs out, then scrolls up
+        to load the next batch.  Continues until no messages remain.
+        """
+        self._check_connection()
+
+        # -- Wait for DOM to contain rendered messages --
+        print("  [DELETE ALL] Загрузка сообщений...", end="", flush=True)
+        loaded = self._ensure_messages_loaded(25)
+        if not loaded:
+            print("  timeout")
+            return 0
+        print(f" OK")
+
+        # -- Scroll to bottom (newest messages) --
+        self._scroll_to_bottom()
+        self.page.wait_for_timeout(1000)
+
+        total = self.page.evaluate(
+            "() => document.querySelectorAll('[class*=\"message\"]').length"
+        ) or 0
+        print(f"  [DELETE ALL] Удаляю ~{total} сообщений (снизу вверх)...")
+
+        deleted = 0
+        failed_texts: set[str] = set()
+        empty_scrolls = 0
+
+        for _ in range(10000):
+            last_text = self.page.evaluate("""
+                () => {
+                    const msgs = document.querySelectorAll('[class*="message"]');
+                    for (let i = msgs.length - 1; i >= 0; i--) {
+                        const t = (msgs[i].textContent || '').trim();
+                        if (t) return t.slice(0, 80);
+                    }
+                    return null;
+                }
+            """)
+
+            if not last_text:
+                cur = self.page.evaluate(
+                    "() => document.querySelectorAll('[class*=\"message\"]').length"
+                ) or 0
+                if cur == 0:
+                    break
+                empty_scrolls += 1
+                if empty_scrolls > 8:
+                    print(f"\n  [DELETE ALL] Больше сообщений не найдено")
+                    break
+                self.page.evaluate("""
+                    () => {
+                        const c = window.__gitax_scroll;
+                        if (c) c.scrollBy(0, -c.clientHeight * 0.5);
+                        else window.scrollBy(0, -window.innerHeight * 0.5);
+                    }
+                """)
+                self.page.wait_for_timeout(600)
+                continue
+
+            empty_scrolls = 0
+
+            if last_text in failed_texts:
+                self.page.evaluate("""
+                    () => {
+                        const c = window.__gitax_scroll;
+                        if (c) c.scrollBy(0, -c.clientHeight * 0.25);
+                    }
+                """)
+                self.page.wait_for_timeout(300)
+                continue
+
+            if self._locate_and_delete_by_text(last_text[:50]):
+                deleted += 1
+                if deleted % 5 == 0:
+                    print(f"\r  [DELETE ALL] Удалено: {deleted}", end="", flush=True)
+                self.page.wait_for_timeout(400)
+            else:
+                failed_texts.add(last_text)
+                print(f"\n  ⚠ Не удалось: \"{last_text[:40]}...\"")
+
+        print()
+        remaining = self.page.evaluate(
+            "() => document.querySelectorAll('[class*=\"message\"]').length"
+        ) or 0
+        print(f"  [DELETE ALL] Готово. Удалено: {deleted}, осталось: {remaining}")
+        return deleted
+
     def inspect_message_actions(self, msg_index: int):
         """
         Debug helper — prints all visible elements near a message.

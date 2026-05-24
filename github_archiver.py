@@ -241,7 +241,8 @@ class GitHubArchiver:
         print("  [2] Загрузить новые репозитории")
         print(f"  [3] Список игнорирования{ignored_str}")
         print("  [4] Аудит — очистка / восстановление публикаций")
-        print("  [5] Выход")
+        print("  [5] Удалить все сообщения в ленте")
+        print("  [6] Выход")
         print()
 
     def _get_user_choice(self, options: list, prompt: str = "Выберите действие") -> str:
@@ -1662,14 +1663,94 @@ class GitHubArchiver:
 
         return success and verified
 
+    # ──────────────────────────────────────────────
+    # Delete All Messages
+    # ──────────────────────────────────────────────
+
+    def delete_all_messages_in_channel(self):
+        """Delete ALL messages in the MAX channel with double user confirmation."""
+        print("\n" + "═" * 60)
+        print("          УДАЛЕНИЕ ВСЕХ СООБЩЕНИЙ")
+        print("═" * 60)
+
+        print("\n  ⚠ ВНИМАНИЕ: Это действие удалит ВСЕ сообщения в канале!")
+        print("  Это необратимо — восстановить их будет невозможно.")
+        print()
+
+        # First confirmation
+        try:
+            confirm1 = input("  Вы уверены? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Отменено.")
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        if confirm1 not in ('y', 'yes', 'д', 'да'):
+            print("\n  Отменено.")
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        # Connect to MAX
+        browser = None
+        try:
+            browser = self._ensure_max_connected()
+        except Exception as e:
+            print(f"\n  ✗ Не удалось подключиться к MAX: {e}")
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        # Get current message count to show user
+        try:
+            msg_count = browser.get_message_count()
+            print(f"\n  В канале обнаружено ~{msg_count} сообщений.")
+        except Exception:
+            msg_count = 0
+            print("\n  Не удалось определить количество сообщений.")
+
+        print()
+        print("  Это действие необратимо. Все сообщения будут удалены безвозвратно.")
+        print()
+
+        # Second confirmation — must type "ДА"
+        try:
+            confirm2 = input("  Введите 'ДА' (латиницей или кириллицей) для подтверждения: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Отменено.")
+            if browser:
+                browser.close()
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        if confirm2 not in ('да', 'yes', 'дa'):
+            print("\n  Отменено.")
+            if browser:
+                browser.close()
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        # Proceed with deletion
+        print()
+        try:
+            deleted = browser.delete_all_messages()
+            print(f"\n  ✓ Удалено сообщений: {deleted}")
+            print("  ⚠ Страница в браузере может потребовать перезагрузки.")
+        except Exception as e:
+            print(f"\n  ✗ Ошибка при удалении: {e}")
+
+        if browser:
+            browser.close()
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
     def run(self):
         """Запустить главный цикл программы"""
+
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
 
             self._show_menu()
 
-            choice = input("  Выберите действие [1-5]: ").strip()
+            choice = input("  Выберите действие [1-6]: ").strip()
 
             if choice == '1':
                 self.sync_repositories()
@@ -1680,10 +1761,12 @@ class GitHubArchiver:
             elif choice == '4':
                 self.audit_and_restore_publications()
             elif choice == '5':
+                self.delete_all_messages_in_channel()
+            elif choice == '6':
                 print("\n  До свидания!\n")
                 break
             else:
-                print("\n  Неверный выбор. Нажмите 1, 2, 3, 4 или 5.")
+                print("\n  Неверный выбор. Нажмите 1, 2, 3, 4, 5 или 6.")
                 time.sleep(1)
 
 
