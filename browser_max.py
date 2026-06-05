@@ -3720,6 +3720,139 @@ class BrowserMAX(LogMixin):
     # Export messages to file
     # ─────────────────────────────────────────────
 
+    def _collect_enrich_new(self, known_sigs: set[str]) -> list[dict]:
+        """
+        Single-phase enrichment: ONE page.evaluate that skips known messages
+        and returns full data only for new ones.
+
+        Replaces the two-phase approach (_collect_pass_sigs + _collect_full_for_sigs)
+        which made 2 DOM traversals per scroll step. This makes only 1.
+
+        Args:
+            known_sigs: Set of text signatures (text[:120]) already collected.
+
+        Returns:
+            List of full message dicts for messages NOT in known_sigs.
+        """
+        self._check_connection()
+
+        try:
+            result = self.page.evaluate("""
+                (knownSigs) => {
+                    const knownSet = new Set(knownSigs);
+                    const msgs = document.querySelectorAll('[class*="message"]');
+                    const results = [];
+                    const seen = new Set();
+
+                    for (const m of msgs) {
+                        // Skip nested message elements
+                        const p = m.parentElement;
+                        if (p && p.matches && p.matches('[class*="message"]')) continue;
+
+                        const text = (m.textContent || '').trim();
+                        const sig = text.slice(0, 120);
+                        if (!sig || knownSet.has(sig) || seen.has(sig)) continue;
+                        seen.add(sig);
+
+                        // Extract sender name
+                        let sender = '';
+                        const senderSelectors = [
+                            '[class*="sender"]', '[class*="author"]', '[class*="name"]',
+                            '[class*="from"]', '[class*="user"]'
+                        ];
+                        for (const sel of senderSelectors) {
+                            const el = m.querySelector(sel);
+                            if (el && el.textContent && el.textContent.trim()) {
+                                sender = el.textContent.trim();
+                                break;
+                            }
+                        }
+
+                        // Extract timestamp
+                        let timestamp = '';
+                        const timeSelectors = [
+                            '[class*="time"]', '[class*="date"]', '[class*="when"]',
+                            '[class*="stamp"]', 'time', '[datetime]'
+                        ];
+                        for (const sel of timeSelectors) {
+                            const el = m.querySelector(sel);
+                            if (el) {
+                                timestamp = el.getAttribute('datetime') || el.textContent.trim();
+                                if (timestamp) break;
+                            }
+                        }
+
+                        // Determine direction (out/in)
+                        const classes = (m.className || '').toString();
+                        let direction = 'unknown';
+                        if (/message--?out|outgoing|sent|mine/i.test(classes)) {
+                            direction = 'out';
+                        } else if (/message--?in|incoming|received|theirs/i.test(classes)) {
+                            direction = 'in';
+                        }
+
+                        // Extract attachments
+                        const attachments = [];
+                        const attachSelectors = [
+                            '[class*="file"]', '[class*="attach"]', '[class*="preview"]',
+                            '[class*="document"]', '[class*="media"]'
+                        ];
+                        for (const sel of attachSelectors) {
+                            const els = m.querySelectorAll(sel);
+                            for (const el of els) {
+                                const name = el.getAttribute('title') ||
+                                             el.getAttribute('alt') ||
+                                             (el.textContent || '').trim().slice(0, 200);
+                                const size = el.querySelector('[class*="size"]');
+                                if (name) {
+                                    attachments.push({
+                                        name: name,
+                                        size: size ? size.textContent.trim() : ''
+                                    });
+                                }
+                            }
+                        }
+
+                        // Extract reactions
+                        const reactions = [];
+                        const reactSelectors = [
+                            '[class*="reaction"]', '[class*="emoji"]', '[class*="like"]'
+                        ];
+                        for (const sel of reactSelectors) {
+                            const els = m.querySelectorAll(sel);
+                            for (const el of els) {
+                                const reactText = (el.textContent || '').trim();
+                                if (reactText) {
+                                    reactions.push(reactText);
+                                }
+                            }
+                        }
+
+                        // Check if reply/forward
+                        const isReply = /reply|forward|переслан|ответ/i.test(classes) ||
+                                       !!m.querySelector('[class*="reply"], [class*="forward"]');
+
+                        results.push({
+                            text: text,
+                            html: m.innerHTML || '',
+                            classes: classes.slice(0, 500),
+                            sender: sender,
+                            timestamp: timestamp,
+                            direction: direction,
+                            attachments: attachments,
+                            reactions: reactions,
+                            is_reply: isReply
+                        });
+                    }
+
+                    return results;
+                }
+            """, list(known_sigs))
+            return result or []
+        except Exception as e:
+            self.logger.debug(f"Enrich new error: {e}")
+            return []
+
     def _collect_full_for_sigs(self, target_sigs: list[str]) -> list[dict]:
         """
         Extract full message data ONLY for messages matching given signatures.
@@ -3986,12 +4119,11 @@ class BrowserMAX(LogMixin):
         """
         Scroll through the entire message feed and collect full message data.
 
-        TWO-PHASE approach (fast):
-          Phase 1: quick signature scan via _collect_pass_sigs() — just text[:120]
-          Phase 2: enrich only NEW signatures via _collect_full_for_sigs()
-
-        This avoids re-parsing all visible messages on every scroll step.
-        _collect_full_batch() is only called once at the end as a safety net.
+        SINGLE-PHASE approach (fastest):
+          Each scroll step calls _collect_enrich_new() which does ONE DOM
+          traversal that skips already-known messages and returns full data
+          for new ones. This halves the round-trips compared to the old
+          two-phase approach (_collect_pass_sigs + _collect_full_for_sigs).
 
         Args:
             passes: Number of scroll passes to make
@@ -4037,25 +4169,23 @@ class BrowserMAX(LogMixin):
             """)
             self.page.wait_for_timeout(300)
 
-            # Scroll up and collect — FAST two-phase approach
+            # Scroll up and collect — SINGLE-PHASE: one evaluate per step
             no_new = 0
             step = 0
             while no_new < 15:
                 step += 1
                 try:
-                    # Phase 1: quick signature scan (lightweight — just text[:120])
-                    current_sigs = self._collect_pass_sigs()
-                    new_sigs = [s for s in current_sigs if s and s not in all_signatures]
+                    # Single call: skip known sigs, return full data for new ones
+                    enriched = self._collect_enrich_new(all_signatures)
+                    new_count = len(enriched)
 
-                    if new_sigs:
-                        all_signatures.update(new_sigs)
-
-                        # Phase 2: enrich only NEW signatures with full data
-                        enriched = self._collect_full_for_sigs(new_sigs)
+                    if new_count > 0:
+                        # Update signatures from new messages
+                        for msg in enriched:
+                            sig = msg.get("text", "")[:120]
+                            if sig:
+                                all_signatures.add(sig)
                         all_messages.extend(enriched)
-                        new_count = len(enriched)
-                    else:
-                        new_count = 0
 
                     if new_count == 0:
                         no_new += 1
@@ -4087,14 +4217,6 @@ class BrowserMAX(LogMixin):
                 except Exception as e:
                     self.logger.debug(f"Scroll error in export: {e}")
                     no_new += 1
-
-            # Safety net: collect full data for any signatures that weren't enriched
-            enriched_sigs = {m.get("text", "")[:120] for m in all_messages}
-            missing_sigs = [s for s in all_signatures if s not in enriched_sigs]
-            if missing_sigs:
-                print(f"  [EXPORT] Безопасная сеть: обогащаю {len(missing_sigs)} пропущенных...")
-                enriched = self._collect_full_for_sigs(missing_sigs)
-                all_messages.extend(enriched)
 
             sigs_after = len(all_signatures)
             new_in_pass = sigs_after - sigs_before
