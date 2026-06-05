@@ -25,9 +25,13 @@ from scroll_registry import ScrollRegistry
 
 class GracefulShutdown:
     """Context manager for graceful shutdown"""
-    def __init__(self, archiver):
+    def __init__(self, archiver, browsers=None):
         self.archiver = archiver
         self.interrupted = False
+        self.browsers = browsers if browsers is not None else []
+        # Add archiver's browser if not already in list
+        if self.archiver.max_browser and self.archiver.max_browser not in self.browsers:
+            self.browsers.append(self.archiver.max_browser)
 
     def __enter__(self):
         return self
@@ -41,11 +45,12 @@ class GracefulShutdown:
             return
 
         self.interrupted = True
-        if self.archiver.max_browser:
-            try:
-                self.archiver.max_browser.close()
-            except Exception:
-                pass
+        for browser in self.browsers:
+            if browser:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
 
 class GitHubArchiver:
@@ -241,8 +246,9 @@ class GitHubArchiver:
         print("  [2] Загрузить новые репозитории")
         print(f"  [3] Список игнорирования{ignored_str}")
         print("  [4] Аудит — очистка / восстановление публикаций")
-        print("  [5] Удалить все сообщения в ленте")
-        print("  [6] Выход")
+        print("  [5] Экспорт всех сообщений в файл")
+        print("  [6] Удалить все сообщения в ленте")
+        print("  [7] Выход")
         print()
 
     def _get_user_choice(self, options: list, prompt: str = "Выберите действие") -> str:
@@ -1664,6 +1670,118 @@ class GitHubArchiver:
         return success and verified
 
     # ──────────────────────────────────────────────
+    # Export All Messages to File
+    # ──────────────────────────────────────────────
+
+    def export_messages_to_file(self):
+        """Export all messages from the MAX feed to a JSON/CSV file."""
+        print("\n" + "═" * 60)
+        print("          ЭКСПОРТ СООБЩЕНИЙ ИЗ ЛЕНТЫ")
+        print("═" * 60)
+
+        print("\n  Собирает все сообщения из ленты MAX со всеми деталями:")
+        print("  • текст, отправитель, время, направление")
+        print("  • вложения, реакции, флаги ответа/пересылки")
+        print()
+
+        # Connect to MAX
+        browser = None
+        try:
+            browser = self._ensure_max_connected()
+        except Exception as e:
+            print(f"\n  ✗ Не удалось подключиться к MAX: {e}")
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        # Ask for output format
+        print("\n  Выберите формат:")
+        print("  [J] JSON (полные данные, по умолчанию)")
+        print("  [C] CSV (для Excel)")
+        try:
+            fmt_choice = input("  Ваш выбор [J/C]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Отменено.")
+            if browser:
+                browser.close()
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        fmt = "csv" if fmt_choice == "c" else "json"
+        ext = ".csv" if fmt == "csv" else ".json"
+
+        # Ask for output path
+        default_path = f"messages_export{ext}"
+        try:
+            path_input = input(f"  Путь к файлу [{default_path}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Отменено.")
+            if browser:
+                browser.close()
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        output_path = path_input if path_input else default_path
+
+        # Ask for scroll passes
+        try:
+            passes_input = input("  Количество проходов скролла [3]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Отменено.")
+            if browser:
+                browser.close()
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        scroll_passes = int(passes_input) if passes_input else 3
+
+        # Ask for max messages limit
+        try:
+            max_input = input("  Лимит сообщений (0 = без лимита) [0]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Отменено.")
+            if browser:
+                browser.close()
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        max_messages = int(max_input) if max_input else 0
+
+        # Ask about HTML inclusion
+        try:
+            html_input = input("  Включить HTML содержимое? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Отменено.")
+            if browser:
+                browser.close()
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        include_html = html_input in ("y", "yes", "д", "да")
+
+        print(f"\n  Начинаю экспорт...")
+        print("  Это может занять время в зависимости от количества сообщений.\n")
+
+        try:
+            count = browser.export_messages_to_file(
+                output_path=output_path,
+                format=fmt,
+                scroll_passes=scroll_passes,
+                include_html=include_html,
+                max_messages=max_messages,
+            )
+            if count > 0:
+                print(f"\n  ✓ Экспортировано {count} сообщений в {output_path}")
+            else:
+                print("\n  ⚠ Сообщений не найдено")
+        except Exception as e:
+            print(f"\n  ✗ Ошибка при экспорте: {e}")
+
+        if browser:
+            browser.close()
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    # ──────────────────────────────────────────────
     # Delete All Messages
     # ──────────────────────────────────────────────
 
@@ -1750,7 +1868,7 @@ class GitHubArchiver:
 
             self._show_menu()
 
-            choice = input("  Выберите действие [1-6]: ").strip()
+            choice = input("  Выберите действие [1-7]: ").strip()
 
             if choice == '1':
                 self.sync_repositories()
@@ -1761,12 +1879,14 @@ class GitHubArchiver:
             elif choice == '4':
                 self.audit_and_restore_publications()
             elif choice == '5':
-                self.delete_all_messages_in_channel()
+                self.export_messages_to_file()
             elif choice == '6':
+                self.delete_all_messages_in_channel()
+            elif choice == '7':
                 print("\n  До свидания!\n")
                 break
             else:
-                print("\n  Неверный выбор. Нажмите 1, 2, 3, 4, 5 или 6.")
+                print("\n  Неверный выбор. Нажмите 1, 2, 3, 4, 5, 6 или 7.")
                 time.sleep(1)
 
 

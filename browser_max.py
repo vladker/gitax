@@ -7,6 +7,8 @@ import os
 import re
 import time
 import sys
+import csv
+import json
 import logging
 import subprocess
 from typing import Optional
@@ -3713,6 +3715,547 @@ class BrowserMAX(LogMixin):
     def _confirm_delete(self):
         """Legacy — delegates to _handle_delete_confirmation."""
         self._handle_delete_confirmation()
+
+    # ─────────────────────────────────────────────
+    # Export messages to file
+    # ─────────────────────────────────────────────
+
+    def _collect_full_for_sigs(self, target_sigs: list[str]) -> list[dict]:
+        """
+        Extract full message data ONLY for messages matching given signatures.
+
+        Much faster than _collect_full_batch because it skips messages we
+        already know about and only enriches new ones.
+
+        Args:
+            target_sigs: List of text signatures (first 120 chars) to look for.
+
+        Returns:
+            List of dicts with keys: text, html, classes, sender, timestamp,
+            direction, attachments, reactions, is_reply
+        """
+        self._check_connection()
+
+        try:
+            result = self.page.evaluate("""
+                (targetSigs) => {
+                    const targetSet = new Set(targetSigs);
+                    const msgs = document.querySelectorAll('[class*="message"]');
+                    const results = [];
+                    const seen = new Set();
+
+                    for (const m of msgs) {
+                        // Skip nested message elements
+                        const p = m.parentElement;
+                        if (p && p.matches && p.matches('[class*="message"]')) continue;
+
+                        const text = (m.textContent || '').trim();
+                        const sig = text.slice(0, 120);
+                        if (!sig || !targetSet.has(sig) || seen.has(sig)) continue;
+                        seen.add(sig);
+
+                        // Extract sender name
+                        let sender = '';
+                        const senderSelectors = [
+                            '[class*="sender"]', '[class*="author"]', '[class*="name"]',
+                            '[class*="from"]', '[class*="user"]'
+                        ];
+                        for (const sel of senderSelectors) {
+                            const el = m.querySelector(sel);
+                            if (el && el.textContent && el.textContent.trim()) {
+                                sender = el.textContent.trim();
+                                break;
+                            }
+                        }
+
+                        // Extract timestamp
+                        let timestamp = '';
+                        const timeSelectors = [
+                            '[class*="time"]', '[class*="date"]', '[class*="when"]',
+                            '[class*="stamp"]', 'time', '[datetime]'
+                        ];
+                        for (const sel of timeSelectors) {
+                            const el = m.querySelector(sel);
+                            if (el) {
+                                timestamp = el.getAttribute('datetime') || el.textContent.trim();
+                                if (timestamp) break;
+                            }
+                        }
+
+                        // Determine direction (out/in)
+                        const classes = (m.className || '').toString();
+                        let direction = 'unknown';
+                        if (/message--?out|outgoing|sent|mine/i.test(classes)) {
+                            direction = 'out';
+                        } else if (/message--?in|incoming|received|theirs/i.test(classes)) {
+                            direction = 'in';
+                        }
+
+                        // Extract attachments
+                        const attachments = [];
+                        const attachSelectors = [
+                            '[class*="file"]', '[class*="attach"]', '[class*="preview"]',
+                            '[class*="document"]', '[class*="media"]'
+                        ];
+                        for (const sel of attachSelectors) {
+                            const els = m.querySelectorAll(sel);
+                            for (const el of els) {
+                                const name = el.getAttribute('title') ||
+                                             el.getAttribute('alt') ||
+                                             (el.textContent || '').trim().slice(0, 200);
+                                const size = el.querySelector('[class*="size"]');
+                                if (name) {
+                                    attachments.push({
+                                        name: name,
+                                        size: size ? size.textContent.trim() : ''
+                                    });
+                                }
+                            }
+                        }
+
+                        // Extract reactions
+                        const reactions = [];
+                        const reactSelectors = [
+                            '[class*="reaction"]', '[class*="emoji"]', '[class*="like"]'
+                        ];
+                        for (const sel of reactSelectors) {
+                            const els = m.querySelectorAll(sel);
+                            for (const el of els) {
+                                const reactText = (el.textContent || '').trim();
+                                if (reactText) {
+                                    reactions.push(reactText);
+                                }
+                            }
+                        }
+
+                        // Check if reply/forward
+                        const isReply = /reply|forward|переслан|ответ/i.test(classes) ||
+                                       !!m.querySelector('[class*="reply"], [class*="forward"]');
+
+                        results.push({
+                            text: text,
+                            html: m.innerHTML || '',
+                            classes: classes.slice(0, 500),
+                            sender: sender,
+                            timestamp: timestamp,
+                            direction: direction,
+                            attachments: attachments,
+                            reactions: reactions,
+                            is_reply: isReply
+                        });
+                    }
+
+                    return results;
+                }
+            """, list(target_sigs))
+            return result or []
+        except Exception as e:
+            self.logger.debug(f"Full sigs collection error: {e}")
+            return []
+
+    def _collect_full_batch(self) -> list[dict]:
+        """
+        Extract full message data from all visible [class*="message"] elements in DOM.
+
+        NOTE: This is slow — it parses ALL visible messages. Prefer
+        _scroll_and_collect_full which uses the two-phase sigs-then-enrich approach.
+
+        Returns:
+            List of dicts with keys: text, html, classes, sender, timestamp,
+            direction, attachments, reactions, is_reply
+        """
+        self._check_connection()
+
+        try:
+            result = self.page.evaluate("""
+                () => {
+                    const msgs = document.querySelectorAll('[class*="message"]');
+                    const results = [];
+                    const seen = new Set();
+
+                    for (const m of msgs) {
+                        // Skip nested message elements
+                        const p = m.parentElement;
+                        if (p && p.matches && p.matches('[class*="message"]')) continue;
+
+                        const text = (m.textContent || '').trim();
+                        const sig = text.slice(0, 120);
+                        if (!sig || seen.has(sig)) continue;
+                        seen.add(sig);
+
+                        // Extract sender name
+                        let sender = '';
+                        const senderSelectors = [
+                            '[class*="sender"]', '[class*="author"]', '[class*="name"]',
+                            '[class*="from"]', '[class*="user"]'
+                        ];
+                        for (const sel of senderSelectors) {
+                            const el = m.querySelector(sel);
+                            if (el && el.textContent && el.textContent.trim()) {
+                                sender = el.textContent.trim();
+                                break;
+                            }
+                        }
+
+                        // Extract timestamp
+                        let timestamp = '';
+                        const timeSelectors = [
+                            '[class*="time"]', '[class*="date"]', '[class*="when"]',
+                            '[class*="stamp"]', 'time', '[datetime]'
+                        ];
+                        for (const sel of timeSelectors) {
+                            const el = m.querySelector(sel);
+                            if (el) {
+                                timestamp = el.getAttribute('datetime') || el.textContent.trim();
+                                if (timestamp) break;
+                            }
+                        }
+
+                        // Determine direction (out/in)
+                        const classes = (m.className || '').toString();
+                        let direction = 'unknown';
+                        if (/message--?out|outgoing|sent|mine/i.test(classes)) {
+                            direction = 'out';
+                        } else if (/message--?in|incoming|received|theirs/i.test(classes)) {
+                            direction = 'in';
+                        }
+
+                        // Extract attachments
+                        const attachments = [];
+                        const attachSelectors = [
+                            '[class*="file"]', '[class*="attach"]', '[class*="preview"]',
+                            '[class*="document"]', '[class*="media"]'
+                        ];
+                        for (const sel of attachSelectors) {
+                            const els = m.querySelectorAll(sel);
+                            for (const el of els) {
+                                const name = el.getAttribute('title') ||
+                                             el.getAttribute('alt') ||
+                                             (el.textContent || '').trim().slice(0, 200);
+                                const size = el.querySelector('[class*="size"]');
+                                if (name) {
+                                    attachments.push({
+                                        name: name,
+                                        size: size ? size.textContent.trim() : ''
+                                    });
+                                }
+                            }
+                        }
+
+                        // Extract reactions
+                        const reactions = [];
+                        const reactSelectors = [
+                            '[class*="reaction"]', '[class*="emoji"]', '[class*="like"]'
+                        ];
+                        for (const sel of reactSelectors) {
+                            const els = m.querySelectorAll(sel);
+                            for (const el of els) {
+                                const reactText = (el.textContent || '').trim();
+                                if (reactText) {
+                                    reactions.push(reactText);
+                                }
+                            }
+                        }
+
+                        // Check if reply/forward
+                        const isReply = /reply|forward|переслан|ответ/i.test(classes) ||
+                                       !!m.querySelector('[class*="reply"], [class*="forward"]');
+
+                        results.push({
+                            text: text,
+                            html: m.innerHTML || '',
+                            classes: classes.slice(0, 500),
+                            sender: sender,
+                            timestamp: timestamp,
+                            direction: direction,
+                            attachments: attachments,
+                            reactions: reactions,
+                            is_reply: isReply
+                        });
+                    }
+
+                    return results;
+                }
+            """)
+            return result or []
+        except Exception as e:
+            self.logger.debug(f"Full batch collection error: {e}")
+            return []
+
+    def _scroll_and_collect_full(self, passes: int = 3) -> list[dict]:
+        """
+        Scroll through the entire message feed and collect full message data.
+
+        TWO-PHASE approach (fast):
+          Phase 1: quick signature scan via _collect_pass_sigs() — just text[:120]
+          Phase 2: enrich only NEW signatures via _collect_full_for_sigs()
+
+        This avoids re-parsing all visible messages on every scroll step.
+        _collect_full_batch() is only called once at the end as a safety net.
+
+        Args:
+            passes: Number of scroll passes to make
+
+        Returns:
+            List of message dicts with full data
+        """
+        self._check_connection()
+
+        all_signatures: set[str] = set()
+        all_messages: list[dict] = []
+        pass_count = 0
+
+        for pass_num in range(passes):
+            pass_count += 1
+            sigs_before = len(all_signatures)
+
+            print(f"  [EXPORT] Проход {pass_count}/{passes}, скролл вверх...")
+
+            # Focus scroll container (same as collect_all_messages)
+            self.page.evaluate("""
+                () => {
+                    const containers = document.querySelectorAll(
+                        '[class*="messages"],[class*="lenta"],[class*="feed"],' +
+                        '[class*="chat"],[class*="dialog"],[class*="scroll"]'
+                    );
+                    let best = null;
+                    let bestH = 0;
+                    for (const c of containers) {
+                        if (c.scrollHeight > c.clientHeight + 50 && c.scrollHeight > bestH) {
+                            best = c;
+                            bestH = c.scrollHeight;
+                        }
+                    }
+                    if (best) {
+                        window.__gitax_scroll = best;
+                        best.setAttribute('tabindex', '-1');
+                        best.focus();
+                    } else {
+                        window.__gitax_scroll = null;
+                    }
+                }
+            """)
+            self.page.wait_for_timeout(300)
+
+            # Scroll up and collect — FAST two-phase approach
+            no_new = 0
+            step = 0
+            while no_new < 15:
+                step += 1
+                try:
+                    # Phase 1: quick signature scan (lightweight — just text[:120])
+                    current_sigs = self._collect_pass_sigs()
+                    new_sigs = [s for s in current_sigs if s and s not in all_signatures]
+
+                    if new_sigs:
+                        all_signatures.update(new_sigs)
+
+                        # Phase 2: enrich only NEW signatures with full data
+                        enriched = self._collect_full_for_sigs(new_sigs)
+                        all_messages.extend(enriched)
+                        new_count = len(enriched)
+                    else:
+                        new_count = 0
+
+                    if new_count == 0:
+                        no_new += 1
+                    else:
+                        no_new = 0
+                        if step % 10 == 0:
+                            print(f"  [EXPORT] Шаг {step}: +{new_count}, всего {len(all_signatures)}")
+
+                    # Scroll up
+                    scrolled = self.page.evaluate("""
+                        () => {
+                            const c = window.__gitax_scroll;
+                            if (c) {
+                                const st = Math.max(100, c.clientHeight * 0.7);
+                                const before = c.scrollTop;
+                                c.scrollBy(0, -st);
+                                return c.scrollTop !== before;
+                            }
+                            window.scrollBy(0, -window.innerHeight * 0.7);
+                            return true;
+                        }
+                    """)
+
+                    if not scrolled:
+                        no_new += 1
+
+                    self.page.wait_for_timeout(300)
+
+                except Exception as e:
+                    self.logger.debug(f"Scroll error in export: {e}")
+                    no_new += 1
+
+            # Safety net: collect full data for any signatures that weren't enriched
+            enriched_sigs = {m.get("text", "")[:120] for m in all_messages}
+            missing_sigs = [s for s in all_signatures if s not in enriched_sigs]
+            if missing_sigs:
+                print(f"  [EXPORT] Безопасная сеть: обогащаю {len(missing_sigs)} пропущенных...")
+                enriched = self._collect_full_for_sigs(missing_sigs)
+                all_messages.extend(enriched)
+
+            sigs_after = len(all_signatures)
+            new_in_pass = sigs_after - sigs_before
+            print(f"  [EXPORT] Проход {pass_count}: +{new_in_pass} новых, всего {sigs_after}")
+
+            if new_in_pass == 0:
+                print(f"  [EXPORT] Новых сообщений нет, остановка")
+                break
+
+            # Scroll back to bottom for next pass
+            if pass_num < passes - 1:
+                self._scroll_to_bottom()
+
+        total = len(all_signatures)
+        print(f"  [EXPORT] Итого: {total} уникальных сообщений за {pass_count} проходов")
+        self.logger.info(f"Export collected {total} messages in {pass_count} passes")
+
+        return all_messages
+
+    def _write_json(self, output_path: str, messages: list[dict], channel_url: str):
+        """
+        Write messages to a JSON file with metadata.
+
+        Args:
+            output_path: File path for output
+            messages: List of message dicts
+            channel_url: Channel URL for metadata
+        """
+        from datetime import datetime
+
+        data = {
+            "metadata": {
+                "exported_at": datetime.now().isoformat(),
+                "channel_url": channel_url,
+                "total_messages": len(messages),
+                "format_version": "1.0"
+            },
+            "messages": messages
+        }
+
+        try:
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self.logger.info(f"JSON export written to {output_path} ({len(messages)} messages)")
+        except Exception as e:
+            self.logger.error(f"Failed to write JSON: {e}")
+            raise
+
+    def _write_csv(self, output_path: str, messages: list[dict]):
+        """
+        Write messages to a CSV file. HTML is excluded to keep file size reasonable.
+
+        Args:
+            output_path: File path for output
+            messages: List of message dicts
+        """
+        headers = ["index", "sender", "timestamp", "direction", "text", "type", "attachments"]
+
+        try:
+            with open(output_path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
+                writer.writeheader()
+
+                for msg in messages:
+                    # Determine message type from classes
+                    msg_type = "text"
+                    classes = msg.get("classes", "").lower()
+                    if any(k in classes for k in ['file', 'attach', 'preview']):
+                        msg_type = "file"
+                    elif any(k in classes for k in ['link', 'url']):
+                        msg_type = "link"
+
+                    row = {
+                        "index": msg.get("index", ""),
+                        "sender": msg.get("sender", ""),
+                        "timestamp": msg.get("timestamp", ""),
+                        "direction": msg.get("direction", ""),
+                        "text": msg.get("text", ""),
+                        "type": msg_type,
+                        "attachments": json.dumps(msg.get("attachments", []), ensure_ascii=False)
+                    }
+                    writer.writerow(row)
+
+            self.logger.info(f"CSV export written to {output_path} ({len(messages)} messages)")
+        except Exception as e:
+            self.logger.error(f"Failed to write CSV: {e}")
+            raise
+
+    def export_messages_to_file(
+        self,
+        output_path: str = "messages_export.json",
+        format: str = "json",
+        scroll_passes: int = 3,
+        include_html: bool = False,
+        max_messages: int = 0
+    ) -> int:
+        """
+        Export all messages from the MAX chat feed to a file.
+
+        Scrolls through the entire message feed, collects full data from each
+        message (sender, timestamp, direction, attachments, reactions), and
+        writes to a structured file.
+
+        Args:
+            output_path: Output file path (default: messages_export.json)
+            format: Output format - "json" or "csv" (default: json)
+            scroll_passes: Number of scroll passes to collect messages (default: 3)
+            include_html: Include HTML content in output (default: False, saves space)
+            max_messages: Maximum messages to export (0 = no limit)
+
+        Returns:
+            Total number of messages exported
+
+        Example:
+            bm = BrowserMAX(channel_url)
+            bm.connect()
+            bm.navigate()
+            count = bm.export_messages_to_file("my_export.json")
+            print(f"Exported {count} messages")
+        """
+        self._check_connection()
+        self.logger.info(f"Starting message export to {output_path} (format={format})")
+
+        # Collect all messages
+        messages = self._scroll_and_collect_full(passes=scroll_passes)
+
+        if not messages:
+            print("  [EXPORT] Сообщений не найдено")
+            self.logger.warning("No messages collected for export")
+            return 0
+
+        # Apply max_messages limit
+        if max_messages > 0 and len(messages) > max_messages:
+            messages = messages[:max_messages]
+            self.logger.info(f"Limited to {max_messages} messages")
+
+        # Strip HTML if requested
+        if not include_html:
+            for msg in messages:
+                msg["html"] = ""
+
+        # Re-index messages sequentially
+        for idx, msg in enumerate(messages):
+            msg["index"] = idx
+
+        # Write to file
+        try:
+            if format.lower() == "csv":
+                self._write_csv(output_path, messages)
+            else:
+                self._write_json(output_path, messages, self.channel_url)
+        except Exception as e:
+            # Fallback to temp directory
+            import tempfile
+            temp_path = os.path.join(tempfile.gettempdir(), "messages_export.json")
+            self.logger.warning(f"Original path failed, writing to {temp_path}")
+            self._write_json(temp_path, messages, self.channel_url)
+            output_path = temp_path
+
+        print(f"  [EXPORT] Готово! {len(messages)} сообщений → {output_path}")
+        return len(messages)
 
     def close(self):
         """Close browser connection gracefully"""
