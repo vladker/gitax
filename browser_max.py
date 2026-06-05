@@ -188,6 +188,56 @@ class BrowserMAX(LogMixin):
         self.browser: Optional[Browser] = None
         self.page: Optional[Page] = None
         self._connected = False
+        self._expected_extensions = ['.zip']
+
+    @staticmethod
+    def _launch_chrome_cdp():
+        """Launch Chrome with remote debugging port 9222"""
+        import socket
+
+        # Check if port 9222 is already in use
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(("localhost", 9222)) == 0:
+                _logger.debug("Port 9222 already in use, skipping launch")
+                return
+
+        _logger.info("Port 9222 not available, launching Chrome with remote debugging...")
+
+        chrome_paths = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe",
+        ]
+
+        chrome_exe = None
+        for path in chrome_paths:
+            expanded = os.path.expandvars(path)
+            if os.path.exists(expanded):
+                chrome_exe = expanded
+                break
+
+        if not chrome_exe:
+            _logger.error("Chrome executable not found")
+            return
+
+        user_data_dir = os.path.join(os.path.expanduser("~"), "AppData", "Local", "Google", "Chrome", "User Data")
+
+        cmd = [
+            chrome_exe,
+            "--remote-debugging-port=9222",
+            f"--user-data-dir={user_data_dir}",
+        ]
+
+        try:
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            _logger.info(f"Launched Chrome: {chrome_exe}")
+            time.sleep(3)
+        except Exception as e:
+            _logger.error(f"Failed to launch Chrome: {e}")
 
     def connect(self) -> bool:
         """Connect to Chrome - local browser or via CDP"""
@@ -217,10 +267,18 @@ class BrowserMAX(LogMixin):
                         timeout=30000
                     )
                 except Exception as e:
-                    self.logger.error(f"CDP connection failed: {e}")
-                    self.playwright.stop()
-                    self.playwright = None
-                    return False
+                    self.logger.warning(f"CDP connection failed: {e}")
+                    self._launch_chrome_cdp()
+                    try:
+                        self.browser = self.playwright.chromium.connect_over_cdp(
+                            "http://localhost:9222",
+                            timeout=30000
+                        )
+                    except Exception as e2:
+                        self.logger.error(f"CDP connection failed after launch: {e2}")
+                        self.playwright.stop()
+                        self.playwright = None
+                        return False
 
                 context = self.browser.contexts[0] if self.browser.contexts else self.browser.new_context()
                 self.page = context.pages[0] if context.pages else context.new_page()
@@ -855,6 +913,9 @@ class BrowserMAX(LogMixin):
                 size_str = f"{expected_size / 1024:.1f} KB"
             size_pattern = size_str.replace(".", "\\.").replace(" ", "\\s*")
 
+        # Build extension regex pattern for JS (e.g., "\\.zip" or "\\.tar\\.gz|\\.whl")
+        ext_pattern = '|'.join(re.escape(ext) for ext in self._expected_extensions)
+
         script = f"""
             () => {{
                 const id = '{upload_id}';
@@ -862,6 +923,7 @@ class BrowserMAX(LogMixin):
                 const searchName = '{expected_filename or ''}';
                 const sizePattern = '{size_pattern}';
                 const expectedSize = {expected_size or 0};
+                const extRegex = new RegExp('{ext_pattern}', 'i');
 
                 window[target] = null;
                 window[target + '_file'] = null;
@@ -878,7 +940,7 @@ class BrowserMAX(LogMixin):
 
                                 // Check if this looks like a file message
                                 const hasFileClass = /file|attach|upload|preview|item/i.test(className);
-                                const hasZip = /\\.zip/i.test(text);
+                                const hasZip = extRegex.test(text);
                                 const hasDownload = /скачать|download/i.test(text);
 
                                 if (!hasFileClass && !hasZip && !hasDownload) continue;
@@ -1258,8 +1320,9 @@ class BrowserMAX(LogMixin):
         Final DOM check for attached file in composer.
         NOTE: Does NOT check input[type=file] - that only means file is selected, not uploaded.
         """
-        script = """
-            () => {
+        ext_json = str(self._expected_extensions)
+        script = f"""
+            () => {{
                 // Only check for visible file indicators in composer
                 const composer = document.querySelector('[class*="composer"], [role="textbox"], [contenteditable]');
                 if (!composer) return false;
@@ -1268,24 +1331,25 @@ class BrowserMAX(LogMixin):
                 const fileIndicators = composer.querySelectorAll(
                     '[class*="preview"], [class*="file-item"], [class*="attach"], [class*="upload"], [data-file]'
                 );
+                const expectedExts = {ext_json};
 
-                for (const el of fileIndicators) {
-                    if (el.offsetHeight > 0) {
+                for (const el of fileIndicators) {{
+                    if (el.offsetHeight > 0) {{
                         const text = el.textContent || '';
-                        if (text.includes('.zip') || text.includes('.tar') || text.includes('MB') || text.includes('KB')) {
+                        if (expectedExts.some(ext => text.includes(ext)) || text.includes('MB') || text.includes('KB')) {{
                             return true;
-                        }
-                    }
-                }
+                        }}
+                    }}
+                }}
 
                 // Alternative: check if composer has changed to include file class
                 const composerClasses = composer.className || '';
-                if (composerClasses.includes('with-file') || composerClasses.includes('has-file') || composerClasses.includes('file-attached')) {
+                if (composerClasses.includes('with-file') || composerClasses.includes('has-file') || composerClasses.includes('file-attached')) {{
                     return true;
-                }
+                }}
 
                 return false;
-            }
+            }}
         """
 
         try:
@@ -1422,6 +1486,10 @@ class BrowserMAX(LogMixin):
                 baseline_count = base_count
 
             print(f"  [SCAN] Scanning from msg #{baseline_count + 1} (new messages only)...")
+            # Build dynamic extension patterns
+            js_ext_pattern = '|'.join(re.escape(ext) for ext in self._expected_extensions)
+            py_ext_pattern = '|'.join(re.escape(ext) for ext in self._expected_extensions)
+
             for idx in range(base_count):
                 if idx < baseline_count:
                     continue
@@ -1438,7 +1506,8 @@ class BrowserMAX(LogMixin):
                         const classes = msg.className || '';
 
                         const hasFileClass = /file|attach|download|archive|preview/i.test(classes);
-                        const hasZip = /\\.zip/i.test(text) || /\\.zip/i.test(html);
+                        const extRegex = new RegExp('{js_ext_pattern}', 'i');
+                        const hasZip = extRegex.test(text) || extRegex.test(html);
                         const hasDownload = msg.querySelector('[download]') !== null ||
                                             msg.querySelector('a[href*="download"]') !== null;
 
@@ -1457,7 +1526,7 @@ class BrowserMAX(LogMixin):
                 msg_html = msg_result.get('html', '').lower()
                 msg_classes = msg_result.get('classes', '').lower()
 
-                match = re.search(r'([a-z0-9\-_.]+\.zip(?:\.7z\.\d+)?)', msg_text)
+                match = re.search(r'([a-z0-9\-_.]+(?:' + py_ext_pattern + r')(?:\.7z\.\d+)?)', msg_text)
                 if match:
                     msg_filename = match.group(1).replace('-master', '').replace('-main', '')
                     if search_name not in msg_filename:
@@ -1521,7 +1590,8 @@ class BrowserMAX(LogMixin):
                                 const classes = msg.className || '';
 
                                 const hasFileClass = /file|attach|download|archive|preview/i.test(classes);
-                                const hasZip = /\\.zip/i.test(text) || /\\.zip/i.test(html);
+                                const extRegex = new RegExp('{js_ext_pattern}', 'i');
+                                const hasZip = extRegex.test(text) || extRegex.test(html);
                                 const hasDownload = msg.querySelector('[download]') !== null ||
                                                     msg.querySelector('a[href*="download"]') !== null;
                                 const hasSvg = msg.querySelector('svg') !== null;
@@ -1882,204 +1952,10 @@ class BrowserMAX(LogMixin):
             self.logger.error(f"Send failed: {e}")
             return False
 
-    def _wait_confirmation(self, timeout: int = 30) -> bool:
-        """Wait for message to appear in chat - checks for new file attachment message"""
-        self._check_connection()
-        self.logger.debug(f"Waiting for confirmation (timeout: {timeout}s)...")
-
-        start = time.time()
-
-        try:
-            before_msgs = self.page.evaluate("""
-                () => {
-                    const msgs = document.querySelectorAll('[class*="message"]');
-                    return msgs.length;
-                }
-            """) or 0
-        except Exception as e:
-            self.logger.warning(f"Failed to get initial count: {e}")
-            before_msgs = 0
-
-        while time.time() - start < timeout:
-            time.sleep(2)
-
-            try:
-                after_msgs = self.page.evaluate("""
-                    () => {
-                        const msgs = document.querySelectorAll('[class*="message"]');
-                        return msgs.length;
-                    }
-                """) or 0
-
-                if after_msgs > before_msgs:
-                    last_msg = self.page.evaluate("""
-                        () => {
-                            const msgs = document.querySelectorAll('[class*="message"]');
-                            const last = msgs[msgs.length - 1];
-                            return {
-                                text: last?.textContent?.slice(0, 80) || '',
-                                hasFile: last?.querySelector('[class*="file"], [class*="attach"]') !== null,
-                                html: last?.innerHTML?.slice(0, 200) || ''
-                            };
-                        }
-                    """) or {}
-
-                    if last_msg.get('hasFile') or 'test' in last_msg.get('text', '').lower():
-                        self.logger.info("Message with file appeared!")
-                        return True
-
-                    self.logger.debug(f"New message: {last_msg.get('text', '')[:50]}")
-
-                last_msg_text = self.page.evaluate("""
-                    () => {
-                        const msgs = document.querySelectorAll('[class*="message"]');
-                        return msgs[msgs.length - 1]?.textContent?.slice(0, 80) || '';
-                    }
-                """) or ""
-
-                if last_msg_text and last_msg_text != "Канал создан" and last_msg_text:
-                    if "attached" in last_msg_text.lower() or ".zip" in last_msg_text.lower() or ".txt" in last_msg_text.lower():
-                        self.logger.info(f"File message: {last_msg_text[:40]}...")
-                        return True
-
-            except Exception as e:
-                self.logger.debug(f"Check error: {e}")
-
-        self.logger.warning("No confirmation - continuing anyway")
-        return True
-
-    def send_message_with_file(self, text: str, filepath: str,
-                               retries: int = 3, retry_delay: int = 10,
-                               keep_alive: bool = False) -> tuple[bool, bool]:
-        """
-        Send text message first, then file as second message
-
-        Args:
-            keep_alive: If True, don't close connection after sending
-
-        Returns:
-            Tuple of (success: bool, file_deletable: bool)
-            file_deletable indicates if file can be safely deleted after upload
-        """
-        valid, err = self._validate_file(filepath)
-        if not valid:
-            self.logger.error(f"File not found or invalid: {err}")
-            return (False, True)  # success=False, file_deletable=True (nothing to clean)
-
-        abs_path = os.path.abspath(filepath)
-        file_size_mb = os.path.getsize(abs_path) / 1024 / 1024
-        file_size_bytes = os.path.getsize(abs_path)
-        filename = os.path.basename(filepath)
-
-        self.logger.info(f"Sending message with file: {filename} ({file_size_mb:.1f} MB)")
-
-        for attempt in range(1, retries + 1):
-            try:
-                self.logger.info(f"Attempt {attempt}/{retries}")
-
-                if not self.page:
-                    self.logger.info("Connecting to MAX...")
-                    if not self.connect():
-                        raise ConnectionError("Failed to connect to Chrome")
-
-                self.logger.debug("Opening channel...")
-                self.navigate()
-                self.wait_page_ready()
-
-                self.logger.debug("Typing message...")
-                input_elem = self._find_message_input()
-                if input_elem:
-                    self._type_message(text, input_elem)
-
-                self.logger.debug("Sending about message...")
-                self._send_message()
-                time.sleep(1)
-
-                self.logger.debug("Opening upload dialog...")
-                time.sleep(0.3)
-
-                self.logger.info("Uploading file...")
-                upload_timeout = max(60000, int(file_size_mb * 5000))
-                self.logger.debug(f"Upload timeout: {upload_timeout//1000}s")
-
-                uploaded = False
-                try:
-                    with self.page.expect_file_chooser(timeout=upload_timeout) as fc_info:
-                        self._click_upload_button()
-
-                    fc_info.value.set_files(abs_path, timeout=upload_timeout)
-                    self.logger.info(f"File selected: {filename}")
-                    uploaded = True
-                except PlaywrightTimeout:
-                    self.logger.warning("File chooser timeout, trying input method...")
-                    try:
-                        file_input = self.page.locator('input[type="file"]').first
-                        file_input.set_input_files(abs_path, timeout=upload_timeout)
-                        self.logger.info("File uploaded via input")
-                        uploaded = True
-                    except Exception as e2:
-                        self.logger.error(f"Input method also failed: {e2}")
-                except Exception as e:
-                    self.logger.warning(f"File chooser failed: {e}")
-                    try:
-                        file_input = self.page.locator('input[type="file"]').first
-                        file_input.set_input_files(abs_path, timeout=upload_timeout)
-                        self.logger.info("File uploaded via input")
-                        uploaded = True
-                    except Exception as e2:
-                        self.logger.error(f"Input method also failed: {e2}")
-
-                if not uploaded:
-                    raise UploadError("Failed to upload file - both methods failed")
-
-                self.logger.debug("Waiting for upload...")
-                if not self._wait_upload_complete(expected_filename=filename, expected_size=file_size_bytes):
-                    raise UploadError("Upload did not complete in time")
-
-                self.logger.debug("Sending file message...")
-                self._send_message()
-
-                self.logger.debug("Waiting for file message confirmation...")
-                # Monitor online until file message is found
-                found, reason, msg_idx = self._wait_for_file_message(
-                    timeout=300,
-                    expected_filename=filename,
-                    baseline_count=self._pre_upload_msg_count
-                )
-                self.logger.info(f"Result: {reason}, msg #{msg_idx}")
-
-                # If file not confirmed, return failure
-                if not found:
-                    self.logger.error(f"File not found in chat: {reason}")
-                    return (False, True)  # failure, but file may be deletable
-
-                self.logger.info("About + file sent successfully!")
-                return (True, True)  # success, file_deletable
-
-            except (ConnectionError, UploadError, PlaywrightTimeout) as e:
-                self.logger.error(f"{type(e).__name__}: {e}")
-
-                if attempt < retries:
-                    self.logger.info(f"Retrying in {retry_delay}s...")
-                    time.sleep(retry_delay)
-                else:
-                    self.logger.error("Max retries exceeded")
-                    return (False, True)  # success=False, file may be deletable
-            except Exception as e:
-                self.logger.error(f"Unexpected error: {e}", exc_info=True)
-
-                if attempt < retries:
-                    self.logger.info(f"Retrying in {retry_delay}s...")
-                    time.sleep(retry_delay)
-                else:
-                    self.logger.error("Max retries exceeded")
-                    return (False, True)  # success=False, file may be deletable
-
-        return (False, True)
-
     def send_message_with_files(self, text: str, filepaths: list[str],
                                 retries: int = 3, retry_delay: int = 10,
-                                split_threshold_mb: float = 49.0) -> tuple[bool, bool]:
+                                split_threshold_mb: float = 49.0,
+                                expected_extensions: list[str] | None = None) -> tuple[bool, bool]:
         """
         Send text message with one or more files (supports split archives).
 
@@ -2092,10 +1968,14 @@ class BrowserMAX(LogMixin):
             retries: Number of retries per file
             retry_delay: Delay between retries (seconds)
             split_threshold_mb: Threshold in MB to trigger splitting (default: 49)
+            expected_extensions: List of file extensions to match for upload confirmation.
+                                Default: ['.zip']
 
         Returns:
             Tuple of (all_success: bool, all_files_deletable: bool)
         """
+        if expected_extensions is not None:
+            self._expected_extensions = expected_extensions
         all_files = []
         volumes_to_cleanup = []
 
@@ -2330,12 +2210,15 @@ class BrowserMAX(LogMixin):
 
     def send_message_with_file(self, text: str, filepath: str,
                                retries: int = 3, retry_delay: int = 10,
-                               keep_alive: bool = False) -> tuple[bool, bool]:
+                               keep_alive: bool = False,
+                               expected_extensions: list[str] | None = None) -> tuple[bool, bool]:
         """
         Send text message first, then file as second message.
 
         Args:
             keep_alive: If True, don't close connection after sending
+            expected_extensions: List of file extensions to match for upload confirmation.
+                                Default: ['.zip']
 
         Returns:
             Tuple of (success: bool, file_deletable: bool)
@@ -2346,7 +2229,8 @@ class BrowserMAX(LogMixin):
             text=text,
             filepaths=[filepath],
             retries=retries,
-            retry_delay=retry_delay
+            retry_delay=retry_delay,
+            expected_extensions=expected_extensions
         )
         return (success, deletable)
 
