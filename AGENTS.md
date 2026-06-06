@@ -56,12 +56,11 @@ Priority: `.env` file / env var > `config.yaml`
 
 ### Multi-Volume (7z split)
 
-Files larger than **49 MB** are split into `.7z.001`, `.7z.002`, etc. volumes using 7-Zip:
+Files larger than **49 MB** are split into `.7z.001`, `.7z.002`, etc. volumes using 7-Zip (threshold via `config.yaml`):
 
-- Each volume is uploaded as a separate message after the description text
-- Volumes are sent sequentially (`.001` → `.002` → `.003` ...)
-- Each volume is **deleted immediately** after its upload is confirmed
-- Split threshold is configurable via `config.yaml` → `archiver.split_threshold_mb`
+- Each volume is uploaded as a separate message.
+- Volumes are sent sequentially (`.001` → `.002` → `.003` ...).
+- Each volume is **deleted immediately** after upload confirmation.
 
 ### Upload Confirmation
 
@@ -83,6 +82,22 @@ archiver:
   split_threshold_mb: 49    # Files above this size are split into 7z volumes
   use_local_browser: false  # false = CDP to existing Chrome, true = launch new
   output_dir: "./temp"      # Temp directory for downloads
+```
+
+## PyPI Archiver
+
+Downloads top Python packages from Hugovk dataset and sends them to a separate MAX channel.
+
+### Configuration
+- `pypi.channel_url` — MAX channel URL for PyPI packages
+- `pypi_archiver.limit` — Default number of packages
+- `pypi_archiver.output_dir` — Temp download directory
+- Both .tar.gz (source) and .whl (wheel) distributions are downloaded
+
+### Token Setup
+Add to `.env`:
+```env
+PYPI_CHANNEL_URL=https://web.max.ru/...
 ```
 
 ## .gitignore

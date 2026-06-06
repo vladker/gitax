@@ -1384,6 +1384,149 @@ class BrowserMAX(LogMixin):
             self.logger.debug(f"DOM composer check error: {e}")
             return False
 
+    def _take_content_snapshot(self, depth: int = 15, window: int = 100) -> Optional[str]:
+        """
+        Capture a content snapshot of the last N messages.
+        Returns a hash string or None on failure.
+
+        Used to detect new messages in virtual-scrolling feeds where
+        DOM element count stays constant.
+
+        Args:
+            depth: Number of messages from the bottom to include
+            window: Number of characters per message for hashing
+        """
+        try:
+            texts = self.page.evaluate(f"""
+                () => {{
+                    const msgs = document.querySelectorAll('[class*="message"]');
+                    const depth = {depth};
+                    const window = {window};
+                    const start = Math.max(0, msgs.length - depth);
+                    const texts = [];
+                    for (let i = start; i < msgs.length; i++) {{
+                        const text = (msgs[i].textContent || '').trim();
+                        texts.push(text.slice(0, window));
+                    }}
+                    return texts;
+                }}
+            """)
+            if not texts:
+                return None
+            combined = "\n".join(texts)
+            import hashlib
+            return hashlib.sha256(combined.encode("utf-8")).hexdigest()
+        except Exception as e:
+            self.logger.debug(f"Snapshot error: {e}")
+            return None
+
+    def _match_filename_in_message(self, msg_text: str, msg_html: str,
+                                    search_name: Optional[str] = None) -> tuple[bool, str]:
+        """
+        Check if a message contains the expected file. Three-tier matching:
+        1. Regex extraction + normalized comparison
+        2. Direct substring search
+        3. Generic file indicator (fallback)
+
+        Args:
+            msg_text: Message textContent (lowercased)
+            msg_html: Message innerHTML (lowercased)
+            search_name: Normalized filename to search for (without -master/-main)
+
+        Returns:
+            (matched: bool, match_detail: str)
+        """
+        if not search_name:
+            # No specific filename — accept any file message
+            has_archive = bool(re.search(r'\.(zip|tar|gz|rar|7z)', msg_text))
+            has_download = 'download' in msg_text or 'скачать' in msg_text
+            return (has_archive or has_download, "generic_file" if (has_archive or has_download) else "none")
+
+        # Tier 1: Regex extraction + normalized comparison
+        ext_pattern = '|'.join(re.escape(ext) for ext in self._expected_extensions)
+        match = re.search(r'([a-z0-9\-_.]+(?:' + ext_pattern + r')(?:\.7z\.\d+)?)', msg_text)
+        if match:
+            msg_filename = match.group(1).replace('-master', '').replace('-main', '')
+            if search_name in msg_filename or msg_filename in search_name:
+                return (True, f"regex:{match.group(1)}")
+
+        # Tier 1 on HTML too
+        match = re.search(r'([a-z0-9\-_.]+(?:' + ext_pattern + r')(?:\.7z\.\d+)?)', msg_html)
+        if match:
+            msg_filename = match.group(1).replace('-master', '').replace('-main', '')
+            if search_name in msg_filename or msg_filename in search_name:
+                return (True, f"regex_html:{match.group(1)}")
+
+        # Tier 2: Direct substring search
+        if search_name in msg_text:
+            return (True, f"substring:{search_name}")
+
+        # Tier 3: Generic file indicator (only if search_name contains archive extension)
+        has_archive = bool(re.search(r'\.(zip|7z)', msg_text))
+        has_download = 'download' in msg_text or 'скачать' in msg_text
+        if has_archive and has_download:
+            self.logger.warning(f"Tertiary match — no exact filename, but file+download found near '{search_name}'")
+            return (True, "tertiary_fallback")
+
+        return (False, "no_match")
+
+    def _scan_messages_for_file(self, start_idx: int, end_idx: int,
+                                 search_name: Optional[str] = None) -> tuple[bool, int, str]:
+        """
+        Scan messages in range [start_idx, end_idx) for a file upload.
+
+        Args:
+            start_idx: First message index to check (inclusive)
+            end_idx: Last message index to check (exclusive)
+            search_name: Normalized filename to match (None = accept any file)
+
+        Returns:
+            (found: bool, msg_index: int, detail: str)
+        """
+        js_ext_pattern = '|'.join(re.escape(ext) for ext in self._expected_extensions)
+
+        for idx in range(start_idx, end_idx):
+            try:
+                msg_result = self.page.evaluate(f"""
+                    () => {{
+                        const msgs = document.querySelectorAll('[class*="message"]');
+                        const msg = msgs[{idx}];
+                        if (!msg) return null;
+                        const text = msg.textContent || '';
+                        const html = msg.innerHTML || '';
+                        const classes = msg.className || '';
+                        const hasFileClass = /file|attach|download|archive|preview/i.test(classes);
+                        const extRegex = new RegExp('{js_ext_pattern}', 'i');
+                        const hasZip = extRegex.test(text) || extRegex.test(html);
+                        const hasDownload = msg.querySelector('[download]') !== null ||
+                                            msg.querySelector('a[href*="download"]') !== null;
+                        return {{
+                            text: text.slice(0, 200),
+                            html: html.slice(0, 300),
+                            hasFileClass,
+                            hasZip,
+                            hasDownload,
+                            classes: classes.slice(0, 80)
+                        }};
+                    }}
+                """) or {}
+
+                if not (msg_result.get('hasFileClass') or msg_result.get('hasZip') or msg_result.get('hasDownload')):
+                    continue
+
+                msg_text = (msg_result.get('text') or '').lower()
+                msg_html = (msg_result.get('html') or '').lower()
+
+                matched, detail = self._match_filename_in_message(msg_text, msg_html, search_name)
+                if matched:
+                    return (True, idx + 1, detail)
+
+            except Exception as e:
+                self.logger.debug(f"Scan msg #{idx + 1} error: {e}")
+                continue
+
+        return (False, 0, "not_found")
+
     def _check_upload_in_lenta(self, expected_filename: Optional[str] = None,
                                 min_msg_index: int = 0) -> tuple[bool, Optional[str]]:
         """
@@ -1454,8 +1597,11 @@ class BrowserMAX(LogMixin):
                                 expected_filename: Optional[str] = None,
                                 baseline_count: Optional[int] = None) -> tuple[bool, str, int]:
         """
-        Monitor chat online until file message is found.
-        No hard timeout - exits when file is confirmed or error occurs.
+        Monitor chat for file message using content-based snapshots.
+
+        Since MAX uses virtual scrolling (DOM count stays constant),
+        we detect new messages by comparing text content hashes of
+        the last N messages at regular intervals.
 
         Args:
             timeout: Max time to wait (default 5 min as safety fallback)
@@ -1465,16 +1611,15 @@ class BrowserMAX(LogMixin):
 
         Returns:
             (found: bool, reason: str, found_msg_index: int)
-            reason = "found" | "timeout" | "disconnected" | "no_activity" | "filename_mismatch"
-            found_msg_index: 0 if not found, otherwise message index
+            reason = "found" | "timeout" | "disconnected" | "init_failed"
         """
         start = time.time()
-        base_count = 0
-        last_activity_time = start
+        snapshot_interval = 2  # seconds between snapshots
+        snapshot_depth = 15    # last N messages to snapshot
 
-        print(f"  [MONITOR] Starting live monitoring...")
+        print(f"  [MONITOR] Starting content-based monitoring...")
 
-        # If filename provided, normalize it for comparison
+        # Normalize search name
         search_name = None
         if expected_filename:
             import os as os_module
@@ -1499,88 +1644,32 @@ class BrowserMAX(LogMixin):
             """) or ""
             print(f"  [MONITOR] Initial: {base_count} msgs, last: {init_result[:50]}...")
 
-            # Scan ALL messages - but we must ONLY match files that belong to THIS upload.
-            # Since base_count is captured BEFORE this upload starts, old messages
-            # from previous repos are in indices 0 to base_count-1.
-            # New messages (from this upload) will be at indices >= base_count.
-            # BUT: on reconnect (page reload), base_count resets to new count.
-            # Solution: we REQUIRE filename match if provided, otherwise accept any file message.
-            # This is fine because each upload has unique filename.
-            # Use provided baseline_count or capture current count
+            # Use provided baseline or capture current count
             if baseline_count is None:
                 baseline_count = base_count
 
-            print(f"  [SCAN] Scanning from msg #{baseline_count + 1} (new messages only)...")
-            # Build dynamic extension patterns
-            js_ext_pattern = '|'.join(re.escape(ext) for ext in self._expected_extensions)
-            py_ext_pattern = '|'.join(re.escape(ext) for ext in self._expected_extensions)
-
-            for idx in range(base_count):
-                if idx < baseline_count:
-                    continue
-
-                print(f"  [SCAN] Checking msg #{idx + 1}")
-                msg_result = self.page.evaluate(f"""
-                    () => {{
-                        const msgs = document.querySelectorAll('[class*="message"]');
-                        const msg = msgs[{idx}];
-                        if (!msg) return null;
-
-                        const text = msg.textContent || '';
-                        const html = msg.innerHTML || '';
-                        const classes = msg.className || '';
-
-                        const hasFileClass = /file|attach|download|archive|preview/i.test(classes);
-                        const extRegex = new RegExp('{js_ext_pattern}', 'i');
-                        const hasZip = extRegex.test(text) || extRegex.test(html);
-                        const hasDownload = msg.querySelector('[download]') !== null ||
-                                            msg.querySelector('a[href*="download"]') !== null;
-
-                        return {{
-                            text: text.slice(0, 150),
-                            html: html.slice(0, 200),
-                            hasFileClass,
-                            hasZip,
-                            hasDownload,
-                            classes: classes.slice(0, 80)
-                        }};
-                    }}
-                """) or {}
-
-                msg_text = msg_result.get('text', '').lower()
-                msg_html = msg_result.get('html', '').lower()
-                msg_classes = msg_result.get('classes', '').lower()
-
-                match = re.search(r'([a-z0-9\-_.]+(?:' + py_ext_pattern + r')(?:\.7z\.\d+)?)', msg_text)
-                if match:
-                    msg_filename = match.group(1).replace('-master', '').replace('-main', '')
-                    if search_name not in msg_filename:
-                        match = None
-
-                has_download_btn = (
-                    'download' in msg_classes or
-                    'download' in msg_html or
-                    msg_result.get('hasDownload') or
-                    'скачать' in msg_text.lower() or
-                    'download' in msg_text.lower()
+            # ── INITIAL SCAN ──
+            # FIX: range was range(base_count) with skip if idx < baseline_count,
+            # which meant the range was empty since baseline_count == base_count.
+            # Now: scan from baseline_count to base_count (new messages only).
+            print(f"  [SCAN] Scanning from msg #{baseline_count + 1}...")
+            if baseline_count < base_count:
+                found, msg_idx, detail = self._scan_messages_for_file(
+                    baseline_count, base_count, search_name
                 )
+                if found:
+                    print(f"  [OK] FILE FOUND in initial scan! Message #{msg_idx} ({detail})")
+                    return (True, "found", msg_idx)
+            else:
+                print(f"  [SCAN] No new messages yet (baseline={baseline_count}, current={base_count})")
 
-                if not has_download_btn and not match:
-                    continue
-
-                print(f"  [OK] FILE FOUND! Message #{idx + 1}")
-                print(f"       {msg_result.get('text', '')[:100]}...")
-                return (True, "found", idx + 1)
-
-            print(f"  [SCAN] No matching file found")
-            last_activity_time = time.time()
         except Exception as e:
             print(f"  [ERROR] Failed to initialize: {e}")
             return (False, "init_failed", 0)
 
-        no_change_count = 0
-        check_interval = 0.5  # Check every 0.5 seconds
-        checked_initial = False
+        # ── CONTENT-BASED MONITORING LOOP ──
+        prev_snapshot = self._take_content_snapshot(depth=snapshot_depth)
+        print(f"  [SNAPSHOT] Baseline hash: {prev_snapshot[:16] if prev_snapshot else 'none'}...")
 
         while True:
             elapsed = int(time.time() - start)
@@ -1592,138 +1681,58 @@ class BrowserMAX(LogMixin):
                     print(f"  [WARN] Connection lost after {elapsed}s")
                     return (False, "disconnected", 0)
 
-                # Get current state
-                current_count = self.page.evaluate(
-                    "() => document.querySelectorAll('[class*=\"message\"]').length"
-                ) or 0
+                # Take new content snapshot
+                curr_snapshot = self._take_content_snapshot(depth=snapshot_depth)
 
-                if current_count > baseline_count:
-                    # New message(s) appeared!
-                    print(f"  [UPDATE] New messages: {baseline_count} -> {current_count}")
-                    last_activity_time = time.time()
-                    no_change_count = 0
+                if curr_snapshot and prev_snapshot and curr_snapshot != prev_snapshot:
+                    # Content changed! New message(s) appeared.
+                    print(f"  [UPDATE] Content changed at {elapsed}s")
 
-                    for idx in range(baseline_count, current_count):
-                        msg_result = self.page.evaluate(f"""
-                            () => {{
-                                const msgs = document.querySelectorAll('[class*="message"]');
-                                const msg = msgs[{idx}];
-                                if (!msg) return null;
+                    # Scan the snapshot depth range for file match
+                    current_total = self.page.evaluate(
+                        "() => document.querySelectorAll('[class*=\"message\"]').length"
+                    ) or 0
+                    scan_start = max(baseline_count, current_total - snapshot_depth)
 
-                                const text = msg.textContent || '';
-                                const html = msg.innerHTML || '';
-                                const classes = msg.className || '';
+                    found, msg_idx, detail = self._scan_messages_for_file(
+                        scan_start, current_total, search_name
+                    )
+                    if found:
+                        print(f"  [OK] FILE FOUND! Message #{msg_idx} ({detail})")
+                        return (True, "found", msg_idx)
 
-                                const hasFileClass = /file|attach|download|archive|preview/i.test(classes);
-                                const extRegex = new RegExp('{js_ext_pattern}', 'i');
-                                const hasZip = extRegex.test(text) || extRegex.test(html);
-                                const hasDownload = msg.querySelector('[download]') !== null ||
-                                                    msg.querySelector('a[href*="download"]') !== null;
-                                const hasSvg = msg.querySelector('svg') !== null;
-
-                                return {{
-                                    text: text.slice(0, 150),
-                                    html: html.slice(0, 200),
-                                    hasFileClass,
-                                    hasZip,
-                                    hasDownload,
-                                    hasSvg,
-                                    classes: classes.slice(0, 80)
-                                }};
-                            }}
-                        """) or {}
-
-                        is_file = (msg_result.get('hasFileClass') or
-                                  msg_result.get('hasZip') or
-                                  msg_result.get('hasDownload'))
-
-                        if not is_file:
-                            continue
-
-                        msg_text = msg_result.get('text', '').lower()
-                        msg_html = (msg_result.get('html') or '').lower()
-
-                        match = None
-                        if search_name:
-                            match = re.search(r'([a-z0-9\-_.]+\.zip(?:\.7z\.\d+)?)', msg_text)
-                            if match:
-                                msg_filename = match.group(1).replace('-master', '').replace('-main', '')
-                                if search_name not in msg_filename:
-                                    match = None
-
-                        has_download = msg_result.get('hasDownload')
-                        if not has_download:
-                            has_download = 'download' in msg_text or 'скачать' in msg_text
-
-                        if not has_download and not match:
-                            print(f"  [SKIP] Msg #{idx + 1}: no download/.zip indicator")
-                            continue
-
-                        print(f"  [OK] FILE FOUND! Message #{idx + 1}")
-                        print(f"       {msg_result.get('text', '')[:100]}...")
-                        return (True, "found", idx + 1)
-
-                    baseline_count = current_count
+                    prev_snapshot = curr_snapshot
+                elif curr_snapshot:
+                    prev_snapshot = curr_snapshot
 
                 # Check for timeout
                 if timeout_reached:
-                    # Final check - scan last 20 messages for any file
                     final_count = self.page.evaluate(
                         "() => document.querySelectorAll('[class*=\"message\"]').length"
                     ) or 0
                     print(f"  [WARN] Timeout after {elapsed}s. Checking last 20 msgs...")
 
-                    for idx in range(max(0, final_count - 20), final_count):
-                        msg_result = self.page.evaluate(f"""
-                            () => {{
-                                const msgs = document.querySelectorAll('[class*="message"]');
-                                const msg = msgs[{idx}];
-                                if (!msg) return null;
-                                const text = msg.textContent || '';
-                                const html = msg.innerHTML || '';
-                                const classes = msg.className || '';
-                                const hasFileClass = /file|attach|download|archive|preview/i.test(classes);
-                                const hasZip = /\\.zip/i.test(text) || /\\.zip/i.test(html);
-                                const hasDownload = msg.querySelector('[download]') !== null;
-                                return {{
-                                    text: text.slice(0, 200),
-                                    hasFileClass,
-                                    hasZip,
-                                    hasDownload
-                                }};
-                            }}
-                        """) or {}
-
-                        if not (msg_result.get('hasFileClass') or msg_result.get('hasZip') or msg_result.get('hasDownload')):
-                            continue
-
-                        if search_name:
-                            msg_text = (msg_result.get('text') or '').lower()
-                            match = re.search(r'([a-z0-9\-_.]+\.zip(?:\.7z\.\d+)?)', msg_text)
-                            if match:
-                                msg_filename = match.group(1).replace('-master', '').replace('-main', '')
-                                if search_name not in msg_filename:
-                                    match = None
-
-                        print(f"  [OK] File found at timeout! Msg #{idx + 1}")
-                        return (True, "found", idx + 1)
+                    # Fallback: scan last 20 messages
+                    fallback_start = max(0, final_count - 20)
+                    found, msg_idx, detail = self._scan_messages_for_file(
+                        fallback_start, final_count, search_name
+                    )
+                    if found:
+                        print(f"  [OK] File found at timeout! Msg #{msg_idx} ({detail})")
+                        return (True, "found", msg_idx)
 
                     print(f"  [WARN] No file found. Messages: {base_count} -> {final_count}")
                     return (False, "timeout", 0)
 
-                # Periodic status
+                # Periodic status every 30s
                 if elapsed > 0 and elapsed % 30 == 0:
-                    curr = self.page.evaluate(
-                        "() => document.querySelectorAll('[class*=\"message\"]').length"
-                    ) or 0
-                    print(f"  [MONITOR] {elapsed}s | {curr} msgs | no activity: {int(time.time() - last_activity_time)}s")
+                    print(f"  [MONITOR] {elapsed}s | waiting for content change...")
 
-                no_change_count += 1
-                time.sleep(check_interval)
+                time.sleep(snapshot_interval)
 
             except Exception as e:
                 print(f"  [ERROR] Monitor error: {e}")
-                time.sleep(check_interval)
+                time.sleep(snapshot_interval)
 
     def _watch_message_feed(self, timeout: int = 10800, progress: bool = True) -> tuple[bool, str]:
         """
@@ -2666,6 +2675,7 @@ class BrowserMAX(LogMixin):
             self.page.wait_for_timeout(300)
 
             step_in_pass = -1
+            scroll_stuck_count = 0
             while True:
                 step_in_pass += 1
                 try:
@@ -2725,9 +2735,19 @@ class BrowserMAX(LogMixin):
                     """)
 
                     if not scrolled:
+                        # Only count as "stuck" when scroll didn't move AND no new
+                        # messages were found. MAX lazy-loads content — scroll position
+                        # may stay the same while new messages appear above the viewport.
+                        if not new_sig_set:
+                            scroll_stuck_count += 1
+                            if scroll_stuck_count >= 2:
+                                print(f"  [SCROLL] Скролл застрял на шаге {step_in_pass}, лента закончена")
+                                break
                         no_new += 1
                         if no_new >= 15:
                             break
+                    else:
+                        scroll_stuck_count = 0
 
                     self.page.wait_for_timeout(800)
 
@@ -4195,12 +4215,15 @@ class BrowserMAX(LogMixin):
             # Scroll up and collect — SINGLE-PHASE: one evaluate per step
             no_new = 0
             step = 0
+            scroll_stuck_count = 0
+            sigs_stagnant = 0  # Track when signatures stop growing
             while no_new < 15:
                 step += 1
                 try:
                     # Single call: skip known sigs, return full data for new ones
                     enriched = self._collect_enrich_new(all_signatures)
                     new_count = len(enriched)
+                    sigs_before_step = len(all_signatures)
 
                     if new_count > 0:
                         # Update signatures from new messages
@@ -4210,10 +4233,23 @@ class BrowserMAX(LogMixin):
                                 all_signatures.add(sig)
                         all_messages.extend(enriched)
 
+                    sigs_after_step = len(all_signatures)
+                    sigs_grew = (sigs_after_step - sigs_before_step) > 0
+
                     if new_count == 0:
+                        no_new += 1
+                    elif not sigs_grew:
+                        # Enriched messages returned but signatures didn't grow —
+                        # likely signature mismatch (DOM changed between collections).
+                        # Count as stagnant to prevent infinite loops.
+                        sigs_stagnant += 1
+                        if sigs_stagnant >= 5:
+                            print(f"  [EXPORT] Подписи не растут на шаге {step}, лента закончена")
+                            break
                         no_new += 1
                     else:
                         no_new = 0
+                        sigs_stagnant = 0
                         if step % 10 == 0:
                             print(f"  [EXPORT] Шаг {step}: +{new_count}, всего {len(all_signatures)}")
 
@@ -4233,7 +4269,17 @@ class BrowserMAX(LogMixin):
                     """)
 
                     if not scrolled:
-                        no_new += 1
+                        # Only count as "stuck" when scroll didn't move AND no new
+                        # messages were found. MAX lazy-loads content — scroll position
+                        # may stay the same while new messages appear above the viewport.
+                        if new_count == 0:
+                            scroll_stuck_count += 1
+                            if scroll_stuck_count >= 2:
+                                print(f"  [EXPORT] Скролл застрял на шаге {step}, лента закончена")
+                                break
+                            no_new += 1
+                    else:
+                        scroll_stuck_count = 0
 
                     self.page.wait_for_timeout(300)
 

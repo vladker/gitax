@@ -1709,8 +1709,10 @@ class GitHubArchiver:
         fmt = "csv" if fmt_choice == "c" else "json"
         ext = ".csv" if fmt == "csv" else ".json"
 
-        # Ask for output path
-        default_path = f"messages_export{ext}"
+        # Ask for output path — default to export/ folder next to the script
+        export_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "export")
+        os.makedirs(export_dir, exist_ok=True)
+        default_path = os.path.join(export_dir, f"messages_export{ext}")
         try:
             path_input = input(f"  Путь к файлу [{default_path}]: ").strip()
         except (EOFError, KeyboardInterrupt):

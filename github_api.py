@@ -31,6 +31,7 @@ class GitHubAPI(LogMixin):
     """Класс для работы с GitHub API"""
 
     BASE_URL = "https://api.github.com"
+    DEFAULT_TIMEOUT = 30  # seconds for API requests
 
     def __init__(self, token: str, output_dir: str = "./temp"):
         self.token = token
@@ -71,7 +72,9 @@ class GitHubAPI(LogMixin):
 
         while True:
             try:
-                response = self.session.request(method, url, **kwargs)
+                response = self.session.request(
+                    method, url, timeout=self.DEFAULT_TIMEOUT, **kwargs
+                )
             except requests.exceptions.ConnectionError as e:
                 self.logger.error(f"Connection error: {e}")
                 raise GitHubAPIError(f"Cannot connect to GitHub: {e}")
