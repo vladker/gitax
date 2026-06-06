@@ -209,6 +209,7 @@ class BrowserMAX(LogMixin):
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
             r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
             r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe",
+            r"%LOCALAPPDATA%\Google\Chrome SxS\Application\chrome.exe",
         ]
 
         chrome_exe = None
@@ -263,24 +264,46 @@ class BrowserMAX(LogMixin):
                 # Use CDP connection to existing Chrome (must be open at channel_url)
                 # This preserves existing browser state and cookies
                 self.logger.info("Connecting via CDP (port 9222) to existing browser...")
-                try:
-                    self.browser = self.playwright.chromium.connect_over_cdp(
-                        "http://localhost:9222",
-                        timeout=30000
-                    )
-                except Exception as e:
-                    self.logger.warning(f"CDP connection failed: {e}")
-                    self._launch_chrome_cdp()
+                connected = False
+                for attempt in range(1, 4):
                     try:
                         self.browser = self.playwright.chromium.connect_over_cdp(
                             "http://localhost:9222",
                             timeout=30000
                         )
-                    except Exception as e2:
-                        self.logger.error(f"CDP connection failed after launch: {e2}")
-                        self.playwright.stop()
-                        self.playwright = None
-                        return False
+                        connected = True
+                        break
+                    except Exception as e:
+                        self.logger.warning(f"CDP attempt {attempt}/3 failed: {e}")
+                        if attempt < 3:
+                            wait_time = attempt * 3  # 3s, 6s, 9s backoff
+                            self.logger.info(f"Retrying in {wait_time}s...")
+                            time.sleep(wait_time)
+
+                if not connected:
+                    self.logger.warning("All CDP attempts failed, trying to launch Chrome...")
+                    self._launch_chrome_cdp()
+                    time.sleep(5)  # Give Chrome time to start
+                    for attempt in range(1, 4):
+                        try:
+                            self.browser = self.playwright.chromium.connect_over_cdp(
+                                "http://localhost:9222",
+                                timeout=30000
+                            )
+                            connected = True
+                            break
+                        except Exception as e2:
+                            self.logger.warning(f"Post-launch CDP attempt {attempt}/3 failed: {e2}")
+                            if attempt < 3:
+                                wait_time = attempt * 3
+                                self.logger.info(f"Retrying in {wait_time}s...")
+                                time.sleep(wait_time)
+
+                if not connected:
+                    self.logger.error("Failed to connect to MAX via CDP after all retries")
+                    self.playwright.stop()
+                    self.playwright = None
+                    return False
 
                 context = self.browser.contexts[0] if self.browser.contexts else self.browser.new_context()
                 self.page = context.pages[0] if context.pages else context.new_page()
