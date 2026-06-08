@@ -247,8 +247,9 @@ class GitHubArchiver:
         print(f"  [3] Список игнорирования{ignored_str}")
         print("  [4] Аудит — очистка / восстановление публикаций")
         print("  [5] Экспорт всех сообщений в файл")
-        print("  [6] Удалить все сообщения в ленте")
-        print("  [7] Выход")
+        print("  [6] Загрузить медиа из папки")
+        print("  [7] Удалить все сообщения в ленте")
+        print("  [8] Выход")
         print()
 
     def _get_user_choice(self, options: list, prompt: str = "Выберите действие") -> str:
@@ -1862,6 +1863,23 @@ class GitHubArchiver:
 
         input("\n  Нажмите Enter для возврата в меню...")
 
+    def run_media_archiver(self):
+        """Загрузить медиафайлы из папки в MAX канал"""
+        from media_archiver import MediaArchiver
+
+        print("\n" + "═" * 60)
+        print("  Загрузка медиа из папки")
+        print("═" * 60)
+
+        try:
+            media = MediaArchiver("config.yaml")
+            media.run()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"Media archiver error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
     def run(self):
         """Запустить главный цикл программы"""
 
@@ -1883,12 +1901,14 @@ class GitHubArchiver:
             elif choice == '5':
                 self.export_messages_to_file()
             elif choice == '6':
-                self.delete_all_messages_in_channel()
+                self.run_media_archiver()
             elif choice == '7':
+                self.delete_all_messages_in_channel()
+            elif choice == '8':
                 print("\n  До свидания!\n")
                 break
             else:
-                print("\n  Неверный выбор. Нажмите 1, 2, 3, 4, 5, 6 или 7.")
+                print("\n  Неверный выбор. Нажмите 1, 2, 3, 4, 5, 6, 7 или 8.")
                 time.sleep(1)
 
 
