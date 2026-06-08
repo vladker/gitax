@@ -175,6 +175,11 @@ class ElementNotFoundError(BrowserMAXError):
 class BrowserMAX(LogMixin):
     """MAX messenger automation using Playwright"""
 
+    # Class-level reference to the active playwright instance.
+    # sync_playwright() shares a single asyncio event loop per process —
+    # if one BrowserMAX starts it, another must reuse or stop it first.
+    _active_playwright = None
+
     def __init__(self, channel_url: str, use_local_browser: bool = False):
         """
         Initialize MAX browser automation.
@@ -188,9 +193,24 @@ class BrowserMAX(LogMixin):
         self.use_local_browser = use_local_browser
         self.playwright = None
         self.browser: Optional[Browser] = None
+        self._context = None  # BrowserContext (used for persistent context mode)
         self.page: Optional[Page] = None
         self._connected = False
         self._expected_extensions = ['.zip']
+
+    @classmethod
+    def _stop_existing_playwright(cls) -> None:
+        """
+        Stop any existing playwright event loop shared across BrowserMAX instances.
+        Must be called before sync_playwright().start() to avoid
+        "Sync API inside asyncio loop" errors.
+        """
+        if cls._active_playwright is not None:
+            try:
+                cls._active_playwright.stop()
+            except Exception:
+                pass
+            cls._active_playwright = None
 
     @staticmethod
     def _launch_chrome_cdp():
@@ -199,7 +219,7 @@ class BrowserMAX(LogMixin):
 
         # Check if port 9222 is already in use
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            if s.connect_ex(("localhost", 9222)) == 0:
+            if s.connect_ex(("127.0.0.1", 9222)) == 0:
                 _logger.debug("Port 9222 already in use, skipping launch")
                 return
 
@@ -308,6 +328,9 @@ class BrowserMAX(LogMixin):
         Launch a local Chromium browser using the same user profile.
         Used for large file uploads that exceed CDP's 50MB transfer limit.
 
+        Stops the existing playwright instance first to avoid
+        "Sync API inside asyncio loop" errors on subsequent connect() calls.
+
         Returns:
             True if launch succeeded, False otherwise.
         """
@@ -315,18 +338,29 @@ class BrowserMAX(LogMixin):
             user_data_dir = self._get_user_data_dir()
             self.logger.info(f"Launching local Chrome with profile: {user_data_dir}")
 
-            self.browser = self.playwright.chromium.launch(
+            # Stop existing playwright (instance-level and class-level) to clear
+            # the asyncio event loop. Without this, sync_playwright().start() fails.
+            self._stop_existing_playwright()
+            if self.playwright:
+                try:
+                    self.playwright.stop()
+                except Exception:
+                    pass
+                self.playwright = None
+
+            # Start fresh playwright for local browser
+            self.playwright = sync_playwright().start()
+            self.__class__._active_playwright = self.playwright
+
+            self.browser = self.playwright.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir,
                 headless=False,
                 args=[
-                    '--disable-blink-features=Automation',
-                    f'--user-data-dir={user_data_dir}'
-                ]
-            )
-
-            context = self.browser.new_context(
+                    '--disable-blink-features=Automation'
+                ],
                 viewport={'width': 1200, 'height': 900}
             )
-            self.page = context.new_page()
+            self.page = self.browser.new_page()
 
             # Install API interceptor before navigation
             self._install_api_interceptor()
@@ -340,7 +374,8 @@ class BrowserMAX(LogMixin):
 
     def _close_local_browser(self) -> None:
         """
-        Close the locally-launched Chrome browser (kills the process).
+        Close the locally-launched Chromium browser (kills the process).
+        Stops playwright to clear the asyncio event loop so connect() works later.
         Includes delay to allow lock file to release.
         """
         try:
@@ -350,6 +385,13 @@ class BrowserMAX(LogMixin):
                 except Exception:
                     pass
                 self.page = None
+            # For persistent context mode, close the context (which also closes the browser)
+            if self._context:
+                try:
+                    self._context.close()
+                except Exception:
+                    pass
+                self._context = None
             if self.browser:
                 try:
                     self.browser.close()
@@ -361,9 +403,21 @@ class BrowserMAX(LogMixin):
         except Exception as e:
             self.logger.warning(f"Error closing local browser: {e}")
             self.page = None
+            self._context = None
             self.browser = None
             self._connected = False
         finally:
+            # Stop playwright to clear its asyncio event loop.
+            # Without this, the next sync_playwright().start() in connect() fails with:
+            # "It looks like you are using Playwright Sync API inside the asyncio loop."
+            if self.playwright:
+                try:
+                    self.playwright.stop()
+                except Exception:
+                    pass
+                self.playwright = None
+            # Clear class-level reference so other BrowserMAX instances can start fresh
+            self.__class__._active_playwright = None
             # Allow lock file to release
             time.sleep(2)
 
@@ -458,19 +512,26 @@ class BrowserMAX(LogMixin):
         self.logger.info(f"Connecting to Chrome (local={self.use_local_browser})...")
 
         try:
+            # Stop any existing playwright event loop before starting a new one.
+            # This prevents "Sync API inside asyncio loop" errors when
+            # multiple BrowserMAX instances share the same process.
+            self._stop_existing_playwright()
             self.playwright = sync_playwright().start()
+            self.__class__._active_playwright = self.playwright
 
             if self.use_local_browser:
-                # Launch local Chrome browser (no 50MB file limit)
-                self.logger.info("Launching local Chrome...")
-                self.browser = self.playwright.chromium.launch(
+                # Launch local Chromium with user's profile (preserves cookies/session)
+                user_data_dir = self._get_user_data_dir()
+                self.logger.info(f"Launching local Chromium with profile: {user_data_dir}")
+                self._context = self.playwright.chromium.launch_persistent_context(
+                    user_data_dir=user_data_dir,
                     headless=False,
-                    args=['--disable-blink-features=Automation']
-                )
-                context = self.browser.new_context(
+                    args=['--disable-blink-features=Automation'],
                     viewport={'width': 1200, 'height': 900}
                 )
-                self.page = context.new_page()
+                self.page = self._context.new_page()
+                # For persistent context, self.browser is None — context IS the top-level object
+                self.browser = None
             else:
                 # Use CDP connection to existing Chrome (must be open at channel_url)
                 # This preserves existing browser state and cookies
@@ -479,7 +540,7 @@ class BrowserMAX(LogMixin):
                 for attempt in range(1, 4):
                     try:
                         self.browser = self.playwright.chromium.connect_over_cdp(
-                            "http://localhost:9222",
+                            "http://127.0.0.1:9222",
                             timeout=30000
                         )
                         connected = True
@@ -492,28 +553,15 @@ class BrowserMAX(LogMixin):
                             time.sleep(wait_time)
 
                 if not connected:
-                    self.logger.warning("All CDP attempts failed, trying to launch Chrome...")
-                    self._launch_chrome_cdp()
-                    time.sleep(5)  # Give Chrome time to start
-                    for attempt in range(1, 4):
-                        try:
-                            self.browser = self.playwright.chromium.connect_over_cdp(
-                                "http://localhost:9222",
-                                timeout=30000
-                            )
-                            connected = True
-                            break
-                        except Exception as e2:
-                            self.logger.warning(f"Post-launch CDP attempt {attempt}/3 failed: {e2}")
-                            if attempt < 3:
-                                wait_time = attempt * 3
-                                self.logger.info(f"Retrying in {wait_time}s...")
-                                time.sleep(wait_time)
+                    self.logger.warning("All CDP attempts failed")
+                    self.logger.warning("Chrome SxS/Canary may be incompatible with Playwright CDP.")
+                    self.logger.warning("Set archiver.use_local_browser=true in config.yaml to bypass CDP.")
 
                 if not connected:
                     self.logger.error("Failed to connect to MAX via CDP after all retries")
                     self.playwright.stop()
                     self.playwright = None
+                    self.__class__._active_playwright = None
                     return False
 
                 context = self.browser.contexts[0] if self.browser.contexts else self.browser.new_context()
@@ -527,11 +575,21 @@ class BrowserMAX(LogMixin):
             return True
         except Exception as e:
             self.logger.error(f"Connection failed: {e}", exc_info=True)
+            # Clean up playwright on any exception to prevent event loop poisoning
+            if self.playwright:
+                try:
+                    self.playwright.stop()
+                except Exception:
+                    pass
+                self.playwright = None
+                self.__class__._active_playwright = None
             return False
 
     def keep_alive_connect(self) -> bool:
         """Connect to Chrome and stay connected. Use this for multiple operations."""
-        if self.browser and self.page:
+        # Persistent context mode: self.browser is None, self._context holds the context
+        has_browser = self.browser is not None or self._context is not None
+        if has_browser and self.page:
             self.logger.debug("Already connected (reusing connection)")
             return True
         return self.connect()
@@ -4893,6 +4951,10 @@ class BrowserMAX(LogMixin):
         """Close browser connection gracefully"""
         self.logger.debug("Closing connection...")
         try:
+            # For persistent context mode, close context (which also closes browser)
+            if self._context:
+                self._context.close()
+                self._context = None
             if self.browser:
                 self.browser.close()
             if self.playwright:
@@ -4902,6 +4964,7 @@ class BrowserMAX(LogMixin):
         finally:
             self._connected = False
             self.playwright = None
+            self.__class__._active_playwright = None
             self.browser = None
             self.page = None
         self.logger.debug("Connection closed")

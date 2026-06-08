@@ -21,6 +21,7 @@ from journal import Journal
 from github_api import GitHubAPI
 from browser_max import BrowserMAX
 from scroll_registry import ScrollRegistry
+from logging_config import LogMixin
 
 
 class GracefulShutdown:
@@ -53,7 +54,7 @@ class GracefulShutdown:
                     pass
 
 
-class GitHubArchiver:
+class GitHubArchiver(LogMixin):
     """Главный класс программы"""
 
     def __init__(self, config_path: str = "config.yaml"):
