@@ -1168,7 +1168,14 @@ class BrowserMAX(LogMixin):
         last_activity_time = start
         last_progress_log = start
         consecutive_no_activity = 0
-        max_no_activity_cycles = 30  # ~30 seconds of no progress = done or stalled
+
+        # Smaller files upload faster — reduce no-activity wait accordingly
+        if expected_size and expected_size < 10 * 1024 * 1024:
+            no_activity_threshold = 5  # 5 seconds for files < 10MB
+        elif expected_size and expected_size < 50 * 1024 * 1024:
+            no_activity_threshold = 10  # 10 seconds for files < 50MB
+        else:
+            no_activity_threshold = 30  # 30 seconds for large files
 
         print(f"  [OK] Waiting for upload to complete... (Ctrl+C to cancel)")
 
@@ -1218,10 +1225,10 @@ class BrowserMAX(LogMixin):
             # Track activity - if no progress for a while, consider it done
             time_since_activity = time.time() - last_activity_time
 
-            if time_since_activity > 30:
+            if time_since_activity > no_activity_threshold:
                 consecutive_no_activity += 1
 
-                # After ~30-60 seconds of no activity, assume upload is done
+                # After threshold of no activity, assume upload is done
                 if consecutive_no_activity >= 2:
                     # Final verification — only trust composer or observer (new DOM nodes),
                     # NOT lenta scan (can match old messages from previous runs)
@@ -1230,7 +1237,7 @@ class BrowserMAX(LogMixin):
                         return True
 
                     # Still nothing after extended wait
-                    if consecutive_no_activity >= 4:  # ~60 seconds
+                    if consecutive_no_activity >= 4:  # ~4x threshold
                         print(f"\n  [WARN] No upload activity for {int(time_since_activity)}s")
                         # Try one more thorough check
                         if self._check_dom_upload_ready() or self._check_upload_done():
@@ -1340,11 +1347,46 @@ class BrowserMAX(LogMixin):
             self.logger.debug(f"Progress check error: {e}")
             return None
 
+    def _check_media_preview(self) -> bool:
+        """
+        Quick check: are there visible <img> or <video> elements with data:/blob: sources?
+        These indicate a media file preview is ready (photo/video attached in composer).
+        Searches the ENTIRE page, not just composer — more reliable for MAX.
+        """
+        try:
+            result = self.page.evaluate("""
+                () => {
+                    const imgs = document.querySelectorAll('img');
+                    for (const img of imgs) {
+                        if (img.offsetHeight > 50 && img.offsetWidth > 50) {
+                            const src = img.src || '';
+                            if (src.startsWith('data:') || src.startsWith('blob:')) {
+                                return true;
+                            }
+                        }
+                    }
+                    const vids = document.querySelectorAll('video');
+                    for (const vid of vids) {
+                        if (vid.offsetHeight > 50 && vid.offsetWidth > 50) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
+            return result is True
+        except Exception:
+            return False
+
     def _check_dom_upload_ready(self) -> bool:
         """
         Final DOM check for attached file in composer.
         NOTE: Does NOT check input[type=file] - that only means file is selected, not uploaded.
         """
+        # Fast path: check for media preview anywhere on page
+        if self._check_media_preview():
+            return True
+
         ext_json = str(self._expected_extensions)
         script = f"""
             () => {{
