@@ -1888,7 +1888,7 @@ class GitHubArchiver:
 
             self._show_menu()
 
-            choice = input("  Выберите действие [1-7]: ").strip()
+            choice = input("  Выберите действие [1-8]: ").strip()
 
             if choice == '1':
                 self.sync_repositories()
