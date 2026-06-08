@@ -330,12 +330,13 @@ class MediaArchiver(LogMixin):
             # Upload — route large files via local browser to bypass CDP 50MB limit
             try:
                 if file_size >= self.LARGE_FILE_THRESHOLD:
-                    print(f"    → Отправляю в MAX (большой файл, переключение браузера)...")
+                    print(f"    → Отправляю в MAX (большой файл)...")
                     success = browser._upload_large_file(
                         filepath, filename, file_size,
                         retries=retries,
                         retry_delay=retry_delay,
-                        baseline_count=browser._pre_upload_msg_count
+                        baseline_count=0,
+                        expected_extensions=[ext]
                     )
                 else:
                     print(f"    → Отправляю в MAX...")

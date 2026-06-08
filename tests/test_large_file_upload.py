@@ -358,6 +358,39 @@ class TestUploadLargeFile:
         assert call_log.index("upload") < call_log.index("close")
         assert call_log.index("close") < call_log.index("connect")
 
+    def test_sets_expected_extensions(self):
+        """Verifies expected_extensions parameter sets self._expected_extensions before upload."""
+        from browser_max import BrowserMAX
+
+        bm = BrowserMAX("https://example.com")
+        bm.page = MagicMock()
+        bm.browser = MagicMock()
+        bm._connected = True
+
+        captured_extensions = None
+
+        def track_upload(*args, **kwargs):
+            nonlocal captured_extensions
+            captured_extensions = bm._expected_extensions.copy()
+            return True
+
+        bm._disconnect_cdp = lambda: None
+        bm._launch_with_profile = lambda: True
+        bm._upload_single_file = track_upload
+        bm._close_local_browser = lambda: None
+        bm.connect = MagicMock(return_value=True)
+        bm.navigate = MagicMock()
+        bm.ensure_page_ready = MagicMock()
+
+        with patch("time.sleep"):
+            bm._upload_large_file(
+                "/path/to/video.mp4", "video.mp4", 100_000_000,
+                retries=3, retry_delay=10, baseline_count=0,
+                expected_extensions=[".mp4"]
+            )
+
+        assert captured_extensions == [".mp4"]
+
     def test_returns_false_when_launch_fails(self):
         """Returns False and attempts recovery when launch fails."""
         from browser_max import BrowserMAX
@@ -438,6 +471,64 @@ class TestUploadLargeFile:
         assert result is False
         assert "close" in recovery_calls
         assert "connect" in recovery_calls
+
+
+# ── Media file detection tests ──
+
+class TestMediaFileDetection:
+    """Test that media files (.mp4, .jpg, etc.) are detected by the scanner"""
+
+    def test_match_filename_accepts_mp4(self):
+        """_match_filename_in_message matches .mp4 files."""
+        from browser_max import BrowserMAX
+
+        bm = BrowserMAX("https://example.com")
+        bm._expected_extensions = [".mp4"]
+
+        # Simulate a message containing an .mp4 file
+        msg_text = "video_2026.mp4 download"
+        msg_html = "<div>video_2026.mp4</div>"
+
+        matched, detail = bm._match_filename_in_message(
+            msg_text, msg_html, "video_2026.mp4"
+        )
+
+        assert matched is True
+        assert "video_2026.mp4" in detail
+
+    def test_match_filename_accepts_jpg(self):
+        """_match_filename_in_message matches .jpg files."""
+        from browser_max import BrowserMAX
+
+        bm = BrowserMAX("https://example.com")
+        bm._expected_extensions = [".jpg"]
+
+        msg_text = "photo_2026.jpg скачать"
+        msg_html = "<div>photo_2026.jpg</div>"
+
+        matched, detail = bm._match_filename_in_message(
+            msg_text, msg_html, "photo_2026.jpg"
+        )
+
+        assert matched is True
+
+    def test_generic_file_detection_includes_media(self):
+        """When search_name is None, media files are still detected."""
+        from browser_max import BrowserMAX
+
+        bm = BrowserMAX("https://example.com")
+        bm._expected_extensions = [".zip"]  # Default is .zip
+
+        # Even with .zip as expected extension, .mp4 should be detected
+        msg_text = "video_2026.mp4 download"
+        msg_html = "<div>video_2026.mp4</div>"
+
+        matched, detail = bm._match_filename_in_message(
+            msg_text, msg_html, None  # No specific filename
+        )
+
+        assert matched is True
+        assert detail == "generic_file"
 
 
 # ── MediaArchiver routing tests ──

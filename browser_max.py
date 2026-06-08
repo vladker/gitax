@@ -11,7 +11,9 @@ import csv
 import json
 import logging
 import subprocess
+from dataclasses import dataclass
 from typing import Optional
+from dataclasses import dataclass
 from playwright.sync_api import sync_playwright, Page, Browser, TimeoutError as PlaywrightTimeout
 from logging_config import LogMixin, setup_logging
 
@@ -24,6 +26,13 @@ _logger = logging.getLogger("gitax")
 
 # 7-Zip executable path (Windows default)
 SEVEN_ZIP_EXE = "C:\\Program Files\\7-Zip\\7z.exe"
+
+
+@dataclass
+class ContentSnapshot:
+    """Content snapshot with hash for change detection."""
+    hash: str
+    file_count: int
 
 
 def split_file_with_7z(filepath: str, volume_size: str = SEVEN_ZIP_VOLUME_SIZE) -> list[str]:
@@ -423,7 +432,8 @@ class BrowserMAX(LogMixin):
 
     def _upload_large_file(self, filepath: str, filename: str, file_size_bytes: int,
                            retries: int = 3, retry_delay: int = 10,
-                           baseline_count: int = 0) -> bool:
+                           baseline_count: int = 0,
+                           expected_extensions: list[str] | None = None) -> bool:
         """
         Upload a large file (>50MB).
 
@@ -440,12 +450,22 @@ class BrowserMAX(LogMixin):
             retries: Number of retries per upload attempt
             retry_delay: Delay between retries (seconds)
             baseline_count: Message count baseline for upload confirmation
+            expected_extensions: List of file extensions to match for confirmation.
+                                If None, auto-detected from filename.
 
         Returns:
             True if upload succeeded, False otherwise.
         """
         file_size_mb = file_size_bytes / 1024 / 1024
         self.logger.info(f"Large file detected ({file_size_mb:.1f} MB)")
+
+        # Set expected extensions so _scan_messages_for_file can find the file
+        if expected_extensions is not None:
+            self._expected_extensions = expected_extensions
+        else:
+            import os as _os
+            ext = _os.path.splitext(filename)[1].lower()
+            self._expected_extensions = [ext]
 
         # If already in persistent context mode, upload directly — no browser switch needed
         if self.use_local_browser:
@@ -1723,7 +1743,7 @@ class BrowserMAX(LogMixin):
             self.logger.debug(f"DOM composer check error: {e}")
             return False
 
-    def _take_content_snapshot(self, depth: int = 15, window: int = 100) -> Optional[tuple[str, int]]:
+    def _take_content_snapshot(self, depth: int = 15, window: int = 100) -> Optional["ContentSnapshot"]:
         """
         Capture content snapshot: (hash, file_count).
         Used to detect new messages in virtual-scrolling feeds.
@@ -1759,10 +1779,54 @@ class BrowserMAX(LogMixin):
 
             combined = "\n".join(result['texts'])
             import hashlib
-            return (hashlib.sha256(combined.encode("utf-8")).hexdigest(), result.get('fileCount', 0))
+            return ContentSnapshot(
+                hash=hashlib.sha256(combined.encode("utf-8")).hexdigest(),
+                file_count=result.get('fileCount', 0)
+            )
         except Exception as e:
             self.logger.debug(f"Snapshot error: {e}")
             return None
+
+    def _confirm_file_sent(self, pre_snapshot: "ContentSnapshot", file_size_bytes: int) -> bool:
+        """
+        Fast confirmation: check if feed content changed after sending.
+
+        Adaptive wait based on file size — photos render faster than videos.
+
+        Args:
+            pre_snapshot: Content snapshot taken BEFORE pressing Enter
+            file_size_bytes: Size of the file in bytes
+
+        Returns:
+            True if content changed (file likely sent), False if no change detected
+        """
+        if not pre_snapshot:
+            return False
+
+        # Adaptive wait: photos render faster than videos
+        size_mb = file_size_bytes / (1024 * 1024)
+        if size_mb < 5:
+            initial_wait = 0.5
+        elif size_mb < 50:
+            initial_wait = 1.0
+        else:
+            initial_wait = 2.0
+
+        time.sleep(initial_wait)
+
+        # First check
+        post = self._take_content_snapshot()
+        if post and post.hash != pre_snapshot.hash:
+            return True
+
+        # Retry with increasing delay
+        for _ in range(2):
+            time.sleep(1.0)
+            post = self._take_content_snapshot()
+            if post and post.hash != pre_snapshot.hash:
+                return True
+
+        return False  # Caller falls back to _wait_for_file_message
 
     def _match_filename_in_message(self, msg_text: str, msg_html: str,
                                     search_name: Optional[str] = None) -> tuple[bool, str]:
@@ -1783,11 +1847,17 @@ class BrowserMAX(LogMixin):
         if not search_name:
             # No specific filename — accept any file message
             has_archive = bool(re.search(r'\.(zip|tar|gz|rar|7z)', msg_text))
+            has_media = bool(re.search(r'\.(jpg|jpeg|png|gif|webp|mp4|mov|avi|mkv|webm)', msg_text))
             has_download = 'download' in msg_text or 'скачать' in msg_text
-            return (has_archive or has_download, "generic_file" if (has_archive or has_download) else "none")
+            matched = has_archive or has_media or has_download
+            return (matched, "generic_file" if matched else "none")
 
         # Tier 1: Regex extraction + normalized comparison
-        ext_pattern = '|'.join(re.escape(ext) for ext in self._expected_extensions)
+        # Include media extensions so .mp4/.jpg files are matched too
+        all_exts = list(self._expected_extensions) + [
+            '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.mp4', '.mov', '.avi', '.mkv', '.webm'
+        ]
+        ext_pattern = '|'.join(re.escape(ext) for ext in all_exts)
         match = re.search(r'([a-z0-9\-_.]+(?:' + ext_pattern + r')(?:\.7z\.\d+)?)', msg_text)
         if match:
             msg_filename = match.group(1).replace('-master', '').replace('-main', '')
@@ -1805,10 +1875,11 @@ class BrowserMAX(LogMixin):
         if search_name in msg_text:
             return (True, f"substring:{search_name}")
 
-        # Tier 3: Generic file indicator (only if search_name contains archive extension)
+        # Tier 3: Generic file indicator (archive OR media + download)
         has_archive = bool(re.search(r'\.(zip|7z)', msg_text))
+        has_media = bool(re.search(r'\.(jpg|jpeg|png|gif|webp|mp4|mov|avi|mkv|webm)', msg_text))
         has_download = 'download' in msg_text or 'скачать' in msg_text
-        if has_archive and has_download:
+        if (has_archive or has_media) and has_download:
             self.logger.warning(f"Tertiary match — no exact filename, but file+download found near '{search_name}'")
             return (True, "tertiary_fallback")
 
@@ -1828,6 +1899,8 @@ class BrowserMAX(LogMixin):
             (found: bool, msg_index: int, detail: str)
         """
         js_ext_pattern = '|'.join(re.escape(ext) for ext in self._expected_extensions)
+        # Also check for common media extensions (photos/videos) so messages aren't skipped
+        js_media_pattern = r'\.(jpg|jpeg|png|gif|webp|bmp|tiff|mp4|mov|avi|mkv|webm)'
 
         for idx in range(start_idx, end_idx):
             try:
@@ -1841,21 +1914,28 @@ class BrowserMAX(LogMixin):
                         const classes = msg.className || '';
                         const hasFileClass = /file|attach|download|archive|preview/i.test(classes);
                         const extRegex = new RegExp('{js_ext_pattern}', 'i');
-                        const hasZip = extRegex.test(text) || extRegex.test(html);
+                        const hasExpectedExt = extRegex.test(text) || extRegex.test(html);
+                        const mediaRegex = new RegExp('{js_media_pattern}', 'i');
+                        const hasMedia = mediaRegex.test(text) || mediaRegex.test(html);
+                        const hasMediaTag = !!msg.querySelector('img, video, audio');
                         const hasDownload = msg.querySelector('[download]') !== null ||
                                             msg.querySelector('a[href*="download"]') !== null;
                         return {{
                             text: text.slice(0, 200),
                             html: html.slice(0, 300),
                             hasFileClass,
-                            hasZip,
+                            hasExpectedExt,
+                            hasMedia,
+                            hasMediaTag,
                             hasDownload,
                             classes: classes.slice(0, 80)
                         }};
                     }}
                 """) or {}
 
-                if not (msg_result.get('hasFileClass') or msg_result.get('hasZip') or msg_result.get('hasDownload')):
+                if not (msg_result.get('hasFileClass') or msg_result.get('hasExpectedExt') or
+                        msg_result.get('hasMedia') or msg_result.get('hasMediaTag') or
+                        msg_result.get('hasDownload')):
                     continue
 
                 msg_text = (msg_result.get('text') or '').lower()
@@ -1891,7 +1971,7 @@ class BrowserMAX(LogMixin):
         size_mb = file_size_bytes / (1024 * 1024)
 
         if size_mb < 5:
-            return (8, 12)
+            return (3, 6)
         elif size_mb < 50:
             return (15, 20)
         elif size_mb < 200:
@@ -2027,45 +2107,49 @@ class BrowserMAX(LogMixin):
             if baseline_count is None:
                 baseline_count = base_count
 
+            # Detect virtual scrolling — stable count means count-based checks are useless
+            is_virtual_scroll = base_count <= 150
+            if is_virtual_scroll:
+                print(f"  [MONITOR] Virtual scroll detected ({base_count} msgs), skipping count-based phases")
+
             # ── INITIAL SCAN ──
-            # FIX: range was range(base_count) with skip if idx < baseline_count,
-            # which meant the range was empty since baseline_count == base_count.
-            # Now: scan from baseline_count to base_count (new messages only).
-            # FIX 1: If range is empty, retry with delay to allow DOM to update.
-            print(f"  [SCAN] Scanning from msg #{baseline_count + 1}...")
-            if baseline_count < base_count:
-                found, msg_idx, detail = self._scan_messages_for_file(
-                    baseline_count, base_count, search_name
-                )
-                if found:
-                    print(f"  [OK] FILE FOUND in initial scan! Message #{msg_idx} ({detail})")
-                    return (True, "found", msg_idx)
+            if not is_virtual_scroll:
+                print(f"  [SCAN] Scanning from msg #{baseline_count + 1}...")
+                if baseline_count < base_count:
+                    found, msg_idx, detail = self._scan_messages_for_file(
+                        baseline_count, base_count, search_name
+                    )
+                    if found:
+                        print(f"  [OK] FILE FOUND in initial scan! Message #{msg_idx} ({detail})")
+                        return (True, "found", msg_idx)
+                else:
+                    print(f"  [SCAN] No new messages yet (baseline={baseline_count}, current={base_count}), retrying...")
+                    for retry in range(2):
+                        time.sleep(2)
+                        try:
+                            new_count = self.page.evaluate(
+                                "() => document.querySelectorAll('[class*=\"message\"]').length"
+                            ) or 0
+                            scan_start = max(baseline_count, new_count - 15)
+                            if scan_start < new_count:
+                                found, msg_idx, detail = self._scan_messages_for_file(
+                                    scan_start, new_count, search_name
+                                )
+                                if found:
+                                    print(f"  [OK] FILE FOUND in retry scan #{retry + 1}! Message #{msg_idx} ({detail})")
+                                    return (True, "found", msg_idx)
+                        except Exception as retry_err:
+                            print(f"  [WARN] Retry scan #{retry + 1} failed: {retry_err}")
             else:
-                print(f"  [SCAN] No new messages yet (baseline={baseline_count}, current={base_count}), retrying...")
-                # FIX 1: Retry initial scan with delay — gives MAX time to render
-                for retry in range(2):
-                    time.sleep(2)
-                    try:
-                        new_count = self.page.evaluate(
-                            "() => document.querySelectorAll('[class*=\"message\"]').length"
-                        ) or 0
-                        scan_start = max(baseline_count, new_count - 15)
-                        if scan_start < new_count:
-                            found, msg_idx, detail = self._scan_messages_for_file(
-                                scan_start, new_count, search_name
-                            )
-                            if found:
-                                print(f"  [OK] FILE FOUND in retry scan #{retry + 1}! Message #{msg_idx} ({detail})")
-                                return (True, "found", msg_idx)
-                    except Exception as retry_err:
-                        print(f"  [WARN] Retry scan #{retry + 1} failed: {retry_err}")
+                print(f"  [SCAN] Skipping count-based scan (virtual scroll, {base_count} msgs)")
 
         except Exception as e:
             print(f"  [ERROR] Failed to initialize: {e}")
             return (False, "init_failed", 0)
 
         # ── FAST MODE: quick polls for small media files ──
-        if fast_mode:
+        # Skip under virtual scroll — count-based polls are useless
+        if fast_mode and not is_virtual_scroll:
             for attempt in range(5):
                 time.sleep(1)
                 try:
@@ -2108,7 +2192,7 @@ class BrowserMAX(LogMixin):
         # ── CONTENT-BASED MONITORING LOOP ──
         prev_snapshot = self._take_content_snapshot(depth=snapshot_depth)
         if prev_snapshot:
-            print(f"  [SNAPSHOT] Baseline hash: {prev_snapshot[0][:16]}... files: {prev_snapshot[1]}")
+            print(f"  [SNAPSHOT] Baseline hash: {prev_snapshot.hash[:16]}... files: {prev_snapshot.file_count}")
         else:
             print(f"  [SNAPSHOT] Baseline: none")
 
@@ -2674,6 +2758,10 @@ class BrowserMAX(LogMixin):
                         continue
                     else:
                         return False
+
+                # Capture content snapshot before upload for delta confirmation
+                pre_snapshot = self._take_content_snapshot()
+
                 if not self._try_navigate():
                     self.logger.error("Cannot navigate to channel after reconnect")
                     if attempt < retries:
@@ -2729,12 +2817,24 @@ class BrowserMAX(LogMixin):
                 self.logger.debug("Sending file message...")
                 self._send_message()
 
-                # FIX 2: Give MAX time to render file message for small files
-                # Large files (>10MB) already take time to upload, no delay needed
-                if file_size_bytes < 10 * 1024 * 1024:
-                    time.sleep(2)
+                # Fast delta confirmation — check if content changed
+                confirm_start = time.time()
+                confirmed = self._confirm_file_sent(pre_snapshot, file_size_bytes)
+                confirm_elapsed = time.time() - confirm_start
 
-                self.logger.debug("Waiting for file message confirmation...")
+                if confirmed:
+                    self.logger.info(
+                        f"File confirmed (delta check, {confirm_elapsed:.1f}s)"
+                    )
+                    print(
+                        f"  [OK] File confirmed (delta check, {confirm_elapsed:.1f}s)"
+                    )
+                    return True
+
+                # Fallback: full confirmation flow for edge cases
+                self.logger.debug(
+                    f"Delta check took {confirm_elapsed:.1f}s, falling back to full confirmation"
+                )
                 # Adaptive timeout: scale with file size
                 # ~2 MB/s baseline upload speed, plus buffer
                 size_mb = file_size_bytes / (1024 * 1024)
