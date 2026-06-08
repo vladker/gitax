@@ -425,15 +425,13 @@ class BrowserMAX(LogMixin):
                            retries: int = 3, retry_delay: int = 10,
                            baseline_count: int = 0) -> bool:
         """
-        Upload a large file (>50MB) by switching from CDP to local browser mode.
+        Upload a large file (>50MB).
 
-        Flow:
-        1. Disconnect from CDP
-        2. Launch local Chrome with same profile
-        3. Navigate to MAX channel
-        4. Upload the file
-        5. Close local Chrome
-        6. Reconnect to CDP
+        When use_local_browser is True (persistent context mode):
+        - Uploads directly using the existing browser session (no switching needed).
+
+        When use_local_browser is False (CDP mode):
+        - Disconnects from CDP, launches local Chrome, uploads, reconnects.
 
         Args:
             filepath: Absolute path to file
@@ -446,8 +444,30 @@ class BrowserMAX(LogMixin):
         Returns:
             True if upload succeeded, False otherwise.
         """
-        self.logger.info(f"Large file detected ({file_size_bytes / 1024 / 1024:.1f} MB) — switching to local browser")
+        file_size_mb = file_size_bytes / 1024 / 1024
+        self.logger.info(f"Large file detected ({file_size_mb:.1f} MB)")
 
+        # If already in persistent context mode, upload directly — no browser switch needed
+        if self.use_local_browser:
+            self.logger.info(f"Uploading large file directly (persistent context mode)")
+            self.navigate()
+            self.ensure_page_ready()
+
+            self._pre_upload_msg_count = self.page.evaluate(
+                "() => document.querySelectorAll('[class*=\"message\"]').length"
+            ) or 0
+            self.logger.info(f"Pre-upload message count (large file): {self._pre_upload_msg_count}")
+
+            success = self._upload_single_file(
+                filepath, filename, file_size_bytes,
+                retries=retries, retry_delay=retry_delay,
+                baseline_count=self._pre_upload_msg_count
+            )
+
+            return success
+
+        # CDP mode: switch to local browser for large files
+        self.logger.info("Switching to local browser for large file upload")
         try:
             # Step 1: Disconnect from CDP
             self._disconnect_cdp()
@@ -2715,8 +2735,13 @@ class BrowserMAX(LogMixin):
                     time.sleep(2)
 
                 self.logger.debug("Waiting for file message confirmation...")
+                # Adaptive timeout: scale with file size
+                # ~2 MB/s baseline upload speed, plus buffer
+                size_mb = file_size_bytes / (1024 * 1024)
+                adaptive_timeout = max(120, int(size_mb * 60 / 2))  # 2 MB/s baseline
+                adaptive_timeout = min(adaptive_timeout, 900)  # cap at 15 min
                 found, reason, msg_idx = self._wait_for_file_message(
-                    timeout=300,
+                    timeout=adaptive_timeout,
                     expected_filename=filename,
                     baseline_count=self._pre_upload_msg_count,
                     fast_mode=file_size_bytes < 5 * 1024 * 1024,  # fast mode for files < 5MB
