@@ -413,11 +413,17 @@ class BrowserMAX(LogMixin):
             self.navigate()
             self.ensure_page_ready()
 
+            # Capture message baseline for upload confirmation
+            self._pre_upload_msg_count = self.page.evaluate(
+                "() => document.querySelectorAll('[class*=\"message\"]').length"
+            ) or 0
+            self.logger.info(f"Pre-upload message count (large file): {self._pre_upload_msg_count}")
+
             # Step 4: Upload the file
             success = self._upload_single_file(
                 filepath, filename, file_size_bytes,
                 retries=retries, retry_delay=retry_delay,
-                baseline_count=baseline_count
+                baseline_count=self._pre_upload_msg_count
             )
 
             # Step 5: Close local Chrome
