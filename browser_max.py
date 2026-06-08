@@ -1352,6 +1352,14 @@ class BrowserMAX(LogMixin):
                 const composer = document.querySelector('[class*="composer"], [role="textbox"], [contenteditable]');
                 if (!composer) return false;
 
+                // Check for visible <img> or <video> previews (media files - photos/videos)
+                const mediaPreviews = composer.querySelectorAll('img, video');
+                for (const media of mediaPreviews) {{
+                    if (media.offsetHeight > 0 && media.offsetWidth > 0) {{
+                        return true;
+                    }}
+                }}
+
                 // Check for file preview/attachment elements within composer
                 const fileIndicators = composer.querySelectorAll(
                     '[class*="preview"], [class*="file-item"], [class*="attach"], [class*="upload"], [data-file]'
