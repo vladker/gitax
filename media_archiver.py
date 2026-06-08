@@ -139,6 +139,8 @@ class MediaArchiver(LogMixin):
         '.mp4', '.mov', '.avi', '.mkv', '.webm'
     }
 
+    LARGE_FILE_THRESHOLD = 50 * 1024 * 1024  # 50 MB — files at or above trigger local browser
+
     def __init__(self, config_path: str = "config.yaml"):
         self.config = self._load_config(config_path)
         self.journal = MediaJournal("media_journal.json")
@@ -325,17 +327,26 @@ class MediaArchiver(LogMixin):
                 skipped_count += 1
                 continue
 
-            # Upload
-            print(f"    → Отправляю в MAX...")
+            # Upload — route large files via local browser to bypass CDP 50MB limit
             try:
-                success, _ = browser.send_message_with_files(
-                    text="",
-                    filepaths=[filepath],
-                    retries=retries,
-                    retry_delay=retry_delay,
-                    split_threshold_mb=999999,
-                    expected_extensions=[ext]
-                )
+                if file_size >= self.LARGE_FILE_THRESHOLD:
+                    print(f"    → Отправляю в MAX (большой файл, переключение браузера)...")
+                    success = browser._upload_large_file(
+                        filepath, filename, file_size,
+                        retries=retries,
+                        retry_delay=retry_delay,
+                        baseline_count=browser._pre_upload_msg_count
+                    )
+                else:
+                    print(f"    → Отправляю в MAX...")
+                    success, _ = browser.send_message_with_files(
+                        text="",
+                        filepaths=[filepath],
+                        retries=retries,
+                        retry_delay=retry_delay,
+                        split_threshold_mb=999999,
+                        expected_extensions=[ext]
+                    )
 
                 if success:
                     self.journal.mark_sent(filename, file_size)

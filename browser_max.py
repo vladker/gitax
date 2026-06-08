@@ -242,6 +242,211 @@ class BrowserMAX(LogMixin):
         except Exception as e:
             _logger.error(f"Failed to launch Chrome: {e}")
 
+    def _get_user_data_dir(self) -> str:
+        """
+        Get Chrome user data directory path.
+
+        Reads browser.user_data_dir from config if set, otherwise falls back to
+        the default Chrome profile directory.
+
+        Returns:
+            Full path to Chrome user data directory with profile.
+        """
+        import yaml
+
+        # Try to read from config.yaml
+        user_data_dir = ""
+        profile_name = "Default"
+
+        try:
+            config_path = "config.yaml"
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config = yaml.safe_load(f) or {}
+                browser_config = config.get('browser', {})
+                user_data_dir = browser_config.get('user_data_dir', '')
+                profile_name = browser_config.get('profile_name', 'Default')
+        except Exception:
+            pass
+
+        # Fallback to default Chrome directory
+        if not user_data_dir:
+            user_data_dir = os.path.join(
+                os.path.expanduser("~"), "AppData", "Local", "Google", "Chrome", "User Data"
+            )
+
+        return os.path.join(user_data_dir, profile_name)
+
+    def _disconnect_cdp(self) -> None:
+        """
+        Disconnect from CDP browser gracefully.
+        Closes page and browser connection without killing the Chrome process.
+        """
+        try:
+            if self.page:
+                try:
+                    self.page.close()
+                except Exception:
+                    pass
+                self.page = None
+            if self.browser:
+                try:
+                    self.browser.close()
+                except Exception:
+                    pass
+                self.browser = None
+            self._connected = False
+            self.logger.info("Disconnected from CDP")
+        except Exception as e:
+            self.logger.warning(f"Error during CDP disconnect: {e}")
+            self.page = None
+            self.browser = None
+            self._connected = False
+
+    def _launch_with_profile(self) -> bool:
+        """
+        Launch a local Chromium browser using the same user profile.
+        Used for large file uploads that exceed CDP's 50MB transfer limit.
+
+        Returns:
+            True if launch succeeded, False otherwise.
+        """
+        try:
+            user_data_dir = self._get_user_data_dir()
+            self.logger.info(f"Launching local Chrome with profile: {user_data_dir}")
+
+            self.browser = self.playwright.chromium.launch(
+                headless=False,
+                args=[
+                    '--disable-blink-features=Automation',
+                    f'--user-data-dir={user_data_dir}'
+                ]
+            )
+
+            context = self.browser.new_context(
+                viewport={'width': 1200, 'height': 900}
+            )
+            self.page = context.new_page()
+
+            # Install API interceptor before navigation
+            self._install_api_interceptor()
+
+            self._connected = True
+            self.logger.info("Local Chrome launched successfully")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to launch local Chrome: {e}")
+            return False
+
+    def _close_local_browser(self) -> None:
+        """
+        Close the locally-launched Chrome browser (kills the process).
+        Includes delay to allow lock file to release.
+        """
+        try:
+            if self.page:
+                try:
+                    self.page.close()
+                except Exception:
+                    pass
+                self.page = None
+            if self.browser:
+                try:
+                    self.browser.close()
+                except Exception:
+                    pass
+                self.browser = None
+            self._connected = False
+            self.logger.info("Local browser closed")
+        except Exception as e:
+            self.logger.warning(f"Error closing local browser: {e}")
+            self.page = None
+            self.browser = None
+            self._connected = False
+        finally:
+            # Allow lock file to release
+            time.sleep(2)
+
+    def _upload_large_file(self, filepath: str, filename: str, file_size_bytes: int,
+                           retries: int = 3, retry_delay: int = 10,
+                           baseline_count: int = 0) -> bool:
+        """
+        Upload a large file (>50MB) by switching from CDP to local browser mode.
+
+        Flow:
+        1. Disconnect from CDP
+        2. Launch local Chrome with same profile
+        3. Navigate to MAX channel
+        4. Upload the file
+        5. Close local Chrome
+        6. Reconnect to CDP
+
+        Args:
+            filepath: Absolute path to file
+            filename: Display name for the file
+            file_size_bytes: File size in bytes
+            retries: Number of retries per upload attempt
+            retry_delay: Delay between retries (seconds)
+            baseline_count: Message count baseline for upload confirmation
+
+        Returns:
+            True if upload succeeded, False otherwise.
+        """
+        self.logger.info(f"Large file detected ({file_size_bytes / 1024 / 1024:.1f} MB) — switching to local browser")
+
+        try:
+            # Step 1: Disconnect from CDP
+            self._disconnect_cdp()
+            time.sleep(1)  # Let connection settle
+
+            # Step 2: Launch local Chrome with same profile
+            if not self._launch_with_profile():
+                self.logger.error("Failed to launch local browser for large file upload")
+                # Attempt recovery
+                try:
+                    self.connect()
+                except Exception:
+                    pass
+                return False
+
+            # Step 3: Navigate to MAX channel
+            self.navigate()
+            self.ensure_page_ready()
+
+            # Step 4: Upload the file
+            success = self._upload_single_file(
+                filepath, filename, file_size_bytes,
+                retries=retries, retry_delay=retry_delay,
+                baseline_count=baseline_count
+            )
+
+            # Step 5: Close local Chrome
+            self._close_local_browser()
+            time.sleep(2)  # Let lock file release
+
+            # Step 6: Reconnect to CDP
+            try:
+                self.connect()
+                self.navigate()
+            except Exception as e:
+                self.logger.warning(f"CDP reconnect after large upload: {e}")
+
+            return success
+
+        except Exception as e:
+            self.logger.error(f"Large file upload failed: {e}")
+            # Recovery: close local browser and reconnect CDP
+            try:
+                self._close_local_browser()
+            except Exception:
+                pass
+            try:
+                self.connect()
+                self.navigate()
+            except Exception:
+                pass
+            return False
+
     def connect(self) -> bool:
         """Connect to Chrome - local browser or via CDP"""
         self.logger.info(f"Connecting to Chrome (local={self.use_local_browser})...")
@@ -1582,6 +1787,34 @@ class BrowserMAX(LogMixin):
 
         return (False, 0, "not_found")
 
+    @staticmethod
+    def _compute_monitor_timeouts(file_size_bytes: int | None) -> tuple[int, int]:
+        """
+        Compute adaptive fallback timeouts based on file size.
+
+        Smaller files render faster, so shorter timeouts avoid unnecessary delays.
+        Larger files use the original 30s/45s defaults.
+
+        Args:
+            file_size_bytes: File size in bytes. If None, returns defaults.
+
+        Returns:
+            (rerender_timeout: int, reload_timeout: int) in seconds.
+        """
+        if file_size_bytes is None:
+            return (30, 45)  # defaults for backwards compatibility
+
+        size_mb = file_size_bytes / (1024 * 1024)
+
+        if size_mb < 5:
+            return (8, 12)
+        elif size_mb < 50:
+            return (15, 20)
+        elif size_mb < 200:
+            return (25, 35)
+        else:
+            return (30, 45)  # original defaults for large files
+
     def _check_upload_in_lenta(self, expected_filename: Optional[str] = None,
                                 min_msg_index: int = 0) -> tuple[bool, Optional[str]]:
         """
@@ -1651,7 +1884,8 @@ class BrowserMAX(LogMixin):
                                 expected_msg_index: Optional[int] = None,
                                 expected_filename: Optional[str] = None,
                                 baseline_count: Optional[int] = None,
-                                fast_mode: bool = False) -> tuple[bool, str, int]:
+                                fast_mode: bool = False,
+                                file_size_bytes: int | None = None) -> tuple[bool, str, int]:
         """
         Monitor chat for file message using content-based snapshots.
 
@@ -1665,6 +1899,7 @@ class BrowserMAX(LogMixin):
             expected_filename: Filename to match (if provided, only confirms if filename matches)
             baseline_count: Message count BEFORE this upload started (to ignore old messages)
             fast_mode: If True, use quick polls instead of snapshot monitoring (for small media files)
+            file_size_bytes: File size in bytes for adaptive timeouts (optional, defaults to 30s/45s)
 
         Returns:
             (found: bool, reason: str, found_msg_index: int)
@@ -1673,6 +1908,9 @@ class BrowserMAX(LogMixin):
         start = time.time()
         snapshot_interval = 2  # seconds between snapshots
         snapshot_depth = 15    # last N messages to snapshot
+
+        # FIX 3: Adaptive timeouts based on file size
+        rerender_timeout, reload_timeout = self._compute_monitor_timeouts(file_size_bytes)
 
         print(f"  [MONITOR] Starting content-based monitoring...")
 
@@ -1709,6 +1947,7 @@ class BrowserMAX(LogMixin):
             # FIX: range was range(base_count) with skip if idx < baseline_count,
             # which meant the range was empty since baseline_count == base_count.
             # Now: scan from baseline_count to base_count (new messages only).
+            # FIX 1: If range is empty, retry with delay to allow DOM to update.
             print(f"  [SCAN] Scanning from msg #{baseline_count + 1}...")
             if baseline_count < base_count:
                 found, msg_idx, detail = self._scan_messages_for_file(
@@ -1718,7 +1957,24 @@ class BrowserMAX(LogMixin):
                     print(f"  [OK] FILE FOUND in initial scan! Message #{msg_idx} ({detail})")
                     return (True, "found", msg_idx)
             else:
-                print(f"  [SCAN] No new messages yet (baseline={baseline_count}, current={base_count})")
+                print(f"  [SCAN] No new messages yet (baseline={baseline_count}, current={base_count}), retrying...")
+                # FIX 1: Retry initial scan with delay — gives MAX time to render
+                for retry in range(2):
+                    time.sleep(2)
+                    try:
+                        new_count = self.page.evaluate(
+                            "() => document.querySelectorAll('[class*=\"message\"]').length"
+                        ) or 0
+                        scan_start = max(baseline_count, new_count - 15)
+                        if scan_start < new_count:
+                            found, msg_idx, detail = self._scan_messages_for_file(
+                                scan_start, new_count, search_name
+                            )
+                            if found:
+                                print(f"  [OK] FILE FOUND in retry scan #{retry + 1}! Message #{msg_idx} ({detail})")
+                                return (True, "found", msg_idx)
+                    except Exception as retry_err:
+                        print(f"  [WARN] Retry scan #{retry + 1} failed: {retry_err}")
 
         except Exception as e:
             print(f"  [ERROR] Failed to initialize: {e}")
@@ -1743,7 +1999,27 @@ class BrowserMAX(LogMixin):
                             return (True, "found", msg_idx)
                 except Exception:
                     pass
-            # Fast mode didn't find it, fall through to normal monitoring
+            # FIX 4: Full scan fallback — search ALL messages by filename
+            # After virtual scroll reload, baseline may be stale but file exists in DOM
+            try:
+                total = self.page.evaluate(
+                    "() => document.querySelectorAll('[class*=\"message\"]').length"
+                ) or 0
+                # Limit scan range for performance: if > 500 messages, scan last 50 only
+                if total > 500:
+                    full_start = total - 50
+                else:
+                    full_start = 0
+                found, msg_idx, detail = self._scan_messages_for_file(
+                    full_start, total, search_name
+                )
+                if found:
+                    elapsed = int(time.time() - start)
+                    print(f"  [OK] FILE FOUND (full scan)! Message #{msg_idx} in {elapsed}s ({detail})")
+                    return (True, "found", msg_idx)
+            except Exception as full_scan_err:
+                print(f"  [WARN] Full scan fallback failed: {full_scan_err}")
+            # Fall through to normal monitoring
 
         # ── CONTENT-BASED MONITORING LOOP ──
         prev_snapshot = self._take_content_snapshot(depth=snapshot_depth)
@@ -1810,8 +2086,8 @@ class BrowserMAX(LogMixin):
                     print(f"  [MONITOR] {elapsed}s | waiting...")
 
                 # Fallback: force re-render after 30s of no changes
-                if elapsed >= 30 and elapsed < 35 and prev_snapshot and (elapsed - last_rerender_time) > 25:
-                    print(f"  [FALLBACK] No changes for 30s, forcing re-render...")
+                if elapsed >= rerender_timeout and elapsed < rerender_timeout + 5 and prev_snapshot and (elapsed - last_rerender_time) > (rerender_timeout - 5):
+                    print(f"  [FALLBACK] No changes for {rerender_timeout}s, forcing re-render...")
                     self._force_rerender()
                     last_rerender_time = elapsed
                     new_snapshot = self._take_content_snapshot(depth=snapshot_depth)
@@ -1830,8 +2106,8 @@ class BrowserMAX(LogMixin):
                         prev_snapshot = new_snapshot
 
                 # Fallback: reload page after 45s of no changes
-                if elapsed >= 45 and elapsed < 50 and prev_snapshot and (elapsed - last_reload_time) > 40:
-                    print(f"  [FALLBACK] No changes for 45s, reloading page...")
+                if elapsed >= reload_timeout and elapsed < reload_timeout + 5 and prev_snapshot and (elapsed - last_reload_time) > (reload_timeout - 5):
+                    print(f"  [FALLBACK] No changes for {reload_timeout}s, reloading page...")
                     try:
                         self.page.reload(wait_until="domcontentloaded", timeout=15000)
                         self.page.wait_for_timeout(3000)  # Wait for page to stabilize
@@ -2369,12 +2645,18 @@ class BrowserMAX(LogMixin):
                 self.logger.debug("Sending file message...")
                 self._send_message()
 
+                # FIX 2: Give MAX time to render file message for small files
+                # Large files (>10MB) already take time to upload, no delay needed
+                if file_size_bytes < 10 * 1024 * 1024:
+                    time.sleep(2)
+
                 self.logger.debug("Waiting for file message confirmation...")
                 found, reason, msg_idx = self._wait_for_file_message(
                     timeout=300,
                     expected_filename=filename,
                     baseline_count=self._pre_upload_msg_count,
-                    fast_mode=file_size_bytes < 5 * 1024 * 1024  # fast mode for files < 5MB
+                    fast_mode=file_size_bytes < 5 * 1024 * 1024,  # fast mode for files < 5MB
+                    file_size_bytes=file_size_bytes
                 )
                 self.logger.info(f"Result: {reason}, msg #{msg_idx}")
 
