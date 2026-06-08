@@ -1650,7 +1650,8 @@ class BrowserMAX(LogMixin):
     def _wait_for_file_message(self, timeout: int = 300,
                                 expected_msg_index: Optional[int] = None,
                                 expected_filename: Optional[str] = None,
-                                baseline_count: Optional[int] = None) -> tuple[bool, str, int]:
+                                baseline_count: Optional[int] = None,
+                                fast_mode: bool = False) -> tuple[bool, str, int]:
         """
         Monitor chat for file message using content-based snapshots.
 
@@ -1663,6 +1664,7 @@ class BrowserMAX(LogMixin):
             expected_msg_index: Expected message index (0 = any new)
             expected_filename: Filename to match (if provided, only confirms if filename matches)
             baseline_count: Message count BEFORE this upload started (to ignore old messages)
+            fast_mode: If True, use quick polls instead of snapshot monitoring (for small media files)
 
         Returns:
             (found: bool, reason: str, found_msg_index: int)
@@ -1721,6 +1723,27 @@ class BrowserMAX(LogMixin):
         except Exception as e:
             print(f"  [ERROR] Failed to initialize: {e}")
             return (False, "init_failed", 0)
+
+        # ── FAST MODE: quick polls for small media files ──
+        if fast_mode:
+            for attempt in range(5):
+                time.sleep(1)
+                try:
+                    current_total = self.page.evaluate(
+                        "() => document.querySelectorAll('[class*=\"message\"]').length"
+                    ) or 0
+                    scan_start = baseline_count if baseline_count else 0
+                    if scan_start < current_total:
+                        found, msg_idx, detail = self._scan_messages_for_file(
+                            scan_start, current_total, search_name
+                        )
+                        if found:
+                            elapsed = int(time.time() - start)
+                            print(f"  [OK] FILE FOUND (fast)! Message #{msg_idx} in {elapsed}s ({detail})")
+                            return (True, "found", msg_idx)
+                except Exception:
+                    pass
+            # Fast mode didn't find it, fall through to normal monitoring
 
         # ── CONTENT-BASED MONITORING LOOP ──
         prev_snapshot = self._take_content_snapshot(depth=snapshot_depth)
@@ -2350,7 +2373,8 @@ class BrowserMAX(LogMixin):
                 found, reason, msg_idx = self._wait_for_file_message(
                     timeout=300,
                     expected_filename=filename,
-                    baseline_count=self._pre_upload_msg_count
+                    baseline_count=self._pre_upload_msg_count,
+                    fast_mode=file_size_bytes < 5 * 1024 * 1024  # fast mode for files < 5MB
                 )
                 self.logger.info(f"Result: {reason}, msg #{msg_idx}")
 
