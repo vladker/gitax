@@ -365,8 +365,9 @@ class GitHubArchiver(LogMixin):
         print()
         print("  [1] GitHub — репозитории")
         print("  [2] PyPI — Python библиотеки")
-        print("  [3] Файлы — медиа, скачивание, экспорт")
-        print("  [4] Сервис — журналы, настройки")
+        print("  [3] Backuper — бэкап папок в канал")
+        print("  [4] Файлы — медиа, скачивание, экспорт")
+        print("  [5] Сервис — журналы, настройки")
         print("  [0] Выход")
         print()
 
@@ -1028,6 +1029,7 @@ class GitHubArchiver(LogMixin):
         """Управление очисткой журналов"""
         from media_archiver import MediaJournal
         from channel_downloader import DownloadJournal
+        from backuper_journal import BackuperJournal
 
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
@@ -1043,6 +1045,8 @@ class GitHubArchiver(LogMixin):
             dj_stats = dj.get_stats()
             pj = PyPILibsJournal("pypi_libs_journal.json")
             pj_stats = pj.get_stats()
+            bj = BackuperJournal("backuper_journal.json")
+            bj_stats = bj.get_stats()
 
             print(f"\n  Текущее состояние журналов:")
             print(f"  [1] journal.json — {j_stats['total']} репозиториев "
@@ -1053,17 +1057,20 @@ class GitHubArchiver(LogMixin):
                   f"({dj_stats['downloaded']} скачано, {dj_stats['failed']} ошибок)")
             print(f"  [4] pypi_libs_journal.json — {pj_stats['total']} библиотек "
                   f"({pj_stats['sent']} отправлено, {pj_stats['failed']} ошибок)")
+            print(f"  [5] backuper_journal.json — {bj_stats['total_backups']} бэкапов "
+                  f"({bj_stats['uploaded']} отправлено, {bj_stats['failed']} ошибок)")
 
             print()
             print("  [1] Очистить journal.json")
             print("  [2] Очистить media_journal.json")
             print("  [3] Очистить download_journal.json")
             print("  [4] Очистить pypi_libs_journal.json")
-            print("  [5] Очистить ВСЕ журналы")
+            print("  [5] Очистить backuper_journal.json")
+            print("  [6] Очистить ВСЕ журналы")
             print("  [0] Назад")
             print()
 
-            choice = input("  Ваш выбор [0/1/2/3/4/5]: ").strip()
+            choice = input("  Ваш выбор [0/1/2/3/4/5/6]: ").strip()
 
             if choice == '0':
                 break
@@ -1105,6 +1112,15 @@ class GitHubArchiver(LogMixin):
                 input("\n  Нажмите Enter для продолжения...")
 
             elif choice == '5':
+                confirm = input("\n  Очистить backuper_journal.json? [y/N]: ").strip().lower()
+                if confirm in ('y', 'yes', 'д', 'да'):
+                    BackuperJournal("backuper_journal.json").clear()
+                    print("  ✓ backuper_journal.json очищен")
+                else:
+                    print("  Отменено")
+                input("\n  Нажмите Enter для продолжения...")
+
+            elif choice == '6':
                 print("\n  ⚠ ВНИМАНИЕ: Будут очищены ВСЕ журналы!")
                 confirm = input("  Введите 'ДА' для подтверждения: ").strip().lower()
                 if confirm in ('да', 'yes', 'дa'):
@@ -1112,6 +1128,7 @@ class GitHubArchiver(LogMixin):
                     MediaJournal("media_journal.json").clear()
                     DownloadJournal("download_journal.json").clear()
                     PyPILibsJournal("pypi_libs_journal.json").clear()
+                    BackuperJournal("backuper_journal.json").clear()
                     print("  ✓ Все журналы очищены")
                 else:
                     print("  Отменено")
@@ -2116,7 +2133,7 @@ class GitHubArchiver(LogMixin):
 
             self._show_main_menu()
 
-            choice = input("  Выберите раздел [0-4]: ").strip()
+            choice = input("  Выберите раздел [0-5]: ").strip()
 
             # ── Главное меню ──
             if choice == '0':
@@ -2127,11 +2144,13 @@ class GitHubArchiver(LogMixin):
             elif choice == '2':
                 self._run_pypi_menu()
             elif choice == '3':
-                self._run_files_menu()
+                self._run_backuper_menu()
             elif choice == '4':
+                self._run_files_menu()
+            elif choice == '5':
                 self._run_service_menu()
             else:
-                print("\n  Неверный выбор. Нажмите 0..4.")
+                print("\n  Неверный выбор. Нажмите 0..5.")
                 time.sleep(1)
 
     def _run_github_menu(self):
@@ -2168,6 +2187,34 @@ class GitHubArchiver(LogMixin):
                 self.run_pypi_libs_archiver()
             elif choice == '2':
                 self.run_pypi_libs_sync()
+            else:
+                print("\n  Неверный выбор. Нажмите 0..2.")
+                time.sleep(1)
+
+    def _backuper_menu(self):
+        """Подменю Backuper"""
+        print("\n" + "═" * 60)
+        print("  Backuper — резервное хранение в MAX")
+        print("─" * 60)
+        print()
+        print("  [1] Бэкап — архивировать папку в канал")
+        print("  [2] Восстановление — скачать архивы из канала")
+        print("  [0] Назад")
+        print()
+
+    def _run_backuper_menu(self):
+        """Цикл подменю Backuper"""
+        while True:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            self._backuper_menu()
+            choice = input("  Выберите действие [0-2]: ").strip()
+
+            if choice == '0':
+                break
+            elif choice == '1':
+                self.run_backuper_backup()
+            elif choice == '2':
+                self.run_backuper_restore()
             else:
                 print("\n  Неверный выбор. Нажмите 0..2.")
                 time.sleep(1)
@@ -2240,6 +2287,40 @@ class GitHubArchiver(LogMixin):
         except Exception as e:
             print(f"\n  ✗ Ошибка: {e}")
             self.logger.error(f"PyPI libs sync error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def run_backuper_backup(self):
+        """Запустить бэкап папки в канал"""
+        from backuper import Backuper
+
+        print("\n" + "═" * 60)
+        print("  Бэкап — архивация папки в канал MAX")
+        print("═" * 60)
+
+        try:
+            backuper = Backuper("config.yaml")
+            backuper.run_backup()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"Backuper backup error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def run_backuper_restore(self):
+        """Запустить восстановление архивов из канала"""
+        from backuper import Backuper
+
+        print("\n" + "═" * 60)
+        print("  Восстановление — скачивание архивов из канала MAX")
+        print("═" * 60)
+
+        try:
+            backuper = Backuper("config.yaml")
+            backuper.run_restore()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"Backuper restore error: {e}", exc_info=True)
 
         input("\n  Нажмите Enter для возврата в меню...")
 
