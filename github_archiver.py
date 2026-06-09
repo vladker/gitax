@@ -22,6 +22,7 @@ from github_api import GitHubAPI
 from browser_max import BrowserMAX
 from scroll_registry import ScrollRegistry
 from pypi_libs_journal import PyPILibsJournal
+from config_utils import get_channel_url
 
 
 class GracefulShutdown:
@@ -245,14 +246,14 @@ class GitHubArchiver(LogMixin):
             with open(config_path, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f) or {}
 
-        # Приоритет: .env / env var > config.yaml
+        # GitHub token: env var > config.yaml
         env_token = os.environ.get('GITHUB_TOKEN')
         if env_token:
             config.setdefault('github', {})['token'] = env_token
 
-        env_channel = os.environ.get('MAX_CHANNEL_URL', '')
-        yaml_channel = config.get('max', {}).get('channel_url', '')
-        config.setdefault('max', {})['channel_url'] = env_channel or yaml_channel
+        # Channel URL: standardized via config_utils
+        channel_url = get_channel_url(config, "max", label="MAX канал")
+        config.setdefault('max', {})['channel_url'] = channel_url
 
         if not config.get('github', {}).get('token'):
             print("✗ GitHub token не указан.")

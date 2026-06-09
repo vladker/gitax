@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 from logging_config import setup_logging, LogMixin, SessionCapture
 
 from browser_max import BrowserMAX
+from config_utils import get_channel_url
 
 
 class DownloadJournal:
@@ -226,10 +227,9 @@ class ChannelDownloader(LogMixin):
             with open(config_path, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f) or {}
 
-        # Приоритет: .env / env var > config.yaml
-        env_channel = os.environ.get('MAX_CHANNEL_URL', '')
-        yaml_channel = config.get('max', {}).get('channel_url', '')
-        config.setdefault('max', {})['channel_url'] = env_channel or yaml_channel
+        # Channel URL: standardized via config_utils
+        channel_url = get_channel_url(config, "max", label="MAX канал")
+        config.setdefault('max', {})['channel_url'] = channel_url
 
         # Set defaults for channel_downloader section
         config.setdefault('channel_downloader', {})

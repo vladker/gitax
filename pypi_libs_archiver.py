@@ -22,6 +22,7 @@ from logging_config import setup_logging, LogMixin, SessionCapture
 from pypi_api import PyPIAPI
 from browser_max import BrowserMAX
 from pypi_libs_journal import PyPILibsJournal
+from config_utils import get_channel_url
 
 
 class PyPILibsArchiver(LogMixin):
@@ -78,16 +79,8 @@ class PyPILibsArchiver(LogMixin):
             with open(config_path, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f) or {}
 
-        # PYPI_LIBS_CHANNEL_URL: env var > config.yaml
-        channel_url = os.environ.get('PYPI_LIBS_CHANNEL_URL', '')
-        if not channel_url:
-            channel_url = config.get('pypi_libs', {}).get('channel_url', '')
-
-        if not channel_url:
-            print("✗ PYPI_LIBS_CHANNEL_URL не указан.")
-            print("  Укажите в .env файле или переменной окружения")
-            sys.exit(1)
-
+        # Channel URL: standardized via config_utils
+        channel_url = get_channel_url(config, "pypi", label="PyPI канал")
         config.setdefault('pypi_libs', {})['channel_url'] = channel_url
 
         # Ensure output dir exists

@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from logging_config import setup_logging, LogMixin, SessionCapture
 
 from browser_max import BrowserMAX
+from config_utils import get_channel_url
 
 
 class MediaJournal:
@@ -180,10 +181,8 @@ class MediaArchiver(LogMixin):
             with open(config_path, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f) or {}
 
-        # MEDIA_CHANNEL_URL: env var > config.yaml
-        media_channel_url = os.environ.get('MEDIA_CHANNEL_URL', '')
-        if not media_channel_url:
-            media_channel_url = config.get('media_archiver', {}).get('channel_url', '')
+        # Channel URL: standardized via config_utils
+        media_channel_url = get_channel_url(config, "media", label="Media канал")
 
         # MEDIA_WATCH_DIR: env var > config.yaml
         media_watch_dir = os.environ.get('MEDIA_WATCH_DIR', '')
@@ -191,11 +190,6 @@ class MediaArchiver(LogMixin):
             media_watch_dir = config.get('media_archiver', {}).get('watch_dir', '')
 
         # Validate required values
-        if not media_channel_url:
-            print("✗ MEDIA_CHANNEL_URL не указан.")
-            print("  Укажите в .env файле или переменной окружения")
-            sys.exit(1)
-
         if not media_watch_dir:
             print("✗ MEDIA_WATCH_DIR не указана.")
             print("  Укажите в .env файле или переменной окружения")
