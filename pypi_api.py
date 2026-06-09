@@ -97,15 +97,31 @@ class PyPIAPI(LogMixin):
         response.raise_for_status()
 
         data = response.json()
-        raw_packages = data.get("top-packages", [])[:limit]
 
-        packages = []
-        for pkg in raw_packages:
-            packages.append({
-                "name": pkg.get("pypi-name", ""),
-                "latest_version": pkg.get("pypi-version", ""),
-                "downloads_last_365_days": int(pkg.get("download-simple-365-days", 0)),
-            })
+        # Hugovk dataset changed format in 2025:
+        # Old: top-packages[] with pypi-name, pypi-version, download-simple-365-days
+        # New: rows[] with project, download_count (no version — fetched from PyPI API)
+        if "rows" in data:
+            raw_packages = data.get("rows", [])[:limit]
+            packages = []
+            for pkg in raw_packages:
+                packages.append({
+                    "name": pkg.get("project", ""),
+                    "latest_version": "",  # Not in dataset — fetched via get_package_info()
+                    "downloads_last_365_days": int(pkg.get("download_count", 0)),
+                })
+        elif "top-packages" in data:
+            raw_packages = data.get("top-packages", [])[:limit]
+            packages = []
+            for pkg in raw_packages:
+                packages.append({
+                    "name": pkg.get("pypi-name", ""),
+                    "latest_version": pkg.get("pypi-version", ""),
+                    "downloads_last_365_days": int(pkg.get("download-simple-365-days", 0)),
+                })
+        else:
+            self.logger.warning(f"Unknown Hugovk format, keys: {list(data.keys())}")
+            return []
 
         self.logger.info(f"Fetched {len(packages)} packages")
         return packages
