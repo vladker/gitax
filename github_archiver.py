@@ -15,13 +15,12 @@ import atexit
 import signal
 from datetime import datetime
 from dotenv import load_dotenv
-from logging_config import setup_logging
+from logging_config import setup_logging, LogMixin, SessionCapture
 
 from journal import Journal
 from github_api import GitHubAPI
 from browser_max import BrowserMAX
 from scroll_registry import ScrollRegistry
-from logging_config import LogMixin
 
 
 class GracefulShutdown:
@@ -46,12 +45,55 @@ class GracefulShutdown:
             return
 
         self.interrupted = True
+
+        # Clean up temp files before closing browsers
+        self._cleanup_temp_files()
+
         for browser in self.browsers:
             if browser:
                 try:
                     browser.close()
                 except Exception:
                     pass
+
+    def _cleanup_temp_files(self):
+        """Remove any remaining files in the temp directory"""
+        import glob
+        import logging
+        logger = logging.getLogger("gitax")
+
+        output_dir = self.archiver.config.get('archiver', {}).get('output_dir', './temp')
+        if not os.path.exists(output_dir):
+            return
+
+        # Find all temp files (7z volumes, ZIPs, locked files)
+        patterns = [
+            os.path.join(output_dir, "*.7z.*"),
+            os.path.join(output_dir, "*.zip"),
+            os.path.join(output_dir, "*.locked_*"),
+        ]
+
+        temp_files = []
+        for pattern in patterns:
+            temp_files.extend(glob.glob(pattern))
+
+        if not temp_files:
+            return
+
+        temp_files = list(set(temp_files))
+        logger.info(f"Cleaning up {len(temp_files)} temp file(s) on shutdown")
+
+        deleted = 0
+        for f in temp_files:
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+                    deleted += 1
+            except Exception as e:
+                logger.warning(f"Failed to delete temp file {f}: {e}")
+
+        if deleted:
+            logger.info(f"Deleted {deleted} temp file(s)")
 
 
 class GitHubArchiver(LogMixin):
@@ -68,54 +110,116 @@ class GitHubArchiver(LogMixin):
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
-        # Check for orphaned 7z volumes from interrupted sessions
-        self._check_orphaned_volumes(output_dir)
+        # Check for orphaned files from interrupted sessions
+        self._check_orphaned_files(output_dir)
 
-    def _check_orphaned_volumes(self, output_dir: str):
+    @staticmethod
+    def _safe_remove_file(filepath: str, max_wait: int = 60, poll_interval: int = 2) -> bool:
         """
-        Check for orphaned 7z volume files from interrupted sessions.
+        Safely remove a file with retry logic for Windows file locking.
+
+        Args:
+            filepath: Path to file to remove
+            max_wait: Maximum seconds to wait for file to become available
+            poll_interval: Seconds between retry attempts
+
+        Returns:
+            True if file was removed, False otherwise
+        """
+        if not os.path.exists(filepath):
+            return True
+
+        elapsed = 0
+        while elapsed < max_wait:
+            try:
+                os.remove(filepath)
+                return True
+            except PermissionError:
+                elapsed += poll_interval
+                time.sleep(poll_interval)
+            except OSError as e:
+                if e.errno == 13:  # Permission denied
+                    elapsed += poll_interval
+                    time.sleep(poll_interval)
+                else:
+                    return False
+            except Exception:
+                return False
+
+        return False
+
+    def _check_orphaned_files(self, output_dir: str):
+        """
+        Check for orphaned files from interrupted sessions.
+        Includes 7z volumes, ZIP archives, and locked files.
         Offer to clean them up.
 
         Args:
-            output_dir: Directory to check for orphaned volumes
+            output_dir: Directory to check for orphaned files
         """
         import glob
         import logging
         logger = logging.getLogger("gitax")
 
-        # Find all .7z.xxx files in temp directory
-        pattern = os.path.join(output_dir, "*.7z.*")
-        orphaned = sorted(glob.glob(pattern))
+        # Find all orphaned file types
+        patterns = [
+            os.path.join(output_dir, "*.7z.*"),      # 7z volumes
+            os.path.join(output_dir, "*.zip"),        # ZIP archives
+            os.path.join(output_dir, "*.locked_*"),   # Locked files
+        ]
+
+        orphaned = []
+        for pattern in patterns:
+            orphaned.extend(glob.glob(pattern))
 
         if not orphaned:
             return
 
-        print(f"\n  Found {len(orphaned)} orphaned 7z volume file(s):")
-        for f in orphaned[:10]:  # Show first 10
-            size_mb = os.path.getsize(f) / 1024 / 1024
-            print(f"    - {os.path.basename(f)} ({size_mb:.1f} MB)")
-        if len(orphaned) > 10:
-            print(f"    ... and {len(orphaned) - 10} more")
+        orphaned = sorted(set(orphaned))  # Remove duplicates
 
-        print("\n  These files are from interrupted upload sessions and should be cleaned up.")
-        print("  [1] Delete all orphaned volumes")
+        # Categorize files for display
+        volume_count = len([f for f in orphaned if '.7z.' in f])
+        zip_count = len([f for f in orphaned if f.endswith('.zip')])
+        locked_count = len([f for f in orphaned if '.locked_' in f])
+
+        print(f"\n  Found {len(orphaned)} orphaned file(s) in {output_dir}:")
+        if volume_count:
+            print(f"    - {volume_count} × 7z volume(s)")
+        if zip_count:
+            print(f"    - {zip_count} × ZIP archive(s)")
+        if locked_count:
+            print(f"    - {locked_count} × locked file(s)")
+
+        # Show first few files
+        for f in orphaned[:5]:
+            try:
+                size_mb = os.path.getsize(f) / 1024 / 1024
+                print(f"      {os.path.basename(f)} ({size_mb:.1f} MB)")
+            except OSError:
+                print(f"      {os.path.basename(f)}")
+        if len(orphaned) > 5:
+            print(f"      ... and {len(orphaned) - 5} more")
+
+        print("\n  These files are from interrupted upload sessions.")
+        print("  [1] Delete all orphaned files")
         print("  [2] Keep for manual recovery")
         print("  [3] Don't ask again this session")
 
         try:
             choice = input("  Choose [1/2/3]: ").strip()
             if choice == '1':
+                deleted = 0
                 for f in orphaned:
-                    try:
-                        os.remove(f)
+                    if self._safe_remove_file(f, max_wait=10):
+                        deleted += 1
                         logger.info(f"Deleted orphaned: {f}")
-                    except Exception as e:
-                        logger.warning(f"Failed to delete {f}: {e}")
-                print(f"  ✓ Deleted {len(orphaned)} orphaned file(s)")
+                    else:
+                        logger.warning(f"Failed to delete {f}")
+                print(f"  ✓ Deleted {deleted}/{len(orphaned)} orphaned file(s)")
             elif choice == '3':
                 print("  Will not ask again this session")
         except Exception as e:
-            logger.warning(f"Orphaned volume check error: {e}")
+            logger.warning(f"Orphaned file check error: {e}")
 
     def _load_config(self, config_path: str) -> dict:
         """Загрузить конфигурацию (config.yaml опционален)"""
@@ -426,10 +530,7 @@ class GitHubArchiver(LogMixin):
                 failed_names.append(full_name)
 
             if os.path.exists(zip_path):
-                try:
-                    os.remove(zip_path)
-                except Exception:
-                    pass
+                self._safe_remove_file(zip_path)
 
             time.sleep(repo_delay)
 
@@ -646,12 +747,10 @@ class GitHubArchiver(LogMixin):
         )
 
         # Удалить временный файл
-        try:
-            if os.path.exists(zip_path):
-                os.remove(zip_path)
-                print("    ✓ Временный файл удалён")
-        except Exception as e:
-            print(f"    ⚠ Не удалось удалить файл: {e}")
+        if self._safe_remove_file(zip_path):
+            print("    ✓ Временный файл удалён")
+        else:
+            print(f"    ⚠ Не удалось удалить файл: {os.path.basename(zip_path)}")
 
         # Обновить журнал
         if success:
@@ -730,65 +829,23 @@ class GitHubArchiver(LogMixin):
 
         # If upload failed, log and move on
         if not success:
-            print(f"    ⚠ Upload failed, skipping file cleanup")
+            print(f"    ⚠ Upload failed")
+            # Clean up failed file
+            if self._safe_remove_file(zip_path):
+                print("    ✓ Failed file cleaned up")
+            else:
+                print(f"    ⚠ Could not remove failed file: {os.path.basename(zip_path)}")
             repo_data['status'] = 'failed'
             repo_data['version'] = repo_data.get('version', '') or 'unknown'
             repo_data['archive_size'] = zip_size
             self.journal.add_repository(repo_data)
             return False
 
-        # Combined monitoring: wait for file to be deletable (message already confirmed by send_message_with_file)
-        print(f"    ⏳ Waiting for file to be released...")
-        wait_count = 0
-        max_wait = 600  # Max 10 minutes
-
-        while wait_count < max_wait:
-            # Check: File deletable
-            file_deletable = True
-            if os.path.exists(zip_path):
-                try:
-                    with open(zip_path, 'rb') as f:
-                        pass  # Read-only check is safer
-                except (PermissionError, OSError):
-                    file_deletable = False
-                except Exception:
-                    file_deletable = True  # Other errors, assume deletable
-
-            # Log progress every 15 seconds
-            if wait_count % 15 == 0 and wait_count > 0:
-                status = "file_deletable" if file_deletable else "file_locked"
-                print(f"    ⏳ Status: {status} ({wait_count}s)")
-
-            # File deletable - we're done!
-            if file_deletable:
-                print(f"    ✓ Upload complete and file released ({wait_count}s)")
-                break
-
-            wait_count += 1
-            time.sleep(1)
-
-        # Delete file if possible
-        removed = False
-        if os.path.exists(zip_path):
-            try:
-                os.remove(zip_path)
-                print("    ✓ Temp file removed")
-                removed = True
-            except PermissionError:
-                print(f"    ⚠ File still locked after {wait_count}s, will retry next cycle")
-            except Exception as e:
-                print(f"    ⚠ Failed to remove file: {e}")
-
-        # If can't delete, move to backup
-        if not removed and os.path.exists(zip_path):
-            try:
-                import hashlib
-                lock_suffix = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
-                locked_path = zip_path + f".locked_{lock_suffix}"
-                os.rename(zip_path, locked_path)
-                print(f"    ✓ File moved to: {os.path.basename(locked_path)}")
-            except Exception as e2:
-                print(f"    ⚠ Could not move locked file: {e2}")
+        # Clean up temp file after upload
+        if self._safe_remove_file(zip_path, max_wait=120):
+            print("    ✓ Temp file removed")
+        else:
+            print(f"    ⚠ Could not remove file: {os.path.basename(zip_path)} (will be cleaned at next startup)")
 
         repo_data['status'] = 'sent' if success else 'failed'
         repo_data['version'] = repo_data.get('version', '') or 'unknown'
@@ -1451,11 +1508,10 @@ class GitHubArchiver(LogMixin):
                 "archive_size": zip_size,
             })
 
-        try:
-            if os.path.exists(zip_path):
-                os.remove(zip_path)
-        except Exception:
-            pass
+        if self._safe_remove_file(zip_path):
+            pass  # File cleaned up silently
+        else:
+            print(f"    ⚠ Could not remove file: {os.path.basename(zip_path)}")
 
         return success and verified
 
@@ -1663,11 +1719,10 @@ class GitHubArchiver(LogMixin):
             })
 
         # Cleanup
-        try:
-            if os.path.exists(zip_path):
-                os.remove(zip_path)
-        except Exception:
-            pass
+        if self._safe_remove_file(zip_path):
+            pass  # File cleaned up silently
+        else:
+            print(f"    ⚠ Could not remove file: {os.path.basename(zip_path)}")
 
         return success and verified
 
@@ -1916,6 +1971,12 @@ class GitHubArchiver(LogMixin):
 def main():
     """Точка входа"""
     load_dotenv()
+
+    # Session capture — перехватывает весь print() в timestamped файл
+    session = SessionCapture()
+    session.start()
+    print(f"📋 Session log: {session.path}")
+
     logger = setup_logging(log_file="archiver.log", level=10)
     config_path = "config.yaml"
 
@@ -1929,6 +1990,7 @@ def main():
         logger.info("Received interrupt signal, shutting down gracefully...")
         if shutdown:
             shutdown.cleanup()
+        session.stop()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -1949,6 +2011,7 @@ def main():
     finally:
         if shutdown:
             shutdown.cleanup()
+        session.stop()
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
-from logging_config import setup_logging, LogMixin
+from logging_config import setup_logging, LogMixin, SessionCapture
 
 from browser_max import BrowserMAX
 
@@ -388,9 +388,16 @@ class MediaArchiver(LogMixin):
 
 def main():
     """Точка входа"""
+    session = SessionCapture()
+    session.start()
+    print(f"📋 Session log: {session.path}")
+
     setup_logging()
-    archiver = MediaArchiver("config.yaml")
-    archiver.run()
+    try:
+        archiver = MediaArchiver("config.yaml")
+        archiver.run()
+    finally:
+        session.stop()
 
 
 if __name__ == "__main__":

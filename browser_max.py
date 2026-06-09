@@ -176,6 +176,11 @@ class UploadError(BrowserMAXError):
     pass
 
 
+class UploadInProgressError(BrowserMAXError):
+    """Raised when navigation is attempted during active upload"""
+    pass
+
+
 class ElementNotFoundError(BrowserMAXError):
     """Required element not found"""
     pass
@@ -188,6 +193,38 @@ class BrowserMAX(LogMixin):
     # sync_playwright() shares a single asyncio event loop per process —
     # if one BrowserMAX starts it, another must reuse or stop it first.
     _active_playwright = None
+
+    # Media type extension sets — used to adapt upload timeouts & confirmation
+    VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.m4v'}
+    IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
+    ARCHIVE_EXTENSIONS = {'.zip', '.tar', '.gz', '.7z', '.rar', '.tar.gz', '.whl'}
+
+    @staticmethod
+    def _classify_media(filepath: str) -> str:
+        """
+        Classify a file by its extension into a media type.
+
+        Used to adapt upload timeouts and confirmation logic.
+        Returns one of: 'video', 'image', 'archive', 'other'.
+
+        Args:
+            filepath: Path to the file (can be relative or absolute)
+
+        Returns:
+            'video' | 'image' | 'archive' | 'other'
+        """
+        basename = os.path.basename(filepath).lower()
+        # Check compound extensions first (.tar.gz, .whl)
+        if basename.endswith('.tar.gz') or basename.endswith('.whl'):
+            return 'archive'
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext in BrowserMAX.VIDEO_EXTENSIONS:
+            return 'video'
+        if ext in BrowserMAX.IMAGE_EXTENSIONS:
+            return 'image'
+        if ext in BrowserMAX.ARCHIVE_EXTENSIONS:
+            return 'archive'
+        return 'other'
 
     def __init__(self, channel_url: str, use_local_browser: bool = False):
         """
@@ -206,6 +243,50 @@ class BrowserMAX(LogMixin):
         self.page: Optional[Page] = None
         self._connected = False
         self._expected_extensions = ['.zip']
+
+        # Upload state management — blocks destructive navigation during upload
+        self._upload_in_progress = False
+        self._upload_file_size = 0
+        self._upload_file_name = ""
+        self._is_video = False
+
+    def _lock_upload_state(self, filepath: str) -> None:
+        """
+        Lock upload guards — marks an upload as in progress.
+
+        Sets flags that block destructive navigation/reload during upload.
+        Must be called before file chooser opens.
+        Must be paired with _unlock_upload_state() in a finally block.
+
+        Args:
+            filepath: Absolute path to the file being uploaded
+        """
+        self._upload_in_progress = True
+        self._upload_file_size = os.path.getsize(filepath)
+        self._upload_file_name = os.path.basename(filepath)
+        self._is_video = self._classify_media(filepath) == "video"
+        self.logger.info(
+            f"Upload locked: {self._upload_file_name} "
+            f"({'video' if self._is_video else 'file'}, "
+            f"{self._upload_file_size / 1024 / 1024:.1f} MB)"
+        )
+
+    def _unlock_upload_state(self) -> None:
+        """Unlock upload guards — marks upload as complete."""
+        self._upload_in_progress = False
+        self._upload_file_size = 0
+        self._upload_file_name = ""
+        self._is_video = False
+        self.logger.debug("Upload unlocked")
+
+    def _can_navigate(self) -> bool:
+        """
+        Check if navigation is safe (no upload in progress).
+
+        Returns:
+            True if navigation is allowed, False if upload in progress
+        """
+        return not self._upload_in_progress
 
     @classmethod
     def _stop_existing_playwright(cls) -> None:
@@ -524,10 +605,12 @@ class BrowserMAX(LogMixin):
             self._close_local_browser()
             time.sleep(2)  # Let lock file release
 
-            # Step 6: Reconnect to CDP
+            # Step 6: Reconnect to CDP.
+            # NOTE: no navigate() here — the CDP page retains its URL after reconnect.
+            # Navigating reloads the page, which is visually disruptive and can
+            # interfere with subsequent uploads in the caller's loop.
             try:
                 self.connect()
-                self.navigate()
             except Exception as e:
                 self.logger.warning(f"CDP reconnect after large upload: {e}")
 
@@ -542,7 +625,6 @@ class BrowserMAX(LogMixin):
                 pass
             try:
                 self.connect()
-                self.navigate()
             except Exception:
                 pass
             return False
@@ -648,6 +730,15 @@ class BrowserMAX(LogMixin):
 
     def navigate(self):
         """Navigate to MAX channel"""
+        # GUARD: block navigation during active upload
+        if self._upload_in_progress:
+            self.logger.warning(
+                f"BLOCKED navigate() during upload: {self._upload_file_name}"
+            )
+            raise UploadInProgressError(
+                f"Cannot navigate during upload: {self._upload_file_name}"
+            )
+
         self.logger.info(f"Opening channel: {self.channel_url}")
 
         # Reconnect if needed
@@ -671,6 +762,13 @@ class BrowserMAX(LogMixin):
         Safely navigate to MAX channel. Reconnects if needed.
         Returns True if navigation succeeded.
         """
+        # GUARD: block navigation during active upload
+        if self._upload_in_progress:
+            self.logger.warning(
+                f"BLOCKED _try_navigate() during upload: {self._upload_file_name}"
+            )
+            return False
+
         if not self._ensure_alive():
             return False
         try:
@@ -710,6 +808,16 @@ class BrowserMAX(LogMixin):
         Returns:
             True if connected, False otherwise
         """
+        # GUARD: during active upload, only check current state — do NOT reconnect
+        if self._upload_in_progress:
+            if self.page and not self.page.is_closed():
+                return True
+            self.logger.warning(
+                f"Page lost during upload of {self._upload_file_name} — "
+                f"cannot reconnect without destroying upload"
+            )
+            return False
+
         if not self.page:
             return self.connect()
 
@@ -1471,6 +1579,17 @@ class BrowserMAX(LogMixin):
         self._check_connection()
         self.logger.info(f"Monitoring upload progress...")
 
+        # Video: extend timeout to account for transcoding time
+        if self._is_video and expected_size:
+            video_mb = expected_size / (1024 * 1024)
+            min_video_timeout = max(120, int(video_mb * 10))
+            min_video_timeout = min(min_video_timeout, 1800)  # cap at 30 min
+            if timeout < min_video_timeout:
+                self.logger.info(
+                    f"Extending timeout for video: {timeout}s -> {min_video_timeout}s"
+                )
+                timeout = min_video_timeout
+
         observer_id = self._install_upload_observer(expected_filename, expected_size)
         pre_state = self._capture_pre_upload_state()
         start = time.time()
@@ -1479,12 +1598,15 @@ class BrowserMAX(LogMixin):
         consecutive_no_activity = 0
 
         # Smaller files upload faster — reduce no-activity wait accordingly
-        if expected_size and expected_size < 10 * 1024 * 1024:
-            no_activity_threshold = 5  # 5 seconds for files < 10MB
+        # For video files: NO no-activity exit (video transcoding can pause DOM updates)
+        if self._is_video:
+            no_activity_threshold = float('inf')  # never exit on no-activity for video
+        elif expected_size and expected_size < 10 * 1024 * 1024:
+            no_activity_threshold = 5   # 5 seconds for files < 10MB
         elif expected_size and expected_size < 50 * 1024 * 1024:
             no_activity_threshold = 10  # 10 seconds for files < 50MB
         else:
-            no_activity_threshold = 30  # 30 seconds for large files
+            no_activity_threshold = 45  # Increased from 30s to 45s for files > 50MB
 
         print(f"  [OK] Waiting for upload to complete... (Ctrl+C to cancel)")
 
@@ -1519,6 +1641,18 @@ class BrowserMAX(LogMixin):
 
             # Check DOM for attached file in composer
             if self._check_dom_upload_ready():
+                # For large files (>= 50 MB), composer preview appears INSTANTLY
+                # but actual upload to server is still in progress.
+                # Require a minimum elapsed time before trusting it.
+                if expected_size and expected_size >= 50 * 1024 * 1024:
+                    min_composer_time = max(10, int(expected_size / (1024 * 1024) / 5))  # ~1s per 5MB, min 10s
+                    if elapsed < min_composer_time:
+                        self.logger.debug(
+                            f"Composer preview at {elapsed}s, waiting {min_composer_time}s "
+                            f"before confirming large file upload"
+                        )
+                        time.sleep(0.5)
+                        continue  # Don't confirm yet — keep monitoring
                 print(f"\n  [OK] File attached in composer ({elapsed}s)")
                 return True
 
@@ -1534,7 +1668,16 @@ class BrowserMAX(LogMixin):
             # Track activity - if no progress for a while, consider it done
             time_since_activity = time.time() - last_activity_time
 
-            if time_since_activity > no_activity_threshold:
+            # Skip no-activity heuristic entirely for video files
+            # Video transcoding can pause DOM updates for extended periods
+            if self._is_video:
+                if consecutive_no_activity >= 2:
+                    # For video, only check DOM/observer, never assume done
+                    if self._check_dom_upload_ready() or done:
+                        print(f"\n  [OK] Video upload detected in DOM ({int(time_since_activity)}s)")
+                        return True
+                    consecutive_no_activity = 0  # Reset and keep waiting
+            elif time_since_activity > no_activity_threshold:
                 consecutive_no_activity += 1
 
                 # After threshold of no activity, assume upload is done
@@ -1677,7 +1820,12 @@ class BrowserMAX(LogMixin):
                     const vids = document.querySelectorAll('video');
                     for (const vid of vids) {
                         if (vid.offsetHeight > 50 && vid.offsetWidth > 50) {
-                            return true;
+                            const src = vid.src || '';
+                            // Only blob/data URLs indicate a NEW upload in composer
+                            // Existing video messages have http/https src
+                            if (src.startsWith('data:') || src.startsWith('blob:')) {
+                                return true;
+                            }
                         }
                     }
                     return false;
@@ -1790,6 +1938,7 @@ class BrowserMAX(LogMixin):
     def _confirm_file_sent(self, pre_snapshot: "ContentSnapshot", file_size_bytes: int) -> bool:
         """
         Fast confirmation: check if feed content changed after sending.
+        NOTE: Only reliable for files < 50MB. Larger files use _confirm_file_in_feed().
 
         Adaptive wait based on file size — photos render faster than videos.
 
@@ -1800,6 +1949,13 @@ class BrowserMAX(LogMixin):
         Returns:
             True if content changed (file likely sent), False if no change detected
         """
+        # Guard: only valid for files < 50MB
+        if file_size_bytes >= 50 * 1024 * 1024:
+            self.logger.debug(
+                f"Skipping hash check for file >= 50MB ({file_size_bytes / 1024 / 1024:.1f} MB)"
+            )
+            return False
+
         if not pre_snapshot:
             return False
 
@@ -1827,6 +1983,200 @@ class BrowserMAX(LogMixin):
                 return True
 
         return False  # Caller falls back to _wait_for_file_message
+
+    def _verify_composer_cleared(self, timeout: int = 30, poll_interval: float = 1.0) -> bool:
+        """
+        Verify the composer area no longer shows upload-in-progress indicators.
+
+        Polls the DOM for progress bars, spinners, loading states, file previews,
+        and attachment elements. Returns True when composer is clear, False on timeout.
+
+        Args:
+            timeout: Maximum seconds to wait (default 30)
+            poll_interval: Seconds between polls (default 1)
+
+        Returns:
+            True if composer is clear, False if timeout reached
+        """
+        start = time.time()
+        self.logger.debug("Verifying composer is clear...")
+
+        while time.time() - start < timeout:
+            try:
+                is_clear = self.page.evaluate(r"""
+                    () => {
+                        const composer = document.querySelector(
+                            '[class*="composer"], [class*="input"], [role="textbox"], [contenteditable]'
+                        );
+                        if (!composer) return false; // No composer = not clear (page may have reloaded)
+
+                        // Check for progress indicators
+                        const hasProgress = !!composer.querySelector(
+                            '[class*="progress"], [role="progressbar"]'
+                        );
+                        // Check for spinner/loading indicators
+                        const hasSpinner = !!composer.querySelector(
+                            '[class*="spinner"], [class*="loading"], [class*="loader"]'
+                        );
+                        // Check for file preview/attachment elements
+                        const hasPreview = !!composer.querySelector(
+                            '[class*="preview"], [class*="attach"], [class*="upload-preview"], [data-file]'
+                        );
+                        // Check for upload percentage text
+                        const text = composer.textContent || '';
+                        const hasPercent = /\d+%/.test(text);
+                        const hasUploading = /loading|uploading|sending/i.test(text);
+
+                        if (hasProgress || hasSpinner || hasPreview || hasPercent || hasUploading) {
+                            return false;
+                        }
+                        return true;
+                    }
+                """)
+
+                if is_clear:
+                    self.logger.debug("Composer is clear")
+                    return True
+
+                time.sleep(poll_interval)
+
+            except Exception as e:
+                self.logger.debug(f"Composer check error: {e}")
+                time.sleep(poll_interval)
+
+        self.logger.warning(f"Composer still busy after {timeout}s")
+        return False
+
+    def _confirm_file_in_feed(self, filename: str, file_size_bytes: int,
+                               baseline_count: int = 0) -> bool:
+        """
+        For files >= 50 MB, verify the specific filename appears in the message feed.
+
+        Unlike the delta check (_confirm_file_sent), this verifies the SPECIFIC file
+        was posted — not just that "something changed" in the DOM.
+
+        Adaptive wait before first check based on file size:
+        - < 50 MB: 5 seconds
+        - 50-200 MB: 15 seconds
+        - 200-500 MB: 30 seconds
+        - >= 500 MB: 60 seconds
+
+        Up to 3 retries with 3-second delays between checks.
+
+        Args:
+            filename: Expected filename to find in feed
+            file_size_bytes: Size of file for adaptive timing
+            baseline_count: Message count baseline (only check new messages)
+
+        Returns:
+            True if filename found in feed, False otherwise
+        """
+        size_mb = file_size_bytes / (1024 * 1024)
+
+        # Adaptive initial wait based on file size
+        # Larger files take longer to appear in feed after sending
+        if size_mb < 50:
+            initial_wait = 5
+        elif size_mb < 200:
+            initial_wait = 15    # was 5s
+        elif size_mb < 500:
+            initial_wait = 30    # was 10s
+        else:
+            initial_wait = 60    # was 15s
+
+        self.logger.debug(f"Confirming file in feed: {filename} ({size_mb:.1f} MB, wait {initial_wait}s)")
+        time.sleep(initial_wait)
+
+        # Normalize filename for comparison
+        search_name = os.path.basename(filename).lower()
+        search_name = search_name.replace('-master', '').replace('-main', '')
+
+        max_retries = 3
+
+        for attempt in range(max_retries):
+            try:
+                # CRITICAL: Scroll to bottom where new messages appear.
+                # Virtual scrolling means baseline_count (captured at top) is USELESS
+                # for comparison — the DOM shows completely different messages at bottom.
+                # So we ignore baseline_count entirely and just scan all visible messages
+                # for a STRICT match: both a file indicator AND the exact filename.
+                self._scroll_to_bottom()
+                self._force_rerender()
+                self.page.wait_for_timeout(1500)  # Wait for DOM to update
+
+                # Query ALL messages for STRICT filename match.
+                # We require BOTH a file attachment indicator AND the exact filename
+                # in a file-specific context (not just anywhere in message text).
+                escaped_name = search_name.replace("\\", "\\\\").replace("'", "\\'")
+                found = self.page.evaluate(
+                    f"""
+                    () => {{
+                        const searchName = '{escaped_name}';
+                        const msgs = document.querySelectorAll('[class*="message"]');
+
+                        for (let i = msgs.length - 1; i >= 0; i--) {{
+                            const msg = msgs[i];
+                            const text = msg.textContent || '';
+                            const html = msg.innerHTML || '';
+
+                            // Only consider messages with file indicators
+                            const hasFileClass = !!msg.querySelector(
+                                '[class*="file"], [class*="attach"]'
+                            );
+                            const hasDownloadLink = !!msg.querySelector(
+                                'a[download]'
+                            );
+                            // Video/audio elements with filenames in attributes
+                            const videos = msg.querySelectorAll('video, audio');
+                            const hasMediaWithFilename = Array.from(videos).some(v =>
+                                (v.poster || v.src || v.getAttribute('data-filename') || '')
+                                    .toLowerCase().includes(searchName)
+                            );
+                            // File name elements (previews, file cards)
+                            const nameElements = msg.querySelectorAll(
+                                '[class*="file-name"], [class*="name"], [class*="title"]'
+                            );
+                            const hasNameWithFilename = Array.from(nameElements).some(el =>
+                                (el.textContent || '').toLowerCase().includes(searchName)
+                            );
+
+                            if (!hasFileClass && !hasDownloadLink && !hasMediaWithFilename && !hasNameWithFilename) {{
+                                continue;
+                            }}
+
+                            // STRICT check: filename must appear in message
+                            const textLower = text.toLowerCase();
+                            if (textLower.includes(searchName)) {{
+                                return {{ found: true, text: text.slice(0, 100) }};
+                            }}
+                            const htmlLower = html.toLowerCase();
+                            if (htmlLower.includes(searchName)) {{
+                                return {{ found: true, text: text.slice(0, 100) }};
+                            }}
+                        }}
+
+                        return {{ found: false }};
+                    }}
+                """
+                ) or {}
+
+                if found.get('found'):
+                    self.logger.info(
+                        f"File confirmed in feed: {found.get('text', 'unknown')} (attempt {attempt + 1}/{max_retries})"
+                    )
+                    return True
+
+                if attempt < max_retries - 1:
+                    self.logger.debug(f"Filename not in feed yet, retry {attempt + 1}/{max_retries}")
+                    time.sleep(3)
+
+            except Exception as e:
+                self.logger.warning(f"Feed check error: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(3)
+
+        self.logger.warning(f"Filename '{search_name}' not found in feed after {max_retries} attempts")
+        return False
 
     def _match_filename_in_message(self, msg_text: str, msg_html: str,
                                     search_name: Optional[str] = None) -> tuple[bool, str]:
@@ -1957,7 +2307,17 @@ class BrowserMAX(LogMixin):
         Compute adaptive fallback timeouts based on file size.
 
         Smaller files render faster, so shorter timeouts avoid unnecessary delays.
-        Larger files use the original 30s/45s defaults.
+        Very large files get proportionally longer timeouts to match actual upload
+        times (e.g., 900 MB at 5 MB/s takes ~3 minutes).
+
+        Timeout tiers:
+        | Size       | Re-render | Reload |
+        |------------|-----------|--------|
+        | < 5 MB     | 3s        | 6s     |
+        | 5-50 MB    | 15s       | 20s    |
+        | 50-200 MB  | 25s       | 35s    |
+        | 200-500 MB | 50s       | 60s    |
+        | >= 500 MB  | 90s       | 120s   |
 
         Args:
             file_size_bytes: File size in bytes. If None, returns defaults.
@@ -1976,8 +2336,10 @@ class BrowserMAX(LogMixin):
             return (15, 20)
         elif size_mb < 200:
             return (25, 35)
+        elif size_mb < 500:
+            return (50, 60)   # NEW: 200-500 MB tier
         else:
-            return (30, 45)  # original defaults for large files
+            return (90, 120)  # NEW: >= 500 MB tier (was 30, 45)
 
     def _check_upload_in_lenta(self, expected_filename: Optional[str] = None,
                                 min_msg_index: int = 0) -> tuple[bool, Optional[str]]:
@@ -2071,7 +2433,7 @@ class BrowserMAX(LogMixin):
         """
         start = time.time()
         snapshot_interval = 2  # seconds between snapshots
-        snapshot_depth = 15    # last N messages to snapshot
+        snapshot_depth = 30    # last N messages to snapshot (increased for better coverage)
 
         # FIX 3: Adaptive timeouts based on file size
         rerender_timeout, reload_timeout = self._compute_monitor_timeouts(file_size_bytes)
@@ -2197,7 +2559,7 @@ class BrowserMAX(LogMixin):
             print(f"  [SNAPSHOT] Baseline: none")
 
         last_rerender_time = 0
-        last_reload_time = 0
+        # last_reload_time removed -- reload is eliminated from the pipeline
 
         while True:
             elapsed = int(time.time() - start)
@@ -2273,27 +2635,23 @@ class BrowserMAX(LogMixin):
                             return (True, "found", msg_idx)
                         prev_snapshot = new_snapshot
 
-                # Fallback: reload page after 45s of no changes
-                if elapsed >= reload_timeout and elapsed < reload_timeout + 5 and prev_snapshot and (elapsed - last_reload_time) > (reload_timeout - 5):
-                    print(f"  [FALLBACK] No changes for {reload_timeout}s, reloading page...")
-                    try:
-                        self.page.reload(wait_until="domcontentloaded", timeout=15000)
-                        self.page.wait_for_timeout(3000)  # Wait for page to stabilize
-                        last_reload_time = elapsed
-                        # Re-initialize baseline after reload
-                        base_count = self.page.evaluate(
-                            "() => document.querySelectorAll('[class*=\"message\"]').length"
-                        ) or 0
-                        # Scan all messages after reload
-                        found, msg_idx, detail = self._scan_messages_for_file(
-                            0, base_count, search_name
-                        )
-                        if found:
-                            print(f"  [OK] FILE FOUND after reload! Message #{msg_idx} ({detail})")
-                            return (True, "found", msg_idx)
-                        prev_snapshot = self._take_content_snapshot(depth=snapshot_depth)
-                    except Exception as reload_err:
-                        print(f"  [WARN] Reload failed: {reload_err}, continuing...")
+                # Extended fallback: after 2x rerender_timeout (3x for video), give up
+                # WITHOUT reloading — the caller will retry via _upload_single_file loop
+                extended_timeout = rerender_timeout * 3 if self._is_video else rerender_timeout * 2
+                if elapsed >= extended_timeout:
+                    print(f"  [WARN] Extended timeout ({extended_timeout}s) reached — "
+                          f"file not found, returning without reload")
+                    final_count = self.page.evaluate(
+                        "() => document.querySelectorAll('[class*=\"message\"]').length"
+                    ) or 0
+                    fallback_start = max(0, final_count - 20)
+                    found, msg_idx, detail = self._scan_messages_for_file(
+                        fallback_start, final_count, search_name
+                    )
+                    if found:
+                        print(f"  [OK] File found at extended timeout! Msg #{msg_idx} ({detail})")
+                        return (True, "found", msg_idx)
+                    return (False, "not_found", -1)
 
                 time.sleep(snapshot_interval)
 
@@ -2750,7 +3108,15 @@ class BrowserMAX(LogMixin):
             try:
                 self.logger.debug(f"Attempt {attempt}/{retries}")
 
-                # Reconnect and re-navigate if page was closed during previous attempt
+                # === UPLOAD STATE LOCK ===
+                # Set flags before any browser interaction to block destructive navigation
+                self._lock_upload_state(filepath)
+
+                # Check connection is still alive.
+                # NOTE: Navigation is the caller's responsibility.
+                # _upload_large_file() handles its own navigation,
+                # send_message_with_files() navigates before calling us.
+                # We only verify the page is alive, we don't navigate here.
                 if not self._ensure_alive():
                     self.logger.error("Cannot reconnect to Chrome")
                     if attempt < retries:
@@ -2761,14 +3127,6 @@ class BrowserMAX(LogMixin):
 
                 # Capture content snapshot before upload for delta confirmation
                 pre_snapshot = self._take_content_snapshot()
-
-                if not self._try_navigate():
-                    self.logger.error("Cannot navigate to channel after reconnect")
-                    if attempt < retries:
-                        time.sleep(retry_delay)
-                        continue
-                    else:
-                        return False
 
                 upload_timeout = max(60000, int(file_size_mb * 5000))
                 self.logger.debug(f"Upload timeout: {upload_timeout//1000}s")
@@ -2817,23 +3175,51 @@ class BrowserMAX(LogMixin):
                 self.logger.debug("Sending file message...")
                 self._send_message()
 
-                # Fast delta confirmation — check if content changed
-                confirm_start = time.time()
-                confirmed = self._confirm_file_sent(pre_snapshot, file_size_bytes)
-                confirm_elapsed = time.time() - confirm_start
+                # NEW: Verify composer cleared before confirming (prevents false positives)
+                if not self._verify_composer_cleared():
+                    self.logger.warning("Composer still busy — treating as unconfirmed")
+                else:
+                    self.logger.debug("Composer cleared, proceeding to confirmation")
+
+                # NEW: For large files (>= 50 MB), use filename-based confirmation
+                # instead of the delta check which triggers false positives
+                LARGE_CONFIRM_THRESHOLD = 50 * 1024 * 1024  # 50 MB
+                confirmed = False
+
+                if file_size_bytes >= LARGE_CONFIRM_THRESHOLD:
+                    # Large file path: check filename appears in feed
+                    confirmed = self._confirm_file_in_feed(
+                        filename, file_size_bytes,
+                        baseline_count=baseline_count
+                    )
+                    if confirmed:
+                        confirm_elapsed = 0  # elapsed tracked inside _confirm_file_in_feed
+                        self.logger.info(
+                            f"File confirmed (feed check, {filename})"
+                        )
+                        print(
+                            f"  [OK] File confirmed (feed check, {filename})"
+                        )
+                else:
+                    # Small file path: existing fast delta check
+                    confirm_start = time.time()
+                    confirmed = self._confirm_file_sent(pre_snapshot, file_size_bytes)
+                    confirm_elapsed = time.time() - confirm_start
+
+                    if confirmed:
+                        self.logger.info(
+                            f"File confirmed (delta check, {confirm_elapsed:.1f}s)"
+                        )
+                        print(
+                            f"  [OK] File confirmed (delta check, {confirm_elapsed:.1f}s)"
+                        )
 
                 if confirmed:
-                    self.logger.info(
-                        f"File confirmed (delta check, {confirm_elapsed:.1f}s)"
-                    )
-                    print(
-                        f"  [OK] File confirmed (delta check, {confirm_elapsed:.1f}s)"
-                    )
                     return True
 
                 # Fallback: full confirmation flow for edge cases
                 self.logger.debug(
-                    f"Delta check took {confirm_elapsed:.1f}s, falling back to full confirmation"
+                    f"Fast confirmation failed, falling back to full confirmation"
                 )
                 # Adaptive timeout: scale with file size
                 # ~2 MB/s baseline upload speed, plus buffer
@@ -2857,12 +3243,24 @@ class BrowserMAX(LogMixin):
                         time.sleep(retry_delay)
                     continue
 
+            except UploadInProgressError:
+                # Caught from guards in navigate() — retry with delay
+                self.logger.warning(
+                    f"UploadInProgressError in attempt {attempt} — retrying"
+                )
+                if attempt < retries:
+                    time.sleep(retry_delay)
+                continue
             except Exception as e:
                 self.logger.error(f"Upload error: {e}", exc_info=True)
                 if attempt < retries:
                     time.sleep(retry_delay)
                 else:
                     return False
+            finally:
+                # === UPLOAD STATE UNLOCK ===
+                # Always unlock to reset guards, regardless of outcome
+                self._unlock_upload_state()
 
         return False
 

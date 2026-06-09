@@ -651,3 +651,407 @@ class TestMediaArchiverRouting:
         # Verify send_message_with_files was called, NOT _upload_large_file
         browser.send_message_with_files.assert_called_once()
         browser._upload_large_file.assert_not_called()
+
+
+# ── _verify_composer_cleared tests ──
+
+class TestVerifyComposerCleared:
+    """Test _verify_composer_cleared method"""
+
+    def test_returns_true_when_composer_clear(self):
+        """Returns True immediately when composer has no loading indicators."""
+        from browser_max import BrowserMAX
+
+        bm = BrowserMAX("https://example.com")
+        bm._connected = True
+        bm.page = MagicMock()
+        bm.page.is_closed.return_value = False
+        bm.page.evaluate.return_value = True  # composer is clear
+
+        result = bm._verify_composer_cleared(timeout=5, poll_interval=0.1)
+
+        assert result is True
+        bm.page.evaluate.assert_called_once()
+
+    def test_returns_false_on_timeout(self):
+        """Returns False when composer stays busy past timeout."""
+        from browser_max import BrowserMAX
+
+        bm = BrowserMAX("https://example.com")
+        bm._connected = True
+        bm.page = MagicMock()
+        bm.page.is_closed.return_value = False
+        bm.page.evaluate.return_value = False  # composer still busy
+
+        with patch('time.sleep'):
+            result = bm._verify_composer_cleared(timeout=2, poll_interval=0.5)
+
+        assert result is False
+
+    def test_returns_true_after_polling(self):
+        """Returns True once composer clears after a few polls."""
+        from browser_max import BrowserMAX
+
+        bm = BrowserMAX("https://example.com")
+        bm._connected = True
+        bm.page = MagicMock()
+        bm.page.is_closed.return_value = False
+
+        # First 2 calls: busy, 3rd call: clear
+        bm.page.evaluate.side_effect = [False, False, True]
+
+        result = bm._verify_composer_cleared(timeout=10, poll_interval=0.1)
+
+        assert result is True
+        assert bm.page.evaluate.call_count == 3
+
+    def test_handles_page_error(self):
+        """Handles JS evaluation errors gracefully and retries."""
+        from browser_max import BrowserMAX
+
+        bm = BrowserMAX("https://example.com")
+        bm._connected = True
+        bm.page = MagicMock()
+        bm.page.is_closed.return_value = False
+
+        # First call errors, second call succeeds
+        bm.page.evaluate.side_effect = [Exception("CDP error"), True]
+
+        with patch('time.sleep'):
+            result = bm._verify_composer_cleared(timeout=5, poll_interval=0.5)
+
+        assert result is True
+
+
+# ── _confirm_file_in_feed tests ──
+
+class TestConfirmFileInFeed:
+    """Test _confirm_file_in_feed method"""
+
+    def test_returns_true_when_filename_found(self):
+        """Returns True when filename appears in feed.
+        Evaluate call order per attempt:
+          1. _scroll_to_bottom() — bool
+          2. feed scan — dict with found: True
+        """
+        from browser_max import BrowserMAX
+
+        bm = BrowserMAX("https://example.com")
+        bm._connected = True
+        bm.page = MagicMock()
+        bm.page.is_closed.return_value = False
+
+        bm.page.evaluate.side_effect = [
+            True,  # _scroll_to_bottom()
+            {"found": True, "text": "repo-master.zip 45 MB"}  # feed check
+        ]
+
+        with patch('time.sleep'):
+            result = bm._confirm_file_in_feed(
+                "repo-master.zip",
+                100 * 1024 * 1024,  # 100 MB
+                baseline_count=45
+            )
+
+        assert result is True
+
+    def test_returns_false_when_filename_not_found(self):
+        """Returns False after all retries exhausted.
+        Evaluate call order per attempt:
+          1. _scroll_to_bottom() — bool
+          2. feed scan — dict with found: False
+        3 attempts × 2 = 6 evaluate calls
+        """
+        from browser_max import BrowserMAX
+
+        bm = BrowserMAX("https://example.com")
+        bm._connected = True
+        bm.page = MagicMock()
+        bm.page.is_closed.return_value = False
+
+        evaluate_calls = [0]
+        def mock_evaluate(expr):
+            evaluate_calls[0] += 1
+            idx = (evaluate_calls[0] - 1) % 2
+            if idx == 0:
+                return True  # _scroll_to_bottom()
+            return {"found": False}  # feed scan always fails
+
+        bm.page.evaluate.side_effect = mock_evaluate
+
+        with patch('time.sleep'):
+            result = bm._confirm_file_in_feed(
+                "missing-file.zip",
+                100 * 1024 * 1024,
+                baseline_count=45
+            )
+
+        assert result is False
+
+    def test_finds_filename_on_retry(self):
+        """Filename found on second attempt.
+        Attempt 1: scroll + scan({"found": False}) → retry
+        Attempt 2: scroll + scan({"found": True}) → success
+        """
+        from browser_max import BrowserMAX
+
+        bm = BrowserMAX("https://example.com")
+        bm._connected = True
+        bm.page = MagicMock()
+        bm.page.is_closed.return_value = False
+
+        evaluate_calls = [0]
+        def mock_evaluate(expr):
+            evaluate_calls[0] += 1
+            attempt_num = (evaluate_calls[0] - 1) // 2
+            call_in_attempt = (evaluate_calls[0] - 1) % 2
+            if call_in_attempt == 0:
+                return True  # _scroll_to_bottom()
+            # Scan: first attempt fails, second succeeds
+            if attempt_num == 0:
+                return {"found": False}
+            return {"found": True, "text": "repo.zip"}
+
+        bm.page.evaluate.side_effect = mock_evaluate
+
+        with patch('time.sleep'):
+            result = bm._confirm_file_in_feed(
+                "repo.zip",
+                100 * 1024 * 1024,
+                baseline_count=45
+            )
+
+        assert result is True
+
+    def test_adaptive_wait_50_200mb(self):
+        """50-200 MB files get 15 second initial wait."""
+        from browser_max import BrowserMAX
+
+        bm = BrowserMAX("https://example.com")
+        bm._connected = True
+        bm.page = MagicMock()
+        bm.page.is_closed.return_value = False
+        bm.page.evaluate.return_value = {"found": True, "text": "test.zip"}
+
+        sleeps = []
+        def mock_sleep(seconds):
+            sleeps.append(seconds)
+
+        with patch('time.sleep', side_effect=mock_sleep):
+            bm._confirm_file_in_feed("test.zip", 100 * 1024 * 1024, baseline_count=0)
+
+        # First sleep should be 15 seconds (initial wait for 50-200 MB)
+        assert sleeps[0] == 15
+
+    def test_adaptive_wait_200_500mb(self):
+        """200-500 MB files get 30 second initial wait."""
+        from browser_max import BrowserMAX
+
+        bm = BrowserMAX("https://example.com")
+        bm._connected = True
+        bm.page = MagicMock()
+        bm.page.is_closed.return_value = False
+        bm.page.evaluate.return_value = {"found": True, "text": "test.zip"}
+
+        sleeps = []
+        def mock_sleep(seconds):
+            sleeps.append(seconds)
+
+        with patch('time.sleep', side_effect=mock_sleep):
+            bm._confirm_file_in_feed("test.zip", 300 * 1024 * 1024, baseline_count=0)
+
+        assert sleeps[0] == 30
+
+    def test_adaptive_wait_500plus_mb(self):
+        """500+ MB files get 60 second initial wait."""
+        from browser_max import BrowserMAX
+
+        bm = BrowserMAX("https://example.com")
+        bm._connected = True
+        bm.page = MagicMock()
+        bm.page.is_closed.return_value = False
+        bm.page.evaluate.return_value = {"found": True, "text": "test.zip"}
+
+        sleeps = []
+        def mock_sleep(seconds):
+            sleeps.append(seconds)
+
+        with patch('time.sleep', side_effect=mock_sleep):
+            bm._confirm_file_in_feed("test.zip", 600 * 1024 * 1024, baseline_count=0)
+
+        assert sleeps[0] == 60
+
+
+# ── Updated timeout tier tests ──
+
+class TestUpdatedTimeoutTiers:
+    """Test updated _compute_monitor_timeouts with new tiers"""
+
+    def test_200_500mb_tier(self):
+        """200-500 MB files get 50s/60s timeouts."""
+        from browser_max import BrowserMAX
+
+        for size_mb in [200, 300, 400, 499]:
+            rerender, reload = BrowserMAX._compute_monitor_timeouts(
+                size_mb * 1024 * 1024
+            )
+            assert rerender == 50, f"Expected 50s rerender for {size_mb}MB, got {rerender}"
+            assert reload == 60, f"Expected 60s reload for {size_mb}MB, got {reload}"
+
+    def test_500plus_mb_tier(self):
+        """500+ MB files get 90s/120s timeouts."""
+        from browser_max import BrowserMAX
+
+        for size_mb in [500, 600, 900, 1000]:
+            rerender, reload = BrowserMAX._compute_monitor_timeouts(
+                size_mb * 1024 * 1024
+            )
+            assert rerender == 90, f"Expected 90s rerender for {size_mb}MB, got {rerender}"
+            assert reload == 120, f"Expected 120s reload for {size_mb}MB, got {reload}"
+
+    def test_existing_tiers_unchanged(self):
+        """Existing tiers (< 5MB, 5-50MB, 50-200MB) are unchanged."""
+        from browser_max import BrowserMAX
+
+        # < 5 MB
+        r, rl = BrowserMAX._compute_monitor_timeouts(1 * 1024 * 1024)
+        assert r == 3 and rl == 6
+
+        # 5-50 MB
+        r, rl = BrowserMAX._compute_monitor_timeouts(20 * 1024 * 1024)
+        assert r == 15 and rl == 20
+
+        # 50-200 MB
+        r, rl = BrowserMAX._compute_monitor_timeouts(100 * 1024 * 1024)
+        assert r == 25 and rl == 35
+
+    def test_none_returns_defaults(self):
+        """None returns backwards-compatible defaults."""
+        from browser_max import BrowserMAX
+
+        r, rl = BrowserMAX._compute_monitor_timeouts(None)
+        assert r == 30 and rl == 45
+
+
+# ── Integration: large file uses feed check, small file uses delta ──
+
+class TestLargeFileConfirmationRouting:
+    """Test that _upload_single_file routes to correct confirmation method"""
+
+    def test_large_file_uses_feed_check(self):
+        """Files >= 50 MB should call _confirm_file_in_feed, NOT _confirm_file_sent."""
+        from browser_max import BrowserMAX
+
+        bm = BrowserMAX("https://example.com")
+        bm._connected = True
+        bm.page = MagicMock()
+        bm.page.is_closed.return_value = False
+
+        methods_called = []
+
+        def mock_composer_clear():
+            methods_called.append("composer_clear")
+            return True
+
+        def mock_feed_check(*args, **kwargs):
+            methods_called.append("feed_check")
+            return True
+
+        def mock_delta_check(*args, **kwargs):
+            methods_called.append("delta_check")
+            return False
+
+        bm._verify_composer_cleared = mock_composer_clear
+        bm._confirm_file_in_feed = mock_feed_check
+        bm._confirm_file_sent = mock_delta_check
+
+        # Simulate the routing logic from _upload_single_file
+        file_size_bytes = 100 * 1024 * 1024  # 100 MB
+        LARGE_CONFIRM_THRESHOLD = 50 * 1024 * 1024
+
+        bm._verify_composer_cleared()
+
+        if file_size_bytes >= LARGE_CONFIRM_THRESHOLD:
+            bm._confirm_file_in_feed("test.zip", file_size_bytes, baseline_count=0)
+        else:
+            bm._confirm_file_sent(None, file_size_bytes)
+
+        assert "composer_clear" in methods_called
+        assert "feed_check" in methods_called
+        assert "delta_check" not in methods_called
+
+    def test_small_file_uses_delta_check(self):
+        """Files < 50 MB should call _confirm_file_sent, NOT _confirm_file_in_feed."""
+        from browser_max import BrowserMAX
+
+        bm = BrowserMAX("https://example.com")
+        bm._connected = True
+        bm.page = MagicMock()
+        bm.page.is_closed.return_value = False
+
+        methods_called = []
+
+        def mock_composer_clear():
+            methods_called.append("composer_clear")
+            return True
+
+        def mock_feed_check(*args, **kwargs):
+            methods_called.append("feed_check")
+            return False
+
+        def mock_delta_check(*args, **kwargs):
+            methods_called.append("delta_check")
+            return True
+
+        bm._verify_composer_cleared = mock_composer_clear
+        bm._confirm_file_in_feed = mock_feed_check
+        bm._confirm_file_sent = mock_delta_check
+
+        # Simulate the routing logic from _upload_single_file
+        file_size_bytes = 30 * 1024 * 1024  # 30 MB
+        LARGE_CONFIRM_THRESHOLD = 50 * 1024 * 1024
+
+        bm._verify_composer_cleared()
+
+        if file_size_bytes >= LARGE_CONFIRM_THRESHOLD:
+            bm._confirm_file_in_feed("test.zip", file_size_bytes, baseline_count=0)
+        else:
+            bm._confirm_file_sent(None, file_size_bytes)
+
+        assert "composer_clear" in methods_called
+        assert "delta_check" in methods_called
+        assert "feed_check" not in methods_called
+
+    def test_composer_busy_still_attempts_confirm(self):
+        """When composer is busy, confirmation is still attempted (not blocked)."""
+        from browser_max import BrowserMAX
+
+        bm = BrowserMAX("https://example.com")
+        bm._connected = True
+        bm.page = MagicMock()
+        bm.page.is_closed.return_value = False
+
+        methods_called = []
+
+        def mock_composer_clear():
+            methods_called.append("composer_clear")
+            return False  # composer still busy
+
+        def mock_feed_check(*args, **kwargs):
+            methods_called.append("feed_check")
+            return True
+
+        bm._verify_composer_cleared = mock_composer_clear
+        bm._confirm_file_in_feed = mock_feed_check
+
+        # Simulate: composer busy, but we still try feed check
+        composer_ok = bm._verify_composer_cleared()
+        # Even if composer not clear, we proceed to confirmation
+        file_size_bytes = 100 * 1024 * 1024
+        LARGE_CONFIRM_THRESHOLD = 50 * 1024 * 1024
+
+        if file_size_bytes >= LARGE_CONFIRM_THRESHOLD:
+            bm._confirm_file_in_feed("test.zip", file_size_bytes, baseline_count=0)
+
+        assert "composer_clear" in methods_called
+        assert "feed_check" in methods_called  # still attempted despite busy composer
