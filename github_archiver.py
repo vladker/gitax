@@ -357,24 +357,66 @@ class GitHubArchiver(LogMixin):
               f"({stats['sent']} отправлено, {stats['failed']} ошибок)")
         print("─" * 60)
 
-    def _show_menu(self):
+    def _show_main_menu(self):
         """Показать главное меню"""
         self._show_header()
         ignored_count = self.journal.get_ignored_count()
         ignored_str = f" ({ignored_count} в игноре)" if ignored_count else ""
         print()
+        print("  [1] GitHub — репозитории")
+        print("  [2] PyPI — Python библиотеки")
+        print("  [3] Файлы — медиа, скачивание, экспорт")
+        print("  [4] Сервис — журналы, настройки")
+        print("  [0] Выход")
+        print()
+
+    def _github_menu(self):
+        """Подменю GitHub"""
+        ignored_count = self.journal.get_ignored_count()
+        ignored_str = f" ({ignored_count} в игноре)" if ignored_count else ""
+        print("\n" + "═" * 60)
+        print("  GitHub — репозитории")
+        print("─" * 60)
+        print()
         print("  [1] Синхронизировать репозитории")
         print("  [2] Загрузить новые репозитории")
         print(f"  [3] Список игнорирования{ignored_str}")
         print("  [4] Аудит — очистка / восстановление публикаций")
-        print("  [5] Экспорт всех сообщений в файл")
-        print("  [6] Загрузить медиа из папки")
-        print("  [7] Скачать все файлы из канала")
-        print("  [8] Удалить все сообщения в ленте")
-        print("  [9] Выход")
-        print("  [10] Очистить журналы")
-        print("  [11] Загрузить топ Python библиотек")
-        print("  [12] Синхронизировать Python библиотеки")
+        print("  [0] Назад")
+        print()
+
+    def _pypi_menu(self):
+        """Подменю PyPI"""
+        print("\n" + "═" * 60)
+        print("  PyPI — Python библиотеки")
+        print("─" * 60)
+        print()
+        print("  [1] Загрузить топ Python библиотек")
+        print("  [2] Синхронизировать Python библиотеки")
+        print("  [0] Назад")
+        print()
+
+    def _files_menu(self):
+        """Подменю Файлы"""
+        print("\n" + "═" * 60)
+        print("  Файлы — медиа, скачивание, экспорт")
+        print("─" * 60)
+        print()
+        print("  [1] Загрузить медиа из папки")
+        print("  [2] Скачать все файлы из канала")
+        print("  [3] Экспорт всех сообщений в файл")
+        print("  [4] Удалить все сообщения в ленте")
+        print("  [0] Назад")
+        print()
+
+    def _service_menu(self):
+        """Подменю Сервис"""
+        print("\n" + "═" * 60)
+        print("  Сервис — журналы, настройки")
+        print("─" * 60)
+        print()
+        print("  [1] Очистить журналы")
+        print("  [0] Назад")
         print()
 
     def _get_user_choice(self, options: list, prompt: str = "Выберите действие") -> str:
@@ -2072,11 +2114,36 @@ class GitHubArchiver(LogMixin):
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
 
-            self._show_menu()
+            self._show_main_menu()
 
-            choice = input("  Выберите действие [1-12]: ").strip()
+            choice = input("  Выберите раздел [0-4]: ").strip()
 
-            if choice == '1':
+            # ── Главное меню ──
+            if choice == '0':
+                print("\n  До свидания!\n")
+                break
+            elif choice == '1':
+                self._run_github_menu()
+            elif choice == '2':
+                self._run_pypi_menu()
+            elif choice == '3':
+                self._run_files_menu()
+            elif choice == '4':
+                self._run_service_menu()
+            else:
+                print("\n  Неверный выбор. Нажмите 0..4.")
+                time.sleep(1)
+
+    def _run_github_menu(self):
+        """Цикл подменю GitHub"""
+        while True:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            self._github_menu()
+            choice = input("  Выберите действие [0-4]: ").strip()
+
+            if choice == '0':
+                break
+            elif choice == '1':
                 self.sync_repositories()
             elif choice == '2':
                 self.load_new_repositories()
@@ -2084,25 +2151,61 @@ class GitHubArchiver(LogMixin):
                 self._manage_ignore_list()
             elif choice == '4':
                 self.audit_and_restore_publications()
-            elif choice == '5':
-                self.export_messages_to_file()
-            elif choice == '6':
-                self.run_media_archiver()
-            elif choice == '7':
-                self.download_channel_files()
-            elif choice == '8':
-                self.delete_all_messages_in_channel()
-            elif choice == '9':
-                print("\n  До свидания!\n")
+            else:
+                print("\n  Неверный выбор. Нажмите 0..4.")
+                time.sleep(1)
+
+    def _run_pypi_menu(self):
+        """Цикл подменю PyPI"""
+        while True:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            self._pypi_menu()
+            choice = input("  Выберите действие [0-2]: ").strip()
+
+            if choice == '0':
                 break
-            elif choice == '10':
-                self._manage_journals()
-            elif choice == '11':
+            elif choice == '1':
                 self.run_pypi_libs_archiver()
-            elif choice == '12':
+            elif choice == '2':
                 self.run_pypi_libs_sync()
             else:
-                print("\n  Неверный выбор. Нажмите 1..12.")
+                print("\n  Неверный выбор. Нажмите 0..2.")
+                time.sleep(1)
+
+    def _run_files_menu(self):
+        """Цикл подменю Файлы"""
+        while True:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            self._files_menu()
+            choice = input("  Выберите действие [0-4]: ").strip()
+
+            if choice == '0':
+                break
+            elif choice == '1':
+                self.run_media_archiver()
+            elif choice == '2':
+                self.download_channel_files()
+            elif choice == '3':
+                self.export_messages_to_file()
+            elif choice == '4':
+                self.delete_all_messages_in_channel()
+            else:
+                print("\n  Неверный выбор. Нажмите 0..4.")
+                time.sleep(1)
+
+    def _run_service_menu(self):
+        """Цикл подменю Сервис"""
+        while True:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            self._service_menu()
+            choice = input("  Выберите действие [0-1]: ").strip()
+
+            if choice == '0':
+                break
+            elif choice == '1':
+                self._manage_journals()
+            else:
+                print("\n  Неверный выбор. Нажмите 0..1.")
                 time.sleep(1)
 
 
