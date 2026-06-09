@@ -21,6 +21,7 @@ from journal import Journal
 from github_api import GitHubAPI
 from browser_max import BrowserMAX
 from scroll_registry import ScrollRegistry
+from pypi_libs_journal import PyPILibsJournal
 
 
 class GracefulShutdown:
@@ -73,6 +74,9 @@ class GracefulShutdown:
             os.path.join(output_dir, "*.locked_*"),
         ]
 
+        # Add PyPI temp files
+        patterns.append(os.path.join("temp_pypi", "**", "*"))  # pypi libs downloads
+
         temp_files = []
         for pattern in patterns:
             temp_files.extend(glob.glob(pattern))
@@ -94,6 +98,17 @@ class GracefulShutdown:
 
         if deleted:
             logger.info(f"Deleted {deleted} temp file(s)")
+
+        # Clean up entire pypi_api temp directory
+        temp_pypi = os.path.join(os.getcwd(), "temp_pypi")
+        if os.path.exists(temp_pypi):
+            try:
+                import shutil
+                shutil.rmtree(temp_pypi)
+                deleted += 1
+                logger.info("Cleaned up ./temp_pypi/ directory")
+            except Exception as e:
+                logger.warning(f"Failed to clean ./temp_pypi/: {e}")
 
 
 class GitHubArchiver(LogMixin):
@@ -235,9 +250,9 @@ class GitHubArchiver(LogMixin):
         if env_token:
             config.setdefault('github', {})['token'] = env_token
 
-        env_channel = os.environ.get('MAX_CHANNEL_URL')
-        if env_channel:
-            config.setdefault('max', {})['channel_url'] = env_channel
+        env_channel = os.environ.get('MAX_CHANNEL_URL', '')
+        yaml_channel = config.get('max', {}).get('channel_url', '')
+        config.setdefault('max', {})['channel_url'] = env_channel or yaml_channel
 
         if not config.get('github', {}).get('token'):
             print("✗ GitHub token не указан.")
@@ -357,6 +372,8 @@ class GitHubArchiver(LogMixin):
         print("  [8] Удалить все сообщения в ленте")
         print("  [9] Выход")
         print("  [10] Очистить журналы")
+        print("  [11] Загрузить топ Python библиотек")
+        print("  [12] Синхронизировать Python библиотеки")
         print()
 
     def _get_user_choice(self, options: list, prompt: str = "Выберите действие") -> str:
@@ -981,6 +998,8 @@ class GitHubArchiver(LogMixin):
             mj_stats = mj.get_stats()
             dj = DownloadJournal("download_journal.json")
             dj_stats = dj.get_stats()
+            pj = PyPILibsJournal("pypi_libs_journal.json")
+            pj_stats = pj.get_stats()
 
             print(f"\n  Текущее состояние журналов:")
             print(f"  [1] journal.json — {j_stats['total']} репозиториев "
@@ -989,16 +1008,19 @@ class GitHubArchiver(LogMixin):
                   f"({mj_stats['sent']} отправлено, {mj_stats['failed']} ошибок)")
             print(f"  [3] download_journal.json — {dj_stats['total']} файлов "
                   f"({dj_stats['downloaded']} скачано, {dj_stats['failed']} ошибок)")
+            print(f"  [4] pypi_libs_journal.json — {pj_stats['total']} библиотек "
+                  f"({pj_stats['sent']} отправлено, {pj_stats['failed']} ошибок)")
 
             print()
             print("  [1] Очистить journal.json")
             print("  [2] Очистить media_journal.json")
             print("  [3] Очистить download_journal.json")
-            print("  [4] Очистить ВСЕ журналы")
+            print("  [4] Очистить pypi_libs_journal.json")
+            print("  [5] Очистить ВСЕ журналы")
             print("  [0] Назад")
             print()
 
-            choice = input("  Ваш выбор [0/1/2/3/4]: ").strip()
+            choice = input("  Ваш выбор [0/1/2/3/4/5]: ").strip()
 
             if choice == '0':
                 break
@@ -1031,12 +1053,22 @@ class GitHubArchiver(LogMixin):
                 input("\n  Нажмите Enter для продолжения...")
 
             elif choice == '4':
+                confirm = input("\n  Очистить pypi_libs_journal.json? [y/N]: ").strip().lower()
+                if confirm in ('y', 'yes', 'д', 'да'):
+                    PyPILibsJournal("pypi_libs_journal.json").clear()
+                    print("  ✓ pypi_libs_journal.json очищен")
+                else:
+                    print("  Отменено")
+                input("\n  Нажмите Enter для продолжения...")
+
+            elif choice == '5':
                 print("\n  ⚠ ВНИМАНИЕ: Будут очищены ВСЕ журналы!")
                 confirm = input("  Введите 'ДА' для подтверждения: ").strip().lower()
                 if confirm in ('да', 'yes', 'дa'):
                     self.journal.clear()
                     MediaJournal("media_journal.json").clear()
                     DownloadJournal("download_journal.json").clear()
+                    PyPILibsJournal("pypi_libs_journal.json").clear()
                     print("  ✓ Все журналы очищены")
                 else:
                     print("  Отменено")
@@ -2041,7 +2073,7 @@ class GitHubArchiver(LogMixin):
 
             self._show_menu()
 
-            choice = input("  Выберите действие [1-10]: ").strip()
+            choice = input("  Выберите действие [1-12]: ").strip()
 
             if choice == '1':
                 self.sync_repositories()
@@ -2064,9 +2096,48 @@ class GitHubArchiver(LogMixin):
                 break
             elif choice == '10':
                 self._manage_journals()
+            elif choice == '11':
+                self.run_pypi_libs_archiver()
+            elif choice == '12':
+                self.run_pypi_libs_sync()
             else:
-                print("\n  Неверный выбор. Нажмите 1..10.")
+                print("\n  Неверный выбор. Нажмите 1..12.")
                 time.sleep(1)
+
+
+    def run_pypi_libs_archiver(self):
+        """Загрузить топ Python библиотек в MAX канал"""
+        from pypi_libs_archiver import PyPILibsArchiver
+
+        print("\n" + "═" * 60)
+        print("  Загрузка топ Python библиотек")
+        print("═" * 60)
+
+        try:
+            archiver = PyPILibsArchiver("config.yaml")
+            archiver.load_top_libraries()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"PyPI libs archiver error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def run_pypi_libs_sync(self):
+        """Синхронизировать версии Python библиотек"""
+        from pypi_libs_archiver import PyPILibsArchiver
+
+        print("\n" + "═" * 60)
+        print("  Синхронизация Python библиотек")
+        print("═" * 60)
+
+        try:
+            archiver = PyPILibsArchiver("config.yaml")
+            archiver.sync_libraries()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"PyPI libs sync error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
 
 
 def main():

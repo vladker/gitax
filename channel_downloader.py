@@ -226,6 +226,11 @@ class ChannelDownloader(LogMixin):
             with open(config_path, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f) or {}
 
+        # Приоритет: .env / env var > config.yaml
+        env_channel = os.environ.get('MAX_CHANNEL_URL', '')
+        yaml_channel = config.get('max', {}).get('channel_url', '')
+        config.setdefault('max', {})['channel_url'] = env_channel or yaml_channel
+
         # Set defaults for channel_downloader section
         config.setdefault('channel_downloader', {})
         cd_config = config['channel_downloader']
