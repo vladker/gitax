@@ -353,8 +353,10 @@ class GitHubArchiver(LogMixin):
         print("  [4] Аудит — очистка / восстановление публикаций")
         print("  [5] Экспорт всех сообщений в файл")
         print("  [6] Загрузить медиа из папки")
-        print("  [7] Удалить все сообщения в ленте")
-        print("  [8] Выход")
+        print("  [7] Скачать все файлы из канала")
+        print("  [8] Удалить все сообщения в ленте")
+        print("  [9] Выход")
+        print("  [10] Очистить журналы")
         print()
 
     def _get_user_choice(self, options: list, prompt: str = "Выберите действие") -> str:
@@ -961,6 +963,84 @@ class GitHubArchiver(LogMixin):
 
             elif choice == '3':
                 break
+
+    def _manage_journals(self):
+        """Управление очисткой журналов"""
+        from media_archiver import MediaJournal
+        from channel_downloader import DownloadJournal
+
+        while True:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            print("\n" + "═" * 60)
+            print("Очистка журналов")
+            print("═" * 60)
+
+            # Получить статистику каждого журнала
+            j_stats = self.journal.get_stats()
+            mj = MediaJournal("media_journal.json")
+            mj_stats = mj.get_stats()
+            dj = DownloadJournal("download_journal.json")
+            dj_stats = dj.get_stats()
+
+            print(f"\n  Текущее состояние журналов:")
+            print(f"  [1] journal.json — {j_stats['total']} репозиториев "
+                  f"({j_stats['sent']} отправлено, {j_stats['failed']} ошибок)")
+            print(f"  [2] media_journal.json — {mj_stats['total']} файлов "
+                  f"({mj_stats['sent']} отправлено, {mj_stats['failed']} ошибок)")
+            print(f"  [3] download_journal.json — {dj_stats['total']} файлов "
+                  f"({dj_stats['downloaded']} скачано, {dj_stats['failed']} ошибок)")
+
+            print()
+            print("  [1] Очистить journal.json")
+            print("  [2] Очистить media_journal.json")
+            print("  [3] Очистить download_journal.json")
+            print("  [4] Очистить ВСЕ журналы")
+            print("  [0] Назад")
+            print()
+
+            choice = input("  Ваш выбор [0/1/2/3/4]: ").strip()
+
+            if choice == '0':
+                break
+
+            elif choice == '1':
+                confirm = input("\n  Очистить journal.json? [y/N]: ").strip().lower()
+                if confirm in ('y', 'yes', 'д', 'да'):
+                    self.journal.clear()
+                    print("  ✓ journal.json очищен")
+                else:
+                    print("  Отменено")
+                input("\n  Нажмите Enter для продолжения...")
+
+            elif choice == '2':
+                confirm = input("\n  Очистить media_journal.json? [y/N]: ").strip().lower()
+                if confirm in ('y', 'yes', 'д', 'да'):
+                    MediaJournal("media_journal.json").clear()
+                    print("  ✓ media_journal.json очищен")
+                else:
+                    print("  Отменено")
+                input("\n  Нажмите Enter для продолжения...")
+
+            elif choice == '3':
+                confirm = input("\n  Очистить download_journal.json? [y/N]: ").strip().lower()
+                if confirm in ('y', 'yes', 'д', 'да'):
+                    DownloadJournal("download_journal.json").clear()
+                    print("  ✓ download_journal.json очищен")
+                else:
+                    print("  Отменено")
+                input("\n  Нажмите Enter для продолжения...")
+
+            elif choice == '4':
+                print("\n  ⚠ ВНИМАНИЕ: Будут очищены ВСЕ журналы!")
+                confirm = input("  Введите 'ДА' для подтверждения: ").strip().lower()
+                if confirm in ('да', 'yes', 'дa'):
+                    self.journal.clear()
+                    MediaJournal("media_journal.json").clear()
+                    DownloadJournal("download_journal.json").clear()
+                    print("  ✓ Все журналы очищены")
+                else:
+                    print("  Отменено")
+                input("\n  Нажмите Enter для продолжения...")
 
     # ──────────────────────────────────────────────
     # Audit & Restore Publications
@@ -1936,6 +2016,23 @@ class GitHubArchiver(LogMixin):
 
         input("\n  Нажмите Enter для возврата в меню...")
 
+    # ──────────────────────────────────────────────
+    # Channel File Downloader
+    # ──────────────────────────────────────────────
+
+    def download_channel_files(self):
+        """Скачать все файлы из MAX канала в указанную папку"""
+        from channel_downloader import ChannelDownloader
+
+        try:
+            downloader = ChannelDownloader("config.yaml")
+            downloader.run()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"Channel download error: {e}", exc_info=True)
+
+        # Note: ChannelDownloader.run() handles its own "Press Enter" prompt
+
     def run(self):
         """Запустить главный цикл программы"""
 
@@ -1944,7 +2041,7 @@ class GitHubArchiver(LogMixin):
 
             self._show_menu()
 
-            choice = input("  Выберите действие [1-8]: ").strip()
+            choice = input("  Выберите действие [1-10]: ").strip()
 
             if choice == '1':
                 self.sync_repositories()
@@ -1959,12 +2056,16 @@ class GitHubArchiver(LogMixin):
             elif choice == '6':
                 self.run_media_archiver()
             elif choice == '7':
-                self.delete_all_messages_in_channel()
+                self.download_channel_files()
             elif choice == '8':
+                self.delete_all_messages_in_channel()
+            elif choice == '9':
                 print("\n  До свидания!\n")
                 break
+            elif choice == '10':
+                self._manage_journals()
             else:
-                print("\n  Неверный выбор. Нажмите 1, 2, 3, 4, 5, 6, 7 или 8.")
+                print("\n  Неверный выбор. Нажмите 1..10.")
                 time.sleep(1)
 
 

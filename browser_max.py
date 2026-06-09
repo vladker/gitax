@@ -5470,6 +5470,186 @@ class BrowserMAX(LogMixin):
         print(f"  [EXPORT] Готово! {len(messages)} сообщений → {output_path}")
         return len(messages)
 
+    def scan_channel_for_files(self) -> list[dict]:
+        """
+        Scan all messages in the channel and extract file metadata.
+
+        Uses collect_all_messages() to scroll through and load all messages,
+        then extracts file information from the DOM using CSS selectors.
+
+        Returns:
+            List of dicts with keys:
+            - filename (str): name of the file
+            - download_url (str): URL to download the file
+            - file_size (int): size in bytes (0 if unknown)
+            - message_idx (int): approximate index in the feed
+            - has_direct_url (bool): True if URL is directly downloadable
+            - media_type (str): "file", "video", or "image"
+        """
+        self._check_connection()
+
+        # Scroll to load all messages into DOM (reuse existing infrastructure)
+        # Uses same auto-converge pattern as export feature
+        self.collect_all_messages(passes=2, max_stale=3, overscroll_cycles=3)
+
+        # Extract file info from all loaded messages in a single evaluate call
+        try:
+            file_data = self.page.evaluate(r"""
+                () => {
+                    const results = [];
+                    const seen = new Set();
+
+                    // Find all message-like elements in the feed
+                    const messages = document.querySelectorAll(
+                        '[class*="message"],[class*="msg"],' +
+                        '[class*="lenta-item"],[class*="feed-item"]'
+                    );
+
+                    messages.forEach((msg, idx) => {
+                        let filename = '';
+                        let downloadUrl = '';
+                        let hasDirectUrl = false;
+                        let fileSize = 0;
+                        let mediaType = 'file';
+
+                        // 1. Direct download links: a[download]
+                        const downloadLinks = msg.querySelectorAll('a[download]');
+                        for (const a of downloadLinks) {
+                            const href = a.getAttribute('href') || '';
+                            const name = a.getAttribute('download') || '';
+                            if (name) {
+                                filename = name;
+                                downloadUrl = href;
+                                hasDirectUrl = !!href;
+                                break;
+                            }
+                        }
+
+                        // 2. Alternative download links (a[href*="download"])
+                        if (!filename) {
+                            const altLinks = msg.querySelectorAll(
+                                'a[href*="download"],a[href*="attachment"]'
+                            );
+                            for (const a of altLinks) {
+                                const href = a.getAttribute('href') || '';
+                                if (href) {
+                                    downloadUrl = href;
+                                    hasDirectUrl = true;
+                                    filename = a.textContent?.trim()
+                                        || href.split('/').pop() || '';
+                                    break;
+                                }
+                            }
+                        }
+
+                        // 3. Video elements with src attribute
+                        if (!filename) {
+                            const videos = msg.querySelectorAll('video[src]');
+                            if (videos.length > 0) {
+                                const src = videos[0].getAttribute('src') || '';
+                                downloadUrl = src;
+                                hasDirectUrl = true;
+                                mediaType = 'video';
+                                filename = videos[0].getAttribute('title')
+                                    || src.split('/').pop() || 'video.mp4';
+                            }
+                        }
+
+                        // 4. Image elements (non-emoji, non-avatar)
+                        if (!filename) {
+                            const imgs = msg.querySelectorAll('img[src]');
+                            for (const img of imgs) {
+                                const src = img.getAttribute('src') || '';
+                                if (src && !src.includes('emoji')
+                                    && !src.includes('avatar')) {
+                                    downloadUrl = src;
+                                    hasDirectUrl = true;
+                                    mediaType = 'image';
+                                    filename = img.getAttribute('alt')
+                                        || src.split('/').pop() || 'image.jpg';
+                                    break;
+                                }
+                            }
+                        }
+
+                        // 5. Generic file/attachment indicator classes
+                        if (!filename) {
+                            const fileEls = msg.querySelectorAll(
+                                '[class*="file"],[class*="attach"]'
+                            );
+                            for (const el of fileEls) {
+                                const title = el.getAttribute('title')
+                                    || el.getAttribute('alt') || '';
+                                if (title) {
+                                    filename = title;
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Skip messages without any file indicators
+                        if (!filename) return;
+
+                        // Deduplicate by filename
+                        if (seen.has(filename)) return;
+                        seen.add(filename);
+
+                        // Extract file size from [class*="size"] elements
+                        const sizeEls = msg.querySelectorAll('[class*="size"]');
+                        for (const el of sizeEls) {
+                            const text = el.textContent?.trim()
+                                || el.getAttribute('title') || '';
+                            if (text) {
+                                const match = text.match(
+                                    /([\d.]+)\s*(B|KB|MB|GB)/i
+                                );
+                                if (match) {
+                                    const num = parseFloat(match[1]);
+                                    const unit = match[2].toUpperCase();
+                                    if (unit === 'GB') {
+                                        fileSize = num * 1073741824;
+                                    } else if (unit === 'MB') {
+                                        fileSize = num * 1048576;
+                                    } else if (unit === 'KB') {
+                                        fileSize = num * 1024;
+                                    } else {
+                                        fileSize = num;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+
+                        results.push({
+                            filename: filename,
+                            download_url: downloadUrl,
+                            file_size: fileSize,
+                            message_idx: idx,
+                            has_direct_url: hasDirectUrl,
+                            media_type: mediaType
+                        });
+                    });
+
+                    return results;
+                }
+            """)
+        except Exception:
+            self.logger.warning("scan_channel_for_files: evaluate failed", exc_info=True)
+            return []
+
+        if file_data:
+            # Deduplicate by filename (redundant with JS-side dedup,
+            # but covers edge cases where evaluate returns duplicates)
+            seen = set()
+            deduped = []
+            for item in file_data:
+                fname = item.get("filename", "")
+                if fname and fname not in seen:
+                    seen.add(fname)
+                    deduped.append(item)
+            return deduped
+        return []
+
     def close(self):
         """Close browser connection gracefully"""
         self.logger.debug("Closing connection...")

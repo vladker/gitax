@@ -80,6 +80,12 @@ class Journal(LogMixin):
             "total_failed": 0
         }
 
+    def clear(self):
+        """Очистить журнал — сбросить все данные"""
+        self.data = self._create_empty()
+        self.save()
+        self.logger.info("Journal cleared")
+
     def save(self):
         """Сохранить журнал в файл (атомарная запись)"""
         if not self._acquire_lock():

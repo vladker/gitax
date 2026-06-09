@@ -69,6 +69,11 @@ class MediaJournal:
         """Создать пустой журнал"""
         return {"entries": []}
 
+    def clear(self):
+        """Очистить журнал — сбросить все данные"""
+        self.data = self._create_empty()
+        self.save()
+
     def save(self):
         """Сохранить журнал в файл (атомарная запись)"""
         if not self._acquire_lock():
