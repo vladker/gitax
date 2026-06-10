@@ -22,7 +22,7 @@ from github_api import GitHubAPI
 from browser_max import BrowserMAX
 from scroll_registry import ScrollRegistry
 from pypi_libs_journal import PyPILibsJournal
-from config_utils import get_channel_url
+from config_utils import get_channel_url, is_setup_complete, ensure_channel_url, get_skipped_channels
 
 
 class GracefulShutdown:
@@ -237,6 +237,57 @@ class GitHubArchiver(LogMixin):
         except Exception as e:
             logger.warning(f"Orphaned file check error: {e}")
 
+    def _ensure_channel_ready(self, channel_name: str, label: str,
+                              config_section: str = None) -> bool:
+        """
+        Ensure a channel URL is configured. If missing, prompt interactively
+        and save to .env. Updates self.config so subsequent code finds the URL.
+
+        Args:
+            channel_name: Channel key name (e.g., "max", "pypi", "media", "backup")
+            label: Human-readable label for prompts (e.g., "MAX канал")
+            config_section: Optional section in self.config to update
+                            (e.g., "max" for self.config['max']['channel_url'])
+
+        Returns:
+            True if URL is available (after optional prompt), False if user skips
+        """
+        url = ensure_channel_url(self.config, channel_name, label)
+        if not url:
+            return False
+
+        # Update self.config so subsequent internal lookups find the URL
+        env_var = f"CHANNEL_{channel_name.upper()}"
+        env_val = os.environ.get(env_var, "").strip()
+        if env_val:
+            self.config.setdefault("channels", {})[channel_name] = env_val
+            if config_section:
+                self.config.setdefault(config_section, {})["channel_url"] = env_val
+        return True
+
+    # Module-to-channel mapping for skip-aware UI
+    _MODULE_CHANNELS = {
+        "1": "max",     # GitHub → max
+        "2": "pypi",    # PyPI → pypi
+        "3": "backup",  # Backuper → backup
+        "4": "media",   # Файлы → media
+    }
+
+    def _is_module_enabled(self, menu_key: str) -> bool:
+        """
+        Check if a main menu module is enabled (not skipped in setup).
+
+        Args:
+            menu_key: Main menu key ("1".."5")
+
+        Returns:
+            True if module is enabled or always-available (service menu)
+        """
+        ch = self._MODULE_CHANNELS.get(menu_key)
+        if not ch:
+            return True  # Module 5 (service) always enabled
+        return ch not in get_skipped_channels(self.config)
+
     def _load_config(self, config_path: str) -> dict:
         """Загрузить конфигурацию (config.yaml опционален)"""
         load_dotenv()
@@ -252,13 +303,10 @@ class GitHubArchiver(LogMixin):
             config.setdefault('github', {})['token'] = env_token
 
         # Channel URL: standardized via config_utils
-        channel_url = get_channel_url(config, "max", label="MAX канал")
+        channel_url = get_channel_url(config, "max", label="MAX канал", required=False)
         config.setdefault('max', {})['channel_url'] = channel_url
 
-        if not config.get('github', {}).get('token'):
-            print("✗ GitHub token не указан.")
-            print("  Укажите GITHUB_TOKEN в .env файле или переменной окружения")
-            sys.exit(1)
+
 
         return config
 
@@ -360,15 +408,32 @@ class GitHubArchiver(LogMixin):
     def _show_main_menu(self):
         """Показать главное меню"""
         self._show_header()
-        ignored_count = self.journal.get_ignored_count()
-        ignored_str = f" ({ignored_count} в игноре)" if ignored_count else ""
-        print()
-        print("  [1] GitHub — репозитории")
-        print("  [2] PyPI — Python библиотеки")
-        print("  [3] Backuper — бэкап папок в канал")
-        print("  [4] Файлы — медиа, скачивание, экспорт")
+
+        if not is_setup_complete(self.config):
+            print("\n  ⚡ Требуется начальная настройка")
+            print()
+            print("  [0] ⚡ Начальная настройка")
+        else:
+            print()
+
+        skipped = get_skipped_channels(self.config)
+
+        def menu_item(num, name, channel):
+            if channel in skipped:
+                return f"  [{num}] {name}  (отключён)"
+            return f"  [{num}] {name}"
+
+        print(menu_item("1", "GitHub — репозитории", "max"))
+        print(menu_item("2", "PyPI — Python библиотеки", "pypi"))
+        print(menu_item("3", "Backuper — бэкап папок в канал", "backup"))
+        print(menu_item("4", "Файлы — медиа, скачивание, экспорт", "media"))
         print("  [5] Сервис — журналы, настройки")
-        print("  [0] Выход")
+
+        if not is_setup_complete(self.config):
+            print("  [X] Выход")
+        else:
+            print("  [0] Выход")
+
         print()
 
     def _github_menu(self):
@@ -417,6 +482,8 @@ class GitHubArchiver(LogMixin):
         print("─" * 60)
         print()
         print("  [1] Очистить журналы")
+        if is_setup_complete(self.config):
+            print("  [2] ⚙ Настройки")
         print("  [0] Назад")
         print()
 
@@ -433,6 +500,10 @@ class GitHubArchiver(LogMixin):
         print("\n" + "═" * 60)
         print("Синхронизация репозиториев")
         print("═" * 60)
+
+        if not self._ensure_channel_ready("max", "MAX канал", "max"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
 
         if not self.journal.get_count():
             print("\n  ⚠ Журнал пуст. Нет репозиториев для проверки.")
@@ -618,6 +689,10 @@ class GitHubArchiver(LogMixin):
         print("\n" + "═" * 60)
         print("Загрузка новых репозиториев")
         print("═" * 60)
+
+        if not self._ensure_channel_ready("max", "MAX канал", "max"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
 
         limit = self.config.get('archiver', {}).get('limit', 100)
 
@@ -1288,6 +1363,10 @@ class GitHubArchiver(LogMixin):
         print("          АУДИТ — ОЧИСТКА / ВОССТАНОВЛЕНИЕ ПУБЛИКАЦИЙ")
         print("═" * 60)
 
+        if not self._ensure_channel_ready("max", "MAX канал", "max"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
         self._init_github()
 
         browser = None
@@ -1908,6 +1987,10 @@ class GitHubArchiver(LogMixin):
         print("          ЭКСПОРТ СООБЩЕНИЙ ИЗ ЛЕНТЫ")
         print("═" * 60)
 
+        if not self._ensure_channel_ready("max", "MAX канал", "max"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
         print("\n  Собирает все сообщения из ленты MAX со всеми деталями:")
         print("  • текст, отправитель, время, направление")
         print("  • вложения, реакции, флаги ответа/пересылки")
@@ -2022,6 +2105,10 @@ class GitHubArchiver(LogMixin):
         print("          УДАЛЕНИЕ ВСЕХ СООБЩЕНИЙ")
         print("═" * 60)
 
+        if not self._ensure_channel_ready("max", "MAX канал", "max"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
         print("\n  ⚠ ВНИМАНИЕ: Это действие удалит ВСЕ сообщения в канале!")
         print("  Это необратимо — восстановить их будет невозможно.")
         print()
@@ -2099,6 +2186,10 @@ class GitHubArchiver(LogMixin):
         print("  Загрузка медиа из папки")
         print("═" * 60)
 
+        if not self._ensure_channel_ready("media", "Media канал", "media_archiver"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
         try:
             media = MediaArchiver("config.yaml")
             media.run()
@@ -2114,6 +2205,10 @@ class GitHubArchiver(LogMixin):
 
     def download_channel_files(self):
         """Скачать все файлы из MAX канала в указанную папку"""
+        if not self._ensure_channel_ready("max", "MAX канал", "max"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
         from channel_downloader import ChannelDownloader
 
         try:
@@ -2125,18 +2220,215 @@ class GitHubArchiver(LogMixin):
 
         # Note: ChannelDownloader.run() handles its own "Press Enter" prompt
 
+    def _show_auto_prompt(self):
+        """Показать приветствие при первом запуске без настройки"""
+        print("\n" + "╔" + "═" * 56 + "╗")
+        print("║               ДОБРО ПОЖАЛОВАТЬ В GITHUB ARCHIVER             ║")
+        print("║" + " " * 58 + "║")
+        print("║  Программа не настроена. Для работы необходимо указать:      ║")
+        print("║  • GitHub токен для доступа к API                            ║")
+        print("║  • URL каналов MAX для разных типов архивов                  ║")
+        print("║" + " " * 58 + "║")
+        print("║  [Enter] Выполнить начальную настройку                       ║")
+        print("║  [S] Пропустить (пункт настройки будет в меню)               ║")
+        print("╚" + "═" * 56 + "╝")
+        print()
+
+        try:
+            choice = input("  Ваш выбор [Enter/S]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return
+
+        if choice != "s":
+            self._initial_setup()
+
+    def _initial_setup(self):
+        """Интерактивный мастер начальной настройки (6 шагов)"""
+        import tempfile
+        import shutil
+        from config_utils import set_env_value as _set_env
+
+        print("\n" + "═" * 60)
+        print("        НАЧАЛЬНАЯ НАСТРОЙКА")
+        print("═" * 60)
+        print()
+
+        # ── Шаг 1: GitHub токен ──
+        current_token = os.environ.get("GITHUB_TOKEN", "")
+        if len(current_token) > 8:
+            masked = current_token[:4] + "*" * (len(current_token) - 8) + current_token[-4:]
+        elif current_token:
+            masked = current_token[:4] + "****"
+        else:
+            masked = "(не указан)"
+        print(f"  Шаг 1 из 6: GitHub токен")
+        print(f"  Текущее: {masked}")
+        try:
+            val = input("  Введите токен (Enter = оставить): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            val = ""
+        if val:
+            _set_env("GITHUB_TOKEN", val)
+        elif not current_token:
+            print("  ⚠ Токен не указан. Программа не сможет работать с GitHub API.")
+
+        # ── Шаги 2-5: URL каналов с возможностью пропуска ──
+        channel_steps = [
+            ("max",   "MAX канал (GitHub архивы)"),
+            ("pypi",  "PyPI канал"),
+            ("media", "Media канал"),
+            ("backup","Backup канал"),
+        ]
+
+        # Track skipped channels for this wizard session
+        new_skipped = list(get_skipped_channels(self.config))
+        total = 6
+
+        for step_num, (ch_name, ch_label) in enumerate(channel_steps, 2):
+            env_var = f"CHANNEL_{ch_name.upper()}"
+            current_url = os.environ.get(env_var, "")
+            if not current_url:
+                channels = self.config.get("channels", {}) or {}
+                current_url = channels.get(ch_name, "")
+            display = current_url if current_url else "(не указан)"
+            already_skipped = ch_name in new_skipped
+
+            print(f"\n  Шаг {step_num} из {total}: {ch_label}")
+            print(f"  Текущее: {display}")
+            if already_skipped:
+                print("  (модуль отключён)")
+            print()
+            print("  [Enter] Ввести URL / Оставить текущий")
+            print("  [S] Пропустить — отключить модуль")
+            if already_skipped:
+                print("  [E] Включить модуль")
+            print()
+
+            try:
+                choice = input("  Ваш выбор [Enter/S]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                choice = ""
+
+            if choice == "s":
+                if ch_name not in new_skipped:
+                    new_skipped.append(ch_name)
+                print(f"  → Модуль \"{ch_label}\" отключён.")
+            elif choice == "e" and already_skipped:
+                new_skipped = [c for c in new_skipped if c != ch_name]
+                try:
+                    url = input(f"  Введите URL {ch_label}: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    url = ""
+                if url:
+                    _set_env(env_var, url)
+            elif choice:
+                # User entered a URL
+                _set_env(env_var, choice)
+                # If it was skipped, enable it
+                if ch_name in new_skipped:
+                    new_skipped = [c for c in new_skipped if c != ch_name]
+            # Enter with existing URL = keep as-is
+            # If currently skipped and user just pressed Enter, keep skipped
+
+        # ── Шаг 6: Параметры архивации ──
+        print(f"\n  Шаг 6 из 6: Параметры архивации")
+        archiver_cfg = self.config.get("archiver", {})
+
+        try:
+            limit_str = input(f"  Лимит репозиториев [{archiver_cfg.get('limit', 100)}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            limit_str = ""
+        try:
+            retries_str = input(f"  Retries [{archiver_cfg.get('retries', 3)}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            retries_str = ""
+        try:
+            delay_str = input(f"  Задержка между репо (сек) [{archiver_cfg.get('repo_delay', 30)}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            delay_str = ""
+        try:
+            split_str = input(f"  Порог разделения (MB) [{archiver_cfg.get('split_threshold_mb', 49)}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            split_str = ""
+
+        # Write step 6 to config.yaml (merge, preserve existing keys)
+        yaml_config = {}
+        if os.path.exists("config.yaml"):
+            with open("config.yaml", "r", encoding="utf-8") as f:
+                yaml_config = yaml.safe_load(f) or {}
+
+        yaml_config.setdefault("archiver", {})
+        if limit_str:
+            yaml_config["archiver"]["limit"] = int(limit_str)
+        if retries_str:
+            yaml_config["archiver"]["retries"] = int(retries_str)
+        if delay_str:
+            yaml_config["archiver"]["repo_delay"] = int(delay_str)
+        if split_str:
+            yaml_config["archiver"]["split_threshold_mb"] = int(split_str)
+
+        # Write skipped channels to setup section
+        yaml_config.setdefault("setup", {})["skipped_channels"] = sorted(new_skipped)
+
+        # Atomic write for config.yaml
+        fd, tmp_path = tempfile.mkstemp(suffix=".yaml", dir=".")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                yaml.dump(yaml_config, f, default_flow_style=False, allow_unicode=True)
+            shutil.move(tmp_path, "config.yaml")
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+
+        # ── Reload config to pick up all changes ──
+        load_dotenv(override=True)
+        self.config = self._load_config("config.yaml")
+
+        print(f"\n  ✓ Настройка завершена!")
+        print(f"  Переменные сохранены в .env и config.yaml")
+        input("\n  Нажмите Enter для продолжения...")
+
     def run(self):
         """Запустить главный цикл программы"""
+
+        # Auto-prompt on first launch if setup is incomplete
+        if not is_setup_complete(self.config):
+            self._show_auto_prompt()
 
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
 
             self._show_main_menu()
 
-            choice = input("  Выберите раздел [0-5]: ").strip()
+            needs_setup = not is_setup_complete(self.config)
+            prompt = "[0/X,1-5]" if needs_setup else "[0-5]"
+            choice = input(f"  Выберите раздел {prompt}: ").strip().lower()
 
-            # ── Главное меню ──
-            if choice == '0':
+            # ── Check if selected module is disabled ──
+            if choice in ("1", "2", "3", "4") and not self._is_module_enabled(choice):
+                module_names = {"1": "GitHub", "2": "PyPI", "3": "Backuper", "4": "Файлы"}
+                mod_name = module_names.get(choice, "")
+                print(f"\n  ⚠ Модуль \"{mod_name}\" отключён в настройках.")
+                print()
+                print("  [Enter] Включить и настроить")
+                print("  [S] Вернуться в меню")
+                print()
+                try:
+                    sub = input("  Ваш выбор [Enter/S]: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    sub = ""
+                if sub != "s":
+                    self._initial_setup()
+                continue
+
+            # ── State-aware dispatch ──
+            if needs_setup and choice == '0':
+                self._initial_setup()
+            elif needs_setup and choice == 'x':
+                print("\n  До свидания!\n")
+                break
+            elif not needs_setup and choice == '0':
                 print("\n  До свидания!\n")
                 break
             elif choice == '1':
@@ -2245,14 +2537,18 @@ class GitHubArchiver(LogMixin):
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
             self._service_menu()
-            choice = input("  Выберите действие [0-1]: ").strip()
+            setup_done = is_setup_complete(self.config)
+            prompt = "[0-2]" if setup_done else "[0-1]"
+            choice = input(f"  Выберите действие {prompt}: ").strip()
 
             if choice == '0':
                 break
             elif choice == '1':
                 self._manage_journals()
+            elif choice == '2' and setup_done:
+                self._initial_setup()
             else:
-                print("\n  Неверный выбор. Нажмите 0..1.")
+                print("\n  Неверный выбор.")
                 time.sleep(1)
 
 
@@ -2263,6 +2559,10 @@ class GitHubArchiver(LogMixin):
         print("\n" + "═" * 60)
         print("  Загрузка топ Python библиотек")
         print("═" * 60)
+
+        if not self._ensure_channel_ready("pypi", "PyPI канал", "pypi_libs"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
 
         try:
             archiver = PyPILibsArchiver("config.yaml")
@@ -2281,6 +2581,10 @@ class GitHubArchiver(LogMixin):
         print("  Синхронизация Python библиотек")
         print("═" * 60)
 
+        if not self._ensure_channel_ready("pypi", "PyPI канал", "pypi_libs"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
         try:
             archiver = PyPILibsArchiver("config.yaml")
             archiver.sync_libraries()
@@ -2298,6 +2602,10 @@ class GitHubArchiver(LogMixin):
         print("  Бэкап — архивация папки в канал MAX")
         print("═" * 60)
 
+        if not self._ensure_channel_ready("backup", "Backup канал", "backup"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
         try:
             backuper = Backuper("config.yaml")
             backuper.run_backup()
@@ -2314,6 +2622,10 @@ class GitHubArchiver(LogMixin):
         print("\n" + "═" * 60)
         print("  Восстановление — скачивание архивов из канала MAX")
         print("═" * 60)
+
+        if not self._ensure_channel_ready("backup", "Backup канал", "backup"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
 
         try:
             backuper = Backuper("config.yaml")
