@@ -606,6 +606,7 @@ class GitHubArchiver(LogMixin):
         failed_names = []
         total_to_update = has_update_count
         repo_delay = self.config.get('archiver', {}).get('repo_delay', 30)
+        split_mode = get_split_mode(self.config, "archiver", default="auto")
 
         for i, (repo, has_new, latest_version) in enumerate(repo_updates, 1):
             if not has_new:
@@ -648,7 +649,8 @@ class GitHubArchiver(LogMixin):
                 text=text,
                 filepath=zip_path,
                 retries=self.config.get('archiver', {}).get('retries', 3),
-                retry_delay=self.config.get('archiver', {}).get('retry_delay', 10)
+                retry_delay=self.config.get('archiver', {}).get('retry_delay', 10),
+                split_mode=split_mode,
             )
 
             if success:
