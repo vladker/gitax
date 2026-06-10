@@ -223,6 +223,8 @@ class Backuper(LogMixin):
             f"📊 Томов: {len(volumes)} | {self._format_size(total_size)}\n"
             f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         )
+        if password_hint:
+            msg_text += f"\n🔑 Подсказка: {password_hint}"
 
         retries = int(self.config.get("backuper", {}).get("retries", 3))
         retry_delay = int(self.config.get("backuper", {}).get("retry_delay", 10))
