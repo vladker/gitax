@@ -27,7 +27,9 @@ archiver:
   output_dir: "./temp"
   # false = connect to existing Chrome via CDP, true = launch new browser
   use_local_browser: false
-  # Files above this size (MB) are split into 7z volumes
+  # Split mode: auto (threshold-based), on (always split), off (never split), prompt (ask per-file)
+  split_mode: auto
+  # Files above this size (MB) are split into 7z volumes (only when split_mode=auto)
   split_threshold_mb: 49
 
 pypi:

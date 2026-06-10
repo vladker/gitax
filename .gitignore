@@ -28,10 +28,9 @@ ENV/
 
 # Config and secrets
 config.yaml
-*.yaml
-*.yml
 *.json
 *.auth-state.json
+# Note: .yaml.example files ARE tracked (safe templates)
 
 # Environment variables
 .env
@@ -66,6 +65,5 @@ restored/
 
 # Debug screenshots and test files
 debug*.png
-test_*.py
 inspect_*.py
 *.bat
