@@ -134,14 +134,33 @@ class BackuperJournal(LogMixin):
         self.save()
         return True
 
-    def store_password(self, archive_name: str, password: str):
-        """Store password for an archive"""
-        self.data.setdefault("passwords", {})[archive_name] = password
+    def store_password(self, archive_name: str, password: str, hint: str | None = None):
+        """Store password (and optional hint) for an archive
+
+        Args:
+            archive_name: Name of the archive
+            password: The password string
+            hint: Optional hint to help remember the password
+        """
+        entry = {"password": password}
+        if hint:
+            entry["hint"] = hint
+        self.data.setdefault("passwords", {})[archive_name] = entry
         self.save()
 
     def get_password(self, archive_name: str) -> str | None:
-        """Retrieve password for an archive"""
-        return self.data.get("passwords", {}).get(archive_name)
+        """Retrieve password for an archive (handles old and new format)"""
+        val = self.data.get("passwords", {}).get(archive_name)
+        if isinstance(val, dict):
+            return val.get("password")
+        return val  # old format: plain string
+
+    def get_password_hint(self, archive_name: str) -> str | None:
+        """Retrieve password hint for an archive"""
+        val = self.data.get("passwords", {}).get(archive_name)
+        if isinstance(val, dict):
+            return val.get("hint")
+        return None
 
     def has_password(self, archive_name: str) -> bool:
         """Check if password exists for archive"""

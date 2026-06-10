@@ -165,11 +165,16 @@ class Backuper(LogMixin):
         # 4. Password
         use_password = input("  Использовать пароль? [y/N]: ").strip().lower() == "y"
         password = None
+        password_hint = None
         if use_password:
             password = input("  Пароль: ").strip()
             if not password:
                 print("  Пароль пустой, отменяю шифрование.")
                 use_password = False
+            else:
+                hint = input("  Подсказка для пароля (оставьте пустым, если не нужна): ").strip()
+                if hint:
+                    password_hint = hint
 
         # 5. Duplicate check
         content_hash = self.journal.compute_content_hash(source_path)
@@ -243,7 +248,7 @@ class Backuper(LogMixin):
                 "status": "uploaded",
             })
             if use_password:
-                self.journal.store_password(archive_name, password)
+                self.journal.store_password(archive_name, password, hint=password_hint)
         else:
             print("  ✗ Отправка не удалась. Удаляю тома.")
             self.journal.add_backup({
@@ -305,8 +310,11 @@ class Backuper(LogMixin):
             for i, arch in enumerate(page_archives, start_idx + 1):
                 name = arch.get("archive_name", "?")
                 vol_count = arch.get("volume_count", 1)
+                hint = self.journal.get_password_hint(name)
                 display = name[:37] + "..." if len(name) > 40 else name
-                print(f"  {i:>3}  {display:<40} {vol_count:>5}")
+                if hint:
+                    display += f" [{hint[:20]}]"
+                print(f"  {i:>3}  {display:<60} {vol_count:>5}")
 
             print(f"\n  [←] Пред.  [→] След.  [1] Скачать выбранные  [2] Скачать все  [0] Выход")
             action = input("  Действие: ").strip().lower()
@@ -384,6 +392,9 @@ class Backuper(LogMixin):
             pw = None
             if pw_mode == "1" and global_password:
                 pw = global_password
+                # Store global password + hint for this archive
+                if not self.journal.has_password(archive_name):
+                    self.journal.store_password(archive_name, global_password)
             elif pw_mode == "2":
                 # Check journal first
                 saved_pw = self.journal.get_password(archive_name)
@@ -391,8 +402,13 @@ class Backuper(LogMixin):
                     use_saved = input(f"    Использовать сохранённый пароль для '{archive_name}'? [Y/n]: ").strip().lower()
                     if use_saved != "n":
                         pw = saved_pw
+                        hint = self.journal.get_password_hint(archive_name)
+                        if hint:
+                            print(f"    Подсказка: {hint}")
                     else:
                         pw = input(f"    Новый пароль для '{archive_name}': ").strip()
+                        if pw:
+                            self.journal.store_password(archive_name, pw)
                 else:
                     pw = input(f"    Пароль для '{archive_name}' (пусто = без пароля): ").strip()
                     if pw:

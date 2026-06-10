@@ -58,6 +58,11 @@ Thumbs.db
 
 # Journal backup
 *.backup.json
+*.bak
+
+# Backup temp files
+temp_backups/
+restored/
 
 # Debug screenshots and test files
 debug*.png
