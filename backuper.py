@@ -144,7 +144,13 @@ class Backuper(LogMixin):
         if not archive_name:
             archive_name = default_name
 
-        # 3. Volume mode
+        # 3. Description
+        print()
+        print("  Описание архива (необязательно):")
+        print("  Будет добавлено в сообщение при отправке в канал.")
+        description = input("  Описание: ").strip()
+
+        # 4. Volume mode
         print("\n  Режим томов:")
         print("    [1] Однотомный архив")
         print("    [2] Многотомный (размер из конфига)")
@@ -162,7 +168,7 @@ class Backuper(LogMixin):
         elif vol_choice != "1":
             print("  Неверный выбор, использую однотомный архив.")
 
-        # 4. Password
+        # 5. Password
         use_password = input("  Использовать пароль? [y/N]: ").strip().lower() == "y"
         password = None
         password_hint = None
@@ -176,7 +182,7 @@ class Backuper(LogMixin):
                 if hint:
                     password_hint = hint
 
-        # 5. Duplicate check
+        # 6. Duplicate check
         content_hash = self.journal.compute_content_hash(source_path)
         if self.journal.is_duplicate_by_hash(content_hash):
             confirm = input("  ⚠ Уже есть бэкап с таким содержимым. Переписать? [y/N]: ").strip().lower()
@@ -184,7 +190,7 @@ class Backuper(LogMixin):
                 print("  Отменено.")
                 return
 
-        # 6. Archive
+        # 7. Archive
         output_dir = self.config.get("backuper", {}).get("output_dir", "./temp_backups")
         output_base = os.path.join(output_dir, archive_name) + ".7z"
         comp_level = int(self.config.get("backuper", {}).get("compression_level", "5"))
@@ -223,6 +229,8 @@ class Backuper(LogMixin):
             f"📊 Томов: {len(volumes)} | {self._format_size(total_size)}\n"
             f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         )
+        if description:
+            msg_text = f"📝 {description}\n\n{msg_text}"
         if password_hint:
             msg_text += f"\n🔑 Подсказка: {password_hint}"
 
@@ -248,6 +256,7 @@ class Backuper(LogMixin):
                 "encrypted": use_password,
                 "total_size": total_size,
                 "status": "uploaded",
+                "description": description or "",
             })
             if use_password:
                 self.journal.store_password(archive_name, password, hint=password_hint)
@@ -261,6 +270,7 @@ class Backuper(LogMixin):
                 "encrypted": use_password,
                 "total_size": total_size,
                 "status": "failed",
+                "description": description or "",
             })
 
         cleanup_volumes(volumes)
@@ -313,9 +323,14 @@ class Backuper(LogMixin):
                 name = arch.get("archive_name", "?")
                 vol_count = arch.get("volume_count", 1)
                 hint = self.journal.get_password_hint(name)
+                # Try to get description from journal
+                entry = self.journal.get_backup(name)
+                desc = (entry or {}).get("description", "") or ""
                 display = name[:37] + "..." if len(name) > 40 else name
+                if desc:
+                    display += f" [{desc[:20]}]"
                 if hint:
-                    display += f" [{hint[:20]}]"
+                    display += f" 🔑{hint[:15]}"
                 print(f"  {i:>3}  {display:<60} {vol_count:>5}")
 
             print(f"\n  [←] Пред.  [→] След.  [1] Скачать выбранные  [2] Скачать все  [0] Выход")
