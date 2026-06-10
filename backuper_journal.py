@@ -16,7 +16,7 @@ from logging_config import LogMixin
 
 
 class BackuperJournal(LogMixin):
-    """Backup and download journal with password storage"""
+    """Backup and download journal with password protection tracking"""
 
     def __init__(self, file_path: str = "backuper_journal.json"):
         self.file_path = file_path
@@ -60,7 +60,13 @@ class BackuperJournal(LogMixin):
 
     def _create_empty(self) -> dict:
         """Create empty journal structure"""
-        return {"backups": [], "downloads": [], "passwords": {}, "files": {}}
+        return {
+            "backups": [],
+            "downloads": [],
+            "password_protected": [],
+            "password_hints": {},
+            "files": {}
+        }
 
     def clear(self):
         """Clear journal — reset all data"""
@@ -134,37 +140,40 @@ class BackuperJournal(LogMixin):
         self.save()
         return True
 
-    def store_password(self, archive_name: str, password: str, hint: str | None = None):
-        """Store password (and optional hint) for an archive
+    def mark_password_protected(self, archive_name: str):
+        """Mark an archive as password-protected (boolean flag only, no password stored).
+
+        C1 fix: Passwords are NEVER stored in the journal. Only a boolean flag
+        tracks which archives require a password. The restore flow prompts
+        the user interactively.
 
         Args:
             archive_name: Name of the archive
-            password: The password string
-            hint: Optional hint to help remember the password
         """
-        entry = {"password": password}
-        if hint:
-            entry["hint"] = hint
-        self.data.setdefault("passwords", {})[archive_name] = entry
+        protected = self.data.setdefault("password_protected", [])
+        if archive_name not in protected:
+            protected.append(archive_name)
         self.save()
 
-    def get_password(self, archive_name: str) -> str | None:
-        """Retrieve password for an archive (handles old and new format)"""
-        val = self.data.get("passwords", {}).get(archive_name)
-        if isinstance(val, dict):
-            return val.get("password")
-        return val  # old format: plain string
+    def store_password_hint(self, archive_name: str, hint: str):
+        """Store an optional hint to help remember a password.
+
+        Args:
+            archive_name: Name of the archive
+            hint: Hint text (not the password itself)
+        """
+        if hint:
+            self.data.setdefault("password_hints", {})[archive_name] = hint
+            self.save()
 
     def get_password_hint(self, archive_name: str) -> str | None:
         """Retrieve password hint for an archive"""
-        val = self.data.get("passwords", {}).get(archive_name)
-        if isinstance(val, dict):
-            return val.get("hint")
-        return None
+        return self.data.get("password_hints", {}).get(archive_name)
 
     def has_password(self, archive_name: str) -> bool:
-        """Check if password exists for archive"""
-        return archive_name in self.data.get("passwords", {})
+        """Check if archive is marked as password-protected"""
+        protected = self.data.get("password_protected", [])
+        return archive_name in protected
 
     def get_backup(self, archive_name: str) -> dict | None:
         """Get latest backup entry by archive name"""
@@ -195,7 +204,7 @@ class BackuperJournal(LogMixin):
     def compute_content_hash(self, source_path: str) -> str:
         """
         Compute quick hash of directory contents.
-        Hash is based on file list (relative path + size + mtime), not file contents.
+        Hash is based on actual file content (first 4KB) + relative path + size.
 
         Args:
             source_path: Path to directory
@@ -214,7 +223,10 @@ class BackuperJournal(LogMixin):
                 try:
                     rel = os.path.relpath(fp, source_path)
                     stat = os.stat(fp)
-                    file_list.append(f"{rel}|{stat.st_size}|{stat.st_mtime}")
+                    content_hash = hashlib.sha256()
+                    with open(fp, 'rb') as fh:
+                        content_hash.update(fh.read(4096))
+                    file_list.append(f"{rel}|{stat.st_size}|{content_hash.hexdigest()}")
                 except OSError:
                     pass
 
@@ -231,7 +243,7 @@ class BackuperJournal(LogMixin):
             "failed": len([b for b in backups if b.get("status") == "failed"]),
             "total_downloads": len(downloads),
             "completed_downloads": len([d for d in downloads if d.get("status") == "completed"]),
-            "passwords_stored": len(self.data.get("passwords", {})),
+            "password_protected": len(self.data.get("password_protected", [])),
         }
 
     def get_count(self) -> int:

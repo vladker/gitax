@@ -33,9 +33,26 @@ class GitHubAPI(LogMixin):
     BASE_URL = "https://api.github.com"
     DEFAULT_TIMEOUT = 30  # seconds for API requests
 
+    @staticmethod
+    def _mask_token(token: str) -> str:
+        """Return a safely masked version of the token for logging.
+
+        Shows only the first 3 characters and last 2 characters,
+        replacing everything in between with asterisks.
+        For short tokens (< 6 chars), returns '[token:****]'.
+        """
+        if len(token) < 6:
+            return "[token:****]"
+        return token[:3] + "*" * (len(token) - 5) + token[-2:]
+
+    def __repr__(self) -> str:
+        """Safe representation that never exposes the token."""
+        return f"GitHubAPI(token={self._mask_token(self.token)!r}, output_dir={self.output_dir!r})"
+
     def __init__(self, token: str, output_dir: str = "./temp"):
         self.token = token
         self.output_dir = output_dir
+        self.logger.info(f"GitHubAPI initialized with token {self._mask_token(token)}")
         self.session = self._create_session()
         self._ensure_output_dir()
 
@@ -80,13 +97,27 @@ class GitHubAPI(LogMixin):
                 raise GitHubAPIError(f"Cannot connect to GitHub: {e}")
 
             if response.status_code == 403:
+                remaining = response.headers.get('X-RateLimit-Remaining')
                 reset_time = response.headers.get('X-RateLimit-Reset')
-                if reset_time:
+                body_preview = response.text.lower()[:500] if response.text else ""
+                is_rate_limit = (
+                    remaining is not None and remaining == "0"
+                ) or (
+                    "rate limit" in body_preview
+                )
+
+                if is_rate_limit and reset_time:
                     wait_time = int(reset_time) - int(time.time()) + 5
                     if wait_time > 0:
                         self.logger.warning(f"Rate limit exceeded. Waiting {wait_time}s...")
                         time.sleep(min(wait_time, 60))
                         continue
+                elif is_rate_limit:
+                    raise RateLimitError("GitHub rate limit exceeded. Please wait before retrying.")
+                else:
+                    raise GitHubAPIError(
+                        "Permission denied (403). Check that your token is valid and has the required scopes."
+                    )
 
             if response.status_code == 404:
                 raise NotFoundError(f"Resource not found: {endpoint}")

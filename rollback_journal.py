@@ -6,33 +6,58 @@ to their original SENT status.
 """
 import json
 import os
+import shutil
+import tempfile
 
 JOURNAL_PATH = "journal.json"
 
-if not os.path.exists(JOURNAL_PATH):
-    print(f"[ERROR] {JOURNAL_PATH} not found")
-    exit(1)
 
-with open(JOURNAL_PATH, "r", encoding="utf-8") as f:
-    data = json.load(f)
+def rollback():
+    """Revert CLEANED entries back to SENT status with atomic write."""
+    if not os.path.exists(JOURNAL_PATH):
+        print(f"[ERROR] {JOURNAL_PATH} not found")
+        return
 
-repos = data.get("repositories", [])
-reverted = 0
+    with open(JOURNAL_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-for repo in repos:
-    if repo.get("status") == "cleaned" and not repo.get("restored_at"):
-        repo["status"] = "sent"
-        reverted += 1
+    repos = data.get("repositories", [])
+    reverted = 0
 
-if reverted:
-    data["total_sent"] = len([r for r in repos if r.get("status") == "sent"])
-    data["total_incomplete"] = len([r for r in repos if r.get("status") == "incomplete"])
-    data["total_restored"] = len([r for r in repos if r.get("status") == "restored"])
-    data["total_failed"] = len([r for r in repos if r.get("status") == "failed"])
+    for repo in repos:
+        if repo.get("status") == "cleaned" and not repo.get("restored_at"):
+            repo["status"] = "sent"
+            reverted += 1
 
-    with open(JOURNAL_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    if reverted:
+        data["total_sent"] = len([r for r in repos if r.get("status") == "sent"])
+        data["total_incomplete"] = len([r for r in repos if r.get("status") == "incomplete"])
+        data["total_restored"] = len([r for r in repos if r.get("status") == "restored"])
+        data["total_failed"] = len([r for r in repos if r.get("status") == "failed"])
 
-    print(f"[OK] Откачено {reverted} записей: cleaned -> sent")
-else:
-    print("  Нет записей со статусом 'cleaned'")
+        # Atomic write: temp file → backup → replace (same pattern as journal.py)
+        temp_fd, temp_path = tempfile.mkstemp(
+            suffix='.json',
+            dir=os.path.dirname(JOURNAL_PATH) or '.'
+        )
+
+        try:
+            with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            backup_path = f"{JOURNAL_PATH}.bak"
+            shutil.copy2(JOURNAL_PATH, backup_path)
+
+            os.replace(temp_path, JOURNAL_PATH)
+        except Exception:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise
+
+        print(f"[OK] Откачено {reverted} записей: cleaned -> sent")
+    else:
+        print("  Нет записей со статусом 'cleaned'")
+
+
+if __name__ == "__main__":
+    rollback()

@@ -8,7 +8,6 @@ Standardizes channel URL resolution across the codebase.
 import os
 import sys
 import tempfile
-import shutil
 from pathlib import Path
 from dotenv import load_dotenv
 

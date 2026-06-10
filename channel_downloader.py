@@ -390,6 +390,9 @@ class ChannelDownloader(LogMixin):
         os.makedirs(output_dir, exist_ok=True)
         retries = self.config.get('channel_downloader', {}).get('retries', 3)
         retry_delay = self.config.get('channel_downloader', {}).get('retry_delay', 5)
+        large_file_threshold = (
+            self.config.get('archiver', {}).get('large_file_threshold_mb', 50) * 1024 * 1024
+        )
 
         downloaded_count = 0
         skipped_count = 0
@@ -442,22 +445,22 @@ class ChannelDownloader(LogMixin):
                         success = True
                         break
                     else:
-                        # Fallback via browser evaluate for files < 50MB
-                        if file_size < 50 * 1024 * 1024:
+                        # Fallback via browser evaluate for files below threshold
+                        if file_size < large_file_threshold:
                             print(f"    → Fallback: загрузка через браузер...")
                             raise NotImplementedError(
                                 "Browser-based download fallback not yet implemented"
                             )
                         else:
-                            print(f"    ✗ Нет URL для скачивания (файл >50MB)")
+                            threshold_mb = large_file_threshold // (1024 * 1024)
+                            print(f"    ✗ Нет URL для скачивания (файл >{threshold_mb}MB)")
                             break
 
                 except (ConnectionError, TimeoutError) as e:
                     if attempt < retries:
                         print(f"    ⚠ Ошибка: {e}, попытка {attempt + 1}/{retries}...")
                         time.sleep(retry_delay)
-                        # Refresh cookies on retry
-                        cookies = browser.page.context.cookies()
+                        # _download_with_requests fetches fresh cookies on each call
                     else:
                         print(f"    ✗ Ошибка после {retries} попыток: {e}")
                         error_count += 1

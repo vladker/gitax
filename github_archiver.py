@@ -10,7 +10,6 @@ import re
 import sys
 import yaml
 import time
-import shutil
 import atexit
 import signal
 from datetime import datetime
@@ -23,6 +22,29 @@ from browser_max import BrowserMAX
 from scroll_registry import ScrollRegistry
 from pypi_libs_journal import PyPILibsJournal
 from config_utils import get_channel_url, is_setup_complete, ensure_channel_url, get_skipped_channels, get_split_mode
+from utils import format_file_size
+
+
+def prompt_numeric_choice(prompt_text: str, valid_options: list[str]) -> str:
+    """
+    Prompt the user for a numeric choice, looping until valid input is received.
+
+    Args:
+        prompt_text: The prompt to display
+        valid_options: List of valid option strings (e.g., ["0", "1", "2", "3"])
+
+    Returns:
+        The user's valid choice as a string
+    """
+    while True:
+        try:
+            choice = input(f"  {prompt_text}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Ввод прерван.")
+            return ""
+        if choice in valid_options:
+            return choice
+        print(f"  Неверный выбор. Доступно: {', '.join(sorted(valid_options))}")
 
 
 class GracefulShutdown:
@@ -224,7 +246,7 @@ class GitHubArchiver(LogMixin):
         print("  [3] Don't ask again this session")
 
         try:
-            choice = input("  Choose [1/2/3]: ").strip()
+            choice = prompt_numeric_choice("Choose [1/2/3]", ["1", "2", "3"])
             if choice == '1':
                 deleted = 0
                 for f in orphaned:
@@ -335,16 +357,6 @@ class GitHubArchiver(LogMixin):
             return desc[:max_len-3] + "..."
         return desc
 
-    def _format_file_size(self, size_bytes: int) -> str:
-        """Форматировать размер файла"""
-        if size_bytes >= 1024 * 1024 * 1024:
-            return f"{size_bytes / 1024 / 1024 / 1024:.1f} GB"
-        elif size_bytes >= 1024 * 1024:
-            return f"{size_bytes / 1024 / 1024:.1f} MB"
-        elif size_bytes >= 1024:
-            return f"{size_bytes / 1024:.1f} KB"
-        return f"{size_bytes} B"
-
     def _print_progress(self, current: int, total: int, updated: int, skipped: int, status: str = ""):
         """Print progress bar for sync/load operations"""
         if total == 0:
@@ -371,7 +383,7 @@ class GitHubArchiver(LogMixin):
 🔗 GitHub: {repo_data.get('github_url', '')}"""
 
         if zip_size:
-            text += f"\n📦 Размер: {self._format_file_size(zip_size)}"
+            text += f"\n📦 Размер: {format_file_size(zip_size)}"
 
         return text
 
@@ -621,7 +633,7 @@ class GitHubArchiver(LogMixin):
                 continue
 
             zip_size = os.path.getsize(zip_path)
-            zip_size_str = self._format_file_size(zip_size)
+            zip_size_str = format_file_size(zip_size)
             print(f"    ✓ {zip_size_str}")
 
             text = self._build_message_text(repo_update, zip_size)
@@ -935,7 +947,7 @@ class GitHubArchiver(LogMixin):
             return False
 
         zip_size = os.path.getsize(zip_path)
-        zip_size_str = self._format_file_size(zip_size)
+        zip_size_str = format_file_size(zip_size)
         print(f"    ✓ {zip_size_str}")
 
         text = self._build_message_text(repo_data, zip_size)
@@ -997,7 +1009,7 @@ class GitHubArchiver(LogMixin):
         print()
 
         try:
-            choice = input("  Ваш выбор [1/2/3]: ").strip()
+            choice = prompt_numeric_choice("Ваш выбор [1/2/3]", ["1", "2", "3"])
         except (EOFError, KeyboardInterrupt):
             return
 
@@ -1059,17 +1071,21 @@ class GitHubArchiver(LogMixin):
             print("  [3] Назад")
             print()
 
-            choice = input("  Ваш выбор [1/2/3]: ").strip()
+            choice = prompt_numeric_choice("Ваш выбор [1/2/3]", ["1", "2", "3"])
 
             if choice == '1':
                 try:
-                    num = int(input("\n  Введите номер для удаления: ").strip())
-                    if 1 <= num <= len(ignored):
-                        removed = ignored[num - 1]
-                        self.journal.remove_ignored(removed)
-                        print(f"\n  ✓ {removed} удалён из игнор-листа")
+                    num_input = input("\n  Введите номер для удаления: ").strip()
+                    if not num_input.isdigit():
+                        print("\n  ✗ Неверный ввод. Введите число.")
                     else:
-                        print(f"\n  ✗ Неверный номер. Введите от 1 до {len(ignored)}")
+                        num = int(num_input)
+                        if 1 <= num <= len(ignored):
+                            removed = ignored[num - 1]
+                            self.journal.remove_ignored(removed)
+                            print(f"\n  ✓ {removed} удалён из игнор-листа")
+                        else:
+                            print(f"\n  ✗ Неверный номер. Введите от 1 до {len(ignored)}")
                 except ValueError:
                     print("\n  ✗ Неверный ввод")
                 input("\n  Нажмите Enter для продолжения...")
@@ -1133,7 +1149,7 @@ class GitHubArchiver(LogMixin):
             print("  [0] Назад")
             print()
 
-            choice = input("  Ваш выбор [0/1/2/3/4/5/6]: ").strip()
+            choice = prompt_numeric_choice("Ваш выбор [0/1/2/3/4/5/6]", ["0", "1", "2", "3", "4", "5", "6"])
 
             if choice == '0':
                 break
@@ -1690,7 +1706,7 @@ class GitHubArchiver(LogMixin):
             return False
 
         zip_size = os.path.getsize(zip_path)
-        zip_size_str = self._format_file_size(zip_size)
+        zip_size_str = format_file_size(zip_size)
         print(f"    ✓ {zip_size_str}")
 
         repo_data = {
@@ -1897,7 +1913,7 @@ class GitHubArchiver(LogMixin):
             return False
 
         zip_size = os.path.getsize(zip_path)
-        zip_size_str = self._format_file_size(zip_size)
+        zip_size_str = format_file_size(zip_size)
         print(f"    ✓ {zip_size_str}")
 
         # Step 3: Build and send message
@@ -2038,7 +2054,14 @@ class GitHubArchiver(LogMixin):
             input("\n  Нажмите Enter для возврата в меню...")
             return
 
-        scroll_passes = int(passes_input) if passes_input else 3
+        if passes_input:
+            try:
+                scroll_passes = int(passes_input)
+            except ValueError:
+                print("  Неверный ввод, использую значение по умолчанию: 3")
+                scroll_passes = 3
+        else:
+            scroll_passes = 3
 
         # Ask for max messages limit
         try:
@@ -2050,7 +2073,14 @@ class GitHubArchiver(LogMixin):
             input("\n  Нажмите Enter для возврата в меню...")
             return
 
-        max_messages = int(max_input) if max_input else 0
+        if max_input:
+            try:
+                max_messages = int(max_input)
+            except ValueError:
+                print("  Неверный ввод, использую значение по умолчанию: 0 (без лимита)")
+                max_messages = 0
+        else:
+            max_messages = 0
 
         # Ask about HTML inclusion
         try:
@@ -2351,13 +2381,25 @@ class GitHubArchiver(LogMixin):
 
         yaml_config.setdefault("archiver", {})
         if limit_str:
-            yaml_config["archiver"]["limit"] = int(limit_str)
+            try:
+                yaml_config["archiver"]["limit"] = int(limit_str)
+            except ValueError:
+                print("  ⚠ Неверное значение лимита, пропускаю")
         if retries_str:
-            yaml_config["archiver"]["retries"] = int(retries_str)
+            try:
+                yaml_config["archiver"]["retries"] = int(retries_str)
+            except ValueError:
+                print("  ⚠ Неверное значение retries, пропускаю")
         if delay_str:
-            yaml_config["archiver"]["repo_delay"] = int(delay_str)
+            try:
+                yaml_config["archiver"]["repo_delay"] = int(delay_str)
+            except ValueError:
+                print("  ⚠ Неверное значение задержки, пропускаю")
         if split_str:
-            yaml_config["archiver"]["split_threshold_mb"] = int(split_str)
+            try:
+                yaml_config["archiver"]["split_threshold_mb"] = int(split_str)
+            except ValueError:
+                print("  ⚠ Неверное значение порога, пропускаю")
 
         # ── Split mode prompt (step 6b) ──
         current_split_mode = archiver_cfg.get('split_mode', 'auto')
@@ -2413,8 +2455,16 @@ class GitHubArchiver(LogMixin):
             self._show_main_menu()
 
             needs_setup = not is_setup_complete(self.config)
-            prompt = "[0/X,1-5]" if needs_setup else "[0-5]"
-            choice = input(f"  Выберите раздел {prompt}: ").strip().lower()
+            if needs_setup:
+                valid_opts = ["0", "x", "1", "2", "3", "4", "5"]
+                prompt_text = "Выберите раздел [0/X,1-5]"
+            else:
+                valid_opts = ["0", "1", "2", "3", "4", "5"]
+                prompt_text = "Выберите раздел [0-5]"
+            choice = prompt_numeric_choice(prompt_text, valid_opts).lower()
+
+            if not choice:
+                break
 
             # ── Check if selected module is disabled ──
             if choice in ("1", "2", "3", "4") and not self._is_module_enabled(choice):
@@ -2452,16 +2502,13 @@ class GitHubArchiver(LogMixin):
                 self._run_files_menu()
             elif choice == '5':
                 self._run_service_menu()
-            else:
-                print("\n  Неверный выбор. Нажмите 0..5.")
-                time.sleep(1)
 
     def _run_github_menu(self):
         """Цикл подменю GitHub"""
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
             self._github_menu()
-            choice = input("  Выберите действие [0-4]: ").strip()
+            choice = prompt_numeric_choice("Выберите действие [0-4]", ["0", "1", "2", "3", "4"])
 
             if choice == '0':
                 break
@@ -2473,16 +2520,13 @@ class GitHubArchiver(LogMixin):
                 self._manage_ignore_list()
             elif choice == '4':
                 self.audit_and_restore_publications()
-            else:
-                print("\n  Неверный выбор. Нажмите 0..4.")
-                time.sleep(1)
 
     def _run_pypi_menu(self):
         """Цикл подменю PyPI"""
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
             self._pypi_menu()
-            choice = input("  Выберите действие [0-2]: ").strip()
+            choice = prompt_numeric_choice("Выберите действие [0-2]", ["0", "1", "2"])
 
             if choice == '0':
                 break
@@ -2490,9 +2534,6 @@ class GitHubArchiver(LogMixin):
                 self.run_pypi_libs_archiver()
             elif choice == '2':
                 self.run_pypi_libs_sync()
-            else:
-                print("\n  Неверный выбор. Нажмите 0..2.")
-                time.sleep(1)
 
     def _backuper_menu(self):
         """Подменю Backuper"""
@@ -2510,7 +2551,7 @@ class GitHubArchiver(LogMixin):
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
             self._backuper_menu()
-            choice = input("  Выберите действие [0-2]: ").strip()
+            choice = prompt_numeric_choice("Выберите действие [0-2]", ["0", "1", "2"])
 
             if choice == '0':
                 break
@@ -2518,16 +2559,13 @@ class GitHubArchiver(LogMixin):
                 self.run_backuper_backup()
             elif choice == '2':
                 self.run_backuper_restore()
-            else:
-                print("\n  Неверный выбор. Нажмите 0..2.")
-                time.sleep(1)
 
     def _run_files_menu(self):
         """Цикл подменю Файлы"""
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
             self._files_menu()
-            choice = input("  Выберите действие [0-4]: ").strip()
+            choice = prompt_numeric_choice("Выберите действие [0-4]", ["0", "1", "2", "3", "4"])
 
             if choice == '0':
                 break
@@ -2539,9 +2577,6 @@ class GitHubArchiver(LogMixin):
                 self.export_messages_to_file()
             elif choice == '4':
                 self.delete_all_messages_in_channel()
-            else:
-                print("\n  Неверный выбор. Нажмите 0..4.")
-                time.sleep(1)
 
     def _run_service_menu(self):
         """Цикл подменю Сервис"""
@@ -2549,8 +2584,13 @@ class GitHubArchiver(LogMixin):
             os.system('cls' if os.name == 'nt' else 'clear')
             self._service_menu()
             setup_done = is_setup_complete(self.config)
-            prompt = "[0-2]" if setup_done else "[0-1]"
-            choice = input(f"  Выберите действие {prompt}: ").strip()
+            if setup_done:
+                valid_opts = ["0", "1", "2"]
+                prompt_text = "Выберите действие [0-2]"
+            else:
+                valid_opts = ["0", "1"]
+                prompt_text = "Выберите действие [0-1]"
+            choice = prompt_numeric_choice(prompt_text, valid_opts)
 
             if choice == '0':
                 break
@@ -2558,9 +2598,6 @@ class GitHubArchiver(LogMixin):
                 self._manage_journals()
             elif choice == '2' and setup_done:
                 self._initial_setup()
-            else:
-                print("\n  Неверный выбор.")
-                time.sleep(1)
 
 
     def run_pypi_libs_archiver(self):

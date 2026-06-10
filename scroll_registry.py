@@ -20,8 +20,12 @@ class ScrollRegistry:
             "total": len(self.messages),
             "messages": self.messages,
         }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except (OSError, PermissionError) as e:
+            print(f"[ScrollRegistry] Failed to save {path}: {e}")
+            raise
 
     def load(self, path: str = DATA_FILE) -> bool:
         try:

@@ -11,6 +11,7 @@ import csv
 import json
 import logging
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from typing import Optional
 from dataclasses import dataclass
@@ -26,6 +27,12 @@ def _get_seven_zip_exe() -> str:
     """Get 7z executable path from config."""
     from config import get_config
     return get_config().backuper.seven_zip_exe
+
+
+def _get_large_file_threshold() -> int:
+    """Get large file threshold in bytes from config (default 50 MB)."""
+    from config import get_config
+    return get_config().archiver.large_file_threshold_mb * 1024 * 1024
 
 
 @dataclass
@@ -239,9 +246,22 @@ def archive_directory_to_volumes(
     cmd = [seven_zip_exe, "a", f"-mx={compression_level}", output_base, source_dir + os.sep]
     if volume_size:
         cmd.insert(2, "-v" + volume_size)
+
+    # C2/C3: Use password file instead of CLI argument to avoid leaking in process list
+    password_tempfile = None
     if password:
-        cmd.insert(2, f"-p{password}")
+        password_tempfile = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8"
+        )
+        password_tempfile.write(password)
+        password_tempfile.close()
+        try:
+            os.chmod(password_tempfile.name, 0o600)
+        except OSError:
+            pass  # Windows may not support chmod; file is still private via temp dir
+        cmd.insert(2, f"-p@{password_tempfile.name}")
         cmd.insert(2, "-mhe=on")
+
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
         if result.returncode != 0:
@@ -275,6 +295,12 @@ def archive_directory_to_volumes(
         _logger.error(f"7z archive error: {e}")
         _cleanup_existing_volumes(output_base)
         return []
+    finally:
+        if password_tempfile is not None:
+            try:
+                os.unlink(password_tempfile.name)
+            except OSError:
+                pass
 
 
 class BrowserMAXError(Exception):
@@ -1692,14 +1718,15 @@ class BrowserMAX(LogMixin):
 
         # Smaller files upload faster — reduce no-activity wait accordingly
         # For video files: NO no-activity exit (video transcoding can pause DOM updates)
+        large_file_threshold = _get_large_file_threshold()
         if self._is_video:
             no_activity_threshold = float('inf')  # never exit on no-activity for video
         elif expected_size and expected_size < 10 * 1024 * 1024:
             no_activity_threshold = 5   # 5 seconds for files < 10MB
-        elif expected_size and expected_size < 50 * 1024 * 1024:
-            no_activity_threshold = 10  # 10 seconds for files < 50MB
+        elif expected_size and expected_size < large_file_threshold:
+            no_activity_threshold = 10  # 10 seconds for files below threshold
         else:
-            no_activity_threshold = 45  # Increased from 30s to 45s for files > 50MB
+            no_activity_threshold = 45  # Increased from 30s to 45s for files above threshold
 
         print(f"  [OK] Waiting for upload to complete... (Ctrl+C to cancel)")
 
@@ -2034,7 +2061,8 @@ class BrowserMAX(LogMixin):
     def _confirm_file_sent(self, pre_snapshot: "ContentSnapshot", file_size_bytes: int) -> bool:
         """
         Fast confirmation: check if feed content changed after sending.
-        NOTE: Only reliable for files < 50MB. Larger files use _confirm_file_in_feed().
+        NOTE: Only reliable for files below the large-file threshold.
+        Larger files use _confirm_file_in_feed().
 
         Adaptive wait based on file size — photos render faster than videos.
 
@@ -2045,10 +2073,12 @@ class BrowserMAX(LogMixin):
         Returns:
             True if content changed (file likely sent), False if no change detected
         """
-        # Guard: only valid for files < 50MB
-        if file_size_bytes >= 50 * 1024 * 1024:
+        # Guard: only valid for files below the large-file threshold
+        large_file_threshold = _get_large_file_threshold()
+        if file_size_bytes >= large_file_threshold:
+            threshold_mb = large_file_threshold // (1024 * 1024)
             self.logger.debug(
-                f"Skipping hash check for file >= 50MB ({file_size_bytes / 1024 / 1024:.1f} MB)"
+                f"Skipping hash check for file >= {threshold_mb}MB ({file_size_bytes / 1024 / 1024:.1f} MB)"
             )
             return False
 
@@ -3383,9 +3413,9 @@ class BrowserMAX(LogMixin):
                 else:
                     self.logger.debug("Composer cleared, proceeding to confirmation")
 
-                # NEW: For large files (>= 50 MB), use filename-based confirmation
+                # NEW: For large files (>= threshold), use filename-based confirmation
                 # instead of the delta check which triggers false positives
-                LARGE_CONFIRM_THRESHOLD = 50 * 1024 * 1024  # 50 MB
+                LARGE_CONFIRM_THRESHOLD = _get_large_file_threshold()
                 confirmed = False
 
                 if file_size_bytes >= LARGE_CONFIRM_THRESHOLD:

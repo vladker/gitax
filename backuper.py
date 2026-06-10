@@ -10,10 +10,9 @@ Backuper — Архивация папок в канал MAX и восстано
 
 import os
 import sys
+import tempfile
 import time
 
-import glob
-import shutil
 import requests
 from datetime import datetime
 
@@ -26,6 +25,29 @@ from browser_max import (
 )
 from backuper_journal import BackuperJournal
 from config_utils import get_channel_url, get_config_value
+from utils import format_file_size
+
+
+def prompt_numeric_choice(prompt_text: str, valid_options: list[str]) -> str:
+    """
+    Prompt the user for a numeric choice, looping until valid input is received.
+
+    Args:
+        prompt_text: The prompt to display
+        valid_options: List of valid option strings (e.g., ["0", "1", "2"])
+
+    Returns:
+        The user's valid choice as a string
+    """
+    while True:
+        try:
+            choice = input(f"  {prompt_text}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Ввод прерван.")
+            return ""
+        if choice in valid_options:
+            return choice
+        print(f"  Неверный выбор. Доступно: {', '.join(sorted(valid_options))}")
 
 
 class Backuper(LogMixin):
@@ -69,19 +91,6 @@ class Backuper(LogMixin):
                 pass
             self.browser = None
 
-    # ── Formatting ──
-
-    @staticmethod
-    def _format_size(size_bytes: int) -> str:
-        if size_bytes < 1024:
-            return f"{size_bytes} B"
-        elif size_bytes < 1024 ** 2:
-            return f"{size_bytes / 1024:.1f} KB"
-        elif size_bytes < 1024 ** 3:
-            return f"{size_bytes / 1024 / 1024:.1f} MB"
-        else:
-            return f"{size_bytes / 1024 / 1024 / 1024:.2f} GB"
-
     @staticmethod
     def _dir_size(path: str) -> int:
         total = 0
@@ -118,7 +127,7 @@ class Backuper(LogMixin):
         max_size_bytes = max_size_mb * 1024 * 1024 if max_size_mb > 0 else 0
         allowed_ext = set(ext.lower() for ext in allowed_extensions) if allowed_extensions else None
 
-        walker = os.walk(source_path) if recursive else [(source_path, [], os.listdir(source_path))]
+        walker = os.walk(source_path) if recursive else [(source_path, [], [f for f in os.listdir(source_path) if os.path.isfile(os.path.join(source_path, f))])]
 
         for dirpath, _dirs, filenames in walker:
             for fname in filenames:
@@ -214,7 +223,7 @@ class Backuper(LogMixin):
         print("    [2] Архив (7z) — многотомный (размер из конфига)")
         print("    [3] Архив (7z) — многотомный (свой размер)")
         print("    [4] Загрузить файлы как есть (без архивации)")
-        mode_choice = input("  Выбор [1-4]: ").strip()
+        mode_choice = prompt_numeric_choice("Выбор [1-4]", ["1", "2", "3", "4"])
 
         if mode_choice == "4":
             # Delegate to upload-as-is mode with already-selected folder
@@ -277,7 +286,7 @@ class Backuper(LogMixin):
             return
 
         total_size = sum(os.path.getsize(v) for v in volumes if os.path.exists(v))
-        print(f"  ✓ {len(volumes)} том(ов), {self._format_size(total_size)} за {elapsed:.0f}с")
+        print(f"  ✓ {len(volumes)} том(ов), {format_file_size(total_size)} за {elapsed:.0f}с")
 
         # 7. Upload to channel
         print("\n  Отправка в канал MAX ...")
@@ -291,7 +300,7 @@ class Backuper(LogMixin):
         msg_text = (
             f"📦 Бэкап: {archive_name}\n"
             f"📁 Источник: {os.path.basename(source_path)}\n"
-            f"📊 Томов: {len(volumes)} | {self._format_size(total_size)}\n"
+            f"📊 Томов: {len(volumes)} | {format_file_size(total_size)}\n"
             f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         )
         if description:
@@ -324,7 +333,9 @@ class Backuper(LogMixin):
                 "description": description or "",
             })
             if use_password:
-                self.journal.store_password(archive_name, password, hint=password_hint)
+                self.journal.mark_password_protected(archive_name)
+                if password_hint:
+                    self.journal.store_password_hint(archive_name, password_hint)
         else:
             print("  ✗ Отправка не удалась. Удаляю тома.")
             self.journal.add_backup({
@@ -371,7 +382,11 @@ class Backuper(LogMixin):
         allowed_extensions = [e.strip().lower() for e in ext_input.split(",") if e.strip()] if ext_input else []
 
         size_input = input("  Макс. размер файла в MB (0 = без лимита): ").strip()
-        max_size_mb = int(size_input) if size_input.isdigit() else 0
+        try:
+            max_size_mb = int(size_input) if size_input else 0
+        except ValueError:
+            print("  Неверный ввод, использую значение по умолчанию: 0 (без лимита)")
+            max_size_mb = 0
 
         recursive_input = input("  Рекурсивно (включая подпапки)? [Y/n]: ").strip().lower()
         recursive = recursive_input != "n"
@@ -394,13 +409,13 @@ class Backuper(LogMixin):
 
         total_files = len(files)
         total_size = sum(size for _, size in files)
-        print(f"  ✓ Найдено: {total_files} файл(ов), {self._format_size(total_size)}")
+        print(f"  ✓ Найдено: {total_files} файл(ов), {format_file_size(total_size)}")
 
         # Show first few files
         print("\n  Первые файлы:")
         for filepath, size in files[:10]:
             rel_path = os.path.relpath(filepath, source_path)
-            print(f"    {rel_path} ({self._format_size(size)})")
+            print(f"    {rel_path} ({format_file_size(size)})")
         if total_files > 10:
             print(f"    ... и ещё {total_files - 10}")
 
@@ -420,7 +435,9 @@ class Backuper(LogMixin):
         # 7. Upload each file
         retries = int(self.config.get("backuper", {}).get("retries", 3))
         retry_delay = int(self.config.get("backuper", {}).get("retry_delay", 10))
-        large_file_threshold = 50 * 1024 * 1024  # 50 MB
+        large_file_threshold = (
+            self.config.get("archiver", {}).get("large_file_threshold_mb", 50) * 1024 * 1024
+        )
 
         sent_count = 0
         skipped_count = 0
@@ -433,7 +450,7 @@ class Backuper(LogMixin):
         for idx, (filepath, size) in enumerate(files, 1):
             filename = os.path.basename(filepath)
             rel_path = os.path.relpath(filepath, source_path)
-            size_str = self._format_size(size)
+            size_str = format_file_size(size)
 
             print(f"  [{idx}/{total_files}] {rel_path} ({size_str})")
 
@@ -470,7 +487,7 @@ class Backuper(LogMixin):
                     upload_filename = os.path.basename(zip_path)
                     ext = ".zip"
                     size = os.path.getsize(zip_path)
-                    size_str = self._format_size(size)
+                    size_str = format_file_size(size)
                     temp_files_to_cleanup.append(zip_path)
                     print(f"    → Конвертировано: {upload_filename} ({size_str})")
                 else:
@@ -648,7 +665,7 @@ class Backuper(LogMixin):
         print("    [1] Один пароль на все архивы")
         print("    [2] Пароль для каждого архива отдельно")
         print("    [3] Без пароля (попытка извлечь без пароля)")
-        pw_mode = input("  Выбор [1-3]: ").strip()
+        pw_mode = prompt_numeric_choice("Выбор [1-3]", ["1", "2", "3"])
 
         global_password = None
         if pw_mode == "1":
@@ -667,30 +684,25 @@ class Backuper(LogMixin):
             print(f"  [{arch_idx}/{len(selected)}] {archive_name} ({vol_count} том(ов))")
 
             # Determine password for this archive
+            # C1 fix: passwords are never stored — always prompt interactively
             pw = None
             if pw_mode == "1" and global_password:
                 pw = global_password
-                # Store global password + hint for this archive
-                if not self.journal.has_password(archive_name):
-                    self.journal.store_password(archive_name, global_password)
+                self.journal.mark_password_protected(archive_name)
             elif pw_mode == "2":
-                # Check journal first
-                saved_pw = self.journal.get_password(archive_name)
-                if saved_pw:
-                    use_saved = input(f"    Использовать сохранённый пароль для '{archive_name}'? [Y/n]: ").strip().lower()
-                    if use_saved != "n":
-                        pw = saved_pw
-                        hint = self.journal.get_password_hint(archive_name)
-                        if hint:
-                            print(f"    Подсказка: {hint}")
-                    else:
-                        pw = input(f"    Новый пароль для '{archive_name}': ").strip()
-                        if pw:
-                            self.journal.store_password(archive_name, pw)
+                # Check if archive is password-protected
+                is_protected = self.journal.has_password(archive_name)
+                hint = self.journal.get_password_hint(archive_name)
+                if hint:
+                    print(f"    Подсказка: {hint}")
+                prompt = f"    Пароль для '{archive_name}'"
+                if is_protected:
+                    prompt += " (архив защищён паролем)"
                 else:
-                    pw = input(f"    Пароль для '{archive_name}' (пусто = без пароля): ").strip()
-                    if pw:
-                        self.journal.store_password(archive_name, pw)
+                    prompt += " (пусто = без пароля)"
+                pw = input(f"    {prompt}: ").strip()
+                if pw:
+                    self.journal.mark_password_protected(archive_name)
 
             # Download all volumes
             temp_vol_dir = os.path.join(download_dir, ".tmp_download")
@@ -902,8 +914,12 @@ class Backuper(LogMixin):
             return False
 
         cmd = [seven_zip_exe, "x", archive_path, f"-o{extract_dir}", "-y"]
+        pw_file = None
         if password:
-            cmd.extend([f"-p{password}"])
+            pw_file = tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt")
+            pw_file.write(password)
+            pw_file.close()
+            cmd.extend([f"-p@{pw_file.name}"])
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
@@ -914,6 +930,12 @@ class Backuper(LogMixin):
         except Exception as e:
             self.logger.error(f"7z extract error: {e}")
             return False
+        finally:
+            if pw_file is not None:
+                try:
+                    os.unlink(pw_file.name)
+                except OSError:
+                    pass
 
     # ── Main Menu ──
 
@@ -922,7 +944,7 @@ class Backuper(LogMixin):
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
             self._show_menu()
-            choice = input("  Выберите действие [0-2]: ").strip()
+            choice = prompt_numeric_choice("Выберите действие [0-2]", ["0", "1", "2"])
 
             if choice == "0":
                 break
@@ -930,9 +952,6 @@ class Backuper(LogMixin):
                 self.run_backup()
             elif choice == "2":
                 self.run_restore()
-            else:
-                print("\n  Неверный выбор. Нажмите 0..2.")
-                time.sleep(1)
 
         self._close_browser()
 

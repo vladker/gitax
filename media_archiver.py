@@ -142,12 +142,14 @@ class MediaArchiver(LogMixin):
         '.mp4', '.mov', '.avi', '.mkv', '.webm'
     }
 
-    LARGE_FILE_THRESHOLD = 50 * 1024 * 1024  # 50 MB — files at or above trigger local browser
-
     def __init__(self, config_path: str = "config.yaml"):
         from config import init_config, get_config
         init_config(config_path)
         self.config = get_config().model_dump()
+        # Large file threshold from config (default 50 MB)
+        self.LARGE_FILE_THRESHOLD = (
+            self.config.get('archiver', {}).get('large_file_threshold_mb', 50) * 1024 * 1024
+        )
         # Validate watch_dir (was in _load_config)
         media_watch_dir = self.config.get('media_archiver', {}).get('watch_dir', '')
         if not media_watch_dir:

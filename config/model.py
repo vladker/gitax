@@ -14,6 +14,7 @@ class ArchiverConfig(BaseModel):
     limit: int = 1000
     split_mode: Literal["auto", "on", "off", "prompt"] = "auto"
     split_threshold_mb: int = Field(default=49, ge=1)
+    large_file_threshold_mb: int = Field(default=50, ge=1)
     use_local_browser: bool = False
     output_dir: str = "./temp"
     retries: int = 3

@@ -51,22 +51,7 @@ class PyPILibsArchiver(LogMixin):
 
     def _cleanup(self):
         """Clean up resources on exit"""
-        # Clean up pypi_api temp directory — this is where download_package() puts files
-        try:
-            if os.path.exists("./temp_pypi"):
-                shutil.rmtree("./temp_pypi")
-                self.logger.info("Cleaned up ./temp_pypi/")
-        except Exception as e:
-            self.logger.warning(f"Failed to clean ./temp_pypi/: {e}")
-        # Also clean configured output dir if different
-        output_dir = self.config.get('pypi_libs_archiver', {}).get('output_dir', '')
-        if output_dir and os.path.exists(output_dir) and output_dir != "./temp_pypi":
-            try:
-                shutil.rmtree(output_dir)
-                self.logger.info(f"Cleaned up {output_dir}")
-            except Exception as e:
-                self.logger.warning(f"Failed to clean {output_dir}: {e}")
-        # Close browser
+        # Close browser and save journal
         if self.browser:
             try:
                 self.journal.save()
