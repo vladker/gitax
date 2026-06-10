@@ -22,7 +22,7 @@ from github_api import GitHubAPI
 from browser_max import BrowserMAX
 from scroll_registry import ScrollRegistry
 from pypi_libs_journal import PyPILibsJournal
-from config_utils import get_channel_url, is_setup_complete, ensure_channel_url, get_skipped_channels
+from config_utils import get_channel_url, is_setup_complete, ensure_channel_url, get_skipped_channels, get_split_mode
 
 
 class GracefulShutdown:
@@ -877,11 +877,13 @@ class GitHubArchiver(LogMixin):
         # Отправить в MAX
         browser = self._init_max_browser()  # type: ignore
 
+        split_mode = get_split_mode(self.config, "archiver", default="auto")
         success, _ = browser.send_message_with_file(
             text=text,
             filepath=zip_path,
             retries=self.config.get('archiver', {}).get('retries', 3),
-            retry_delay=self.config.get('archiver', {}).get('retry_delay', 10)
+            retry_delay=self.config.get('archiver', {}).get('retry_delay', 10),
+            split_mode=split_mode,
         )
 
         # Удалить временный файл
@@ -958,11 +960,13 @@ class GitHubArchiver(LogMixin):
 
         # Send message with file - returns (success, file_deletable)
         # Note: send_message_with_file confirms file message appears in chat before returning
+        split_mode = get_split_mode(self.config, "archiver", default="auto")
         success, _ = browser.send_message_with_file(
             text=text,
             filepath=zip_path,
             retries=self.config.get('archiver', {}).get('retries', 3),
-            retry_delay=self.config.get('archiver', {}).get('retry_delay', 10)
+            retry_delay=self.config.get('archiver', {}).get('retry_delay', 10),
+            split_mode=split_mode,
         )
 
         # If upload failed, log and move on
@@ -1726,6 +1730,7 @@ class GitHubArchiver(LogMixin):
         except Exception:
             pass
 
+        split_mode = get_split_mode(self.config, "archiver", default="auto")
         split_threshold_mb = self.config.get("archiver", {}).get("split_threshold_mb", 49)
         success, _ = browser.send_message_with_files(
             text=text,
@@ -1733,6 +1738,7 @@ class GitHubArchiver(LogMixin):
             retries=self.config.get("archiver", {}).get("retries", 3),
             retry_delay=self.config.get("archiver", {}).get("retry_delay", 10),
             split_threshold_mb=split_threshold_mb,
+            split_mode=split_mode,
         )
 
         verified = False
@@ -1933,6 +1939,7 @@ class GitHubArchiver(LogMixin):
         except Exception:
             pass
 
+        split_mode = get_split_mode(self.config, "archiver", default="auto")
         split_threshold_mb = self.config.get("archiver", {}).get("split_threshold_mb", 49)
         success, _ = browser.send_message_with_files(
             text=text,
@@ -1940,6 +1947,7 @@ class GitHubArchiver(LogMixin):
             retries=self.config.get("archiver", {}).get("retries", 3),
             retry_delay=self.config.get("archiver", {}).get("retry_delay", 10),
             split_threshold_mb=split_threshold_mb,
+            split_mode=split_mode,
         )
 
         # Step 4: Verify (retry up to 3 times with delay)
@@ -2366,6 +2374,23 @@ class GitHubArchiver(LogMixin):
             yaml_config["archiver"]["repo_delay"] = int(delay_str)
         if split_str:
             yaml_config["archiver"]["split_threshold_mb"] = int(split_str)
+
+        # ── Split mode prompt (step 6b) ──
+        current_split_mode = archiver_cfg.get('split_mode', 'auto')
+        mode_prompt = (
+            f"  Режим разделения [{current_split_mode}]\n"
+            f"    auto    — автоматически (если > порога)\n"
+            f"    on      — дробить всегда\n"
+            f"    off     — никогда не дробить\n"
+            f"    prompt  — спрашивать для каждого файла\n"
+        )
+        try:
+            mode_str = input(mode_prompt + "  Ваш выбор [Enter=" + current_split_mode + "]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            mode_str = ""
+
+        if mode_str in ("auto", "on", "off", "prompt"):
+            yaml_config["archiver"]["split_mode"] = mode_str
 
         # Write skipped channels to setup section
         yaml_config.setdefault("setup", {})["skipped_channels"] = sorted(new_skipped)

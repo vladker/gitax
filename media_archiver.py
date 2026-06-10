@@ -344,7 +344,7 @@ class MediaArchiver(LogMixin):
                         filepaths=[filepath],
                         retries=retries,
                         retry_delay=retry_delay,
-                        split_threshold_mb=999999,
+                        split_mode="off",
                         expected_extensions=[ext]
                     )
 

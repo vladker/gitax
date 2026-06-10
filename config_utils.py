@@ -103,6 +103,34 @@ def get_config_value(config: dict, section: str, key: str, default=None,
     return default
 
 
+def get_split_mode(config: dict, section: str, default: str = "auto") -> str:
+    """
+    Get split_mode from config section with fallback to default.
+
+    Validates the value against allowed modes: auto, on, off, prompt.
+
+    Priority: config.yaml[section].split_mode > default
+
+    Args:
+        config: Loaded config dict from config.yaml
+        section: Config section name (e.g., "archiver", "pypi_libs_archiver")
+        default: Default split mode if not found or invalid (default: "auto")
+
+    Returns:
+        Lowercase valid split mode string: "auto", "on", "off", or "prompt"
+
+    Examples:
+        >>> mode = get_split_mode(config, "archiver")
+        >>> mode = get_split_mode(config, "pypi_libs_archiver", default="off")
+    """
+    VALID_MODES = {"auto", "on", "off", "prompt"}
+    section_data = config.get(section, {}) or {}
+    value = section_data.get("split_mode", default)
+    if not isinstance(value, str) or value.lower() not in VALID_MODES:
+        return default
+    return value.lower()
+
+
 def set_env_value(key: str, value: str):
     """
     Set or update an environment variable in .env file.

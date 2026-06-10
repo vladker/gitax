@@ -22,7 +22,7 @@ from logging_config import setup_logging, LogMixin, SessionCapture
 from pypi_api import PyPIAPI
 from browser_max import BrowserMAX
 from pypi_libs_journal import PyPILibsJournal
-from config_utils import get_channel_url
+from config_utils import get_channel_url, get_split_mode
 
 
 class PyPILibsArchiver(LogMixin):
@@ -341,11 +341,13 @@ class PyPILibsArchiver(LogMixin):
             # Отправляем в MAX
             print(f"  → Отправляю в MAX...")
             try:
+                split_mode = get_split_mode(self.config, "pypi_libs_archiver", default="auto")
                 success, _ = browser.send_message_with_files(
                     text=text,
                     filepaths=file_paths,
                     retries=retries,
                     retry_delay=retry_delay,
+                    split_mode=split_mode,
                     expected_extensions=['.tar.gz', '.whl']
                 )
             except Exception as e:
@@ -524,11 +526,13 @@ class PyPILibsArchiver(LogMixin):
 
             # Отправляем
             try:
+                split_mode = get_split_mode(self.config, "pypi_libs_archiver", default="auto")
                 success, _ = browser.send_message_with_files(
                     text=text,
                     filepaths=file_paths,
                     retries=retries,
                     retry_delay=retry_delay,
+                    split_mode=split_mode,
                     expected_extensions=['.tar.gz', '.whl']
                 )
             except Exception as e:

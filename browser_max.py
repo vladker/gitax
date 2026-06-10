@@ -3049,9 +3049,79 @@ class BrowserMAX(LogMixin):
             self.logger.debug(f"Re-render failed: {e}")
             return False
 
+    def _prompt_split_mode(self, filename: str, file_size_mb: float) -> int:
+        """
+        Prompt user for split mode choice for a specific file.
+
+        Matches the backuper's 3-option pattern:
+          [1] - single volume (no split)
+          [2] - multi-volume (split with default size)
+          [3] - custom size (split with user-specified size)
+
+        Args:
+            filename: Name of the file being uploaded
+            file_size_mb: File size in megabytes
+
+        Returns:
+            1, 2, or 3 corresponding to user's choice.
+            Loops until valid input (1-3) is received.
+        """
+        print()
+        print(f"  \u26a1 \u0424\u0430\u0439\u043b: {filename} ({file_size_mb:.1f} MB)")
+        print()
+        print("  [1] \u041e\u0434\u043d\u043e\u0442\u043e\u043c\u043d\u044b\u0439 \u2014 \u0431\u0435\u0437 \u0440\u0430\u0437\u0434\u0435\u043b\u0435\u043d\u0438\u044f")
+        print(f"  [2] \u041c\u043d\u043e\u0433\u043e\u0442\u043e\u043c\u043d\u044b\u0439 \u2014 \u0440\u0430\u0437\u0434\u0435\u043b\u0438\u0442\u044c \u043d\u0430 \u0442\u043e\u043c\u0430 ({SEVEN_ZIP_VOLUME_SIZE})")
+        print("  [3] \u0421\u0432\u043e\u0439 \u0440\u0430\u0437\u043c\u0435\u0440 \u0442\u043e\u043c\u0430")
+        print()
+
+        while True:
+            try:
+                choice = input("  \u0412\u0430\u0448 \u0432\u044b\u0431\u043e\u0440 [1/2/3]: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 1
+
+            if choice in ("1", "2", "3"):
+                return int(choice)
+
+            print("  \u041d\u0435\u0432\u0435\u0440\u043d\u044b\u0439 \u0432\u0432\u043e\u0434. \u0412\u0432\u0435\u0434\u0438\u0442\u0435 1, 2 \u0438\u043b\u0438 3.")
+
+    def _prompt_split_volume_size(self) -> str | None:
+        """
+        Prompt user for a custom volume size (option 3).
+
+        Validates input - must be a positive number optionally followed
+        by K/M/G (e.g., "100M", "50", "1G").
+
+        Returns:
+            Size string (e.g., "100M") or None if user cancels.
+        """
+        print()
+        print("  \u0423\u043a\u0430\u0436\u0438\u0442\u0435 \u0440\u0430\u0437\u043c\u0435\u0440 \u0442\u043e\u043c\u0430 (\u043d\u0430\u043f\u0440\u0438\u043c\u0435\u0440: 100M, 50M, 1G)")
+        print("  [Enter] \u041e\u0442\u043c\u0435\u043d\u0430 \u2014 \u0432\u0435\u0440\u043d\u0443\u0442\u044c\u0441\u044f \u043a \u0432\u044b\u0431\u043e\u0440\u0443")
+
+        while True:
+            try:
+                raw = input("  \u0420\u0430\u0437\u043c\u0435\u0440 \u0442\u043e\u043c\u0430: ").strip().upper()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return None
+
+            if not raw:
+                return None
+
+            if raw.isdigit():
+                return raw + "M"
+
+            if re.match(r'^\d+(\.\d+)?[KMG]$', raw):
+                return raw
+
+            print("  \u041d\u0435\u0432\u0435\u0440\u043d\u044b\u0439 \u0444\u043e\u0440\u043c\u0430\u0442. \u0418\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 \u0447\u0438\u0441\u043b\u043e + K/M/G (\u043d\u0430\u043f\u0440\u0438\u043c\u0435\u0440: 100M, 50, 1G)")
+
     def send_message_with_files(self, text: str, filepaths: list[str],
                                 retries: int = 3, retry_delay: int = 10,
                                 split_threshold_mb: float = 49.0,
+                                split_mode: str = "auto",
                                 expected_extensions: list[str] | None = None) -> tuple[bool, bool]:
         """
         Send text message with one or more files (supports split archives).
@@ -3083,19 +3153,52 @@ class BrowserMAX(LogMixin):
                 continue
 
             file_size_mb = os.path.getsize(fp) / 1024 / 1024
+            filename = os.path.basename(fp)
+            should_split = False
+            volume_size = SEVEN_ZIP_VOLUME_SIZE
 
-            if file_size_mb > split_threshold_mb:
-                self.logger.info(f"File {os.path.basename(fp)} ({file_size_mb:.1f} MB) > {split_threshold_mb} MB - splitting...")
+            # Determine split behavior based on split_mode
+            if split_mode == "on":
+                should_split = True
+                self.logger.info(f"split_mode=on: splitting {filename}")
+            elif split_mode == "off":
+                should_split = False
+                self.logger.info(f"split_mode=off: no split for {filename}")
+            elif split_mode == "auto":
+                if file_size_mb > split_threshold_mb:
+                    should_split = True
+                    self.logger.info(
+                        f"{filename} ({file_size_mb:.1f} MB) > "
+                        f"{split_threshold_mb} MB \u2014 splitting"
+                    )
+            elif split_mode == "prompt":
+                choice = self._prompt_split_mode(filename, file_size_mb)
+                if choice == 1:
+                    should_split = False
+                    self.logger.info(f"User chose no split for {filename}")
+                elif choice == 2:
+                    should_split = True
+                    self.logger.info(f"User chose split (default size) for {filename}")
+                elif choice == 3:
+                    custom_size = self._prompt_split_volume_size()
+                    if custom_size:
+                        should_split = True
+                        volume_size = custom_size
+                        self.logger.info(f"User chose split (custom size {custom_size}) for {filename}")
+                    else:
+                        should_split = False
+                        self.logger.info(f"User cancelled custom size, no split for {filename}")
+            else:
+                # Unknown split_mode - default to auto behavior (backward compat)
+                should_split = file_size_mb > split_threshold_mb
 
-                # Split into volumes
-                volumes = split_file_with_7z(fp, SEVEN_ZIP_VOLUME_SIZE)
-
+            if should_split:
+                volumes = split_file_with_7z(fp, volume_size)
                 if volumes:
                     self.logger.info(f"Split into {len(volumes)} volumes")
                     all_files.extend(volumes)
                     volumes_to_cleanup.extend(volumes)
                 else:
-                    # Split failed, try sending original
                     self.logger.warning("Split failed, trying original file")
                     all_files.append(fp)
             else:
@@ -3376,12 +3479,14 @@ class BrowserMAX(LogMixin):
     def send_message_with_file(self, text: str, filepath: str,
                                retries: int = 3, retry_delay: int = 10,
                                keep_alive: bool = False,
+                               split_mode: str = "auto",
                                expected_extensions: list[str] | None = None) -> tuple[bool, bool]:
         """
         Send text message first, then file as second message.
 
         Args:
             keep_alive: If True, don't close connection after sending
+            split_mode: Split behavior - "auto", "on", "off", or "prompt"
             expected_extensions: List of file extensions to match for upload confirmation.
                                 Default: ['.zip']
 
@@ -3395,6 +3500,7 @@ class BrowserMAX(LogMixin):
             filepaths=[filepath],
             retries=retries,
             retry_delay=retry_delay,
+            split_mode=split_mode,
             expected_extensions=expected_extensions
         )
         return (success, deletable)
