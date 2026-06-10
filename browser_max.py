@@ -1747,15 +1747,18 @@ class BrowserMAX(LogMixin):
 
             # Check DOM for attached file in composer
             if self._check_dom_upload_ready():
-                # For large files (>= 50 MB), composer preview appears INSTANTLY
-                # but actual upload to server is still in progress.
-                # Require a minimum elapsed time before trusting it.
-                if expected_size and expected_size >= 50 * 1024 * 1024:
-                    min_composer_time = max(10, int(expected_size / (1024 * 1024) / 5))  # ~1s per 5MB, min 10s
+                # Composer preview appears INSTANTLY, but actual upload to server
+                # may still be in progress for files > ~5MB.
+                # Require a minimum elapsed time proportional to file size.
+                if expected_size:
+                    # ~1s per 8MB, min 5s floor so even small files get a brief wait
+                    min_composer_time = max(5, int(expected_size / (1024 * 1024) / 8))
                     if elapsed < min_composer_time:
+                        remaining = min_composer_time - elapsed
+                        print(f"\r  [UPLOAD] File preview ready, waiting for upload ({remaining}s remaining)...", end="", flush=True)
                         self.logger.debug(
                             f"Composer preview at {elapsed}s, waiting {min_composer_time}s "
-                            f"before confirming large file upload"
+                            f"before confirming upload (size={expected_size / (1024*1024):.1f}MB)"
                         )
                         time.sleep(0.5)
                         continue  # Don't confirm yet — keep monitoring
