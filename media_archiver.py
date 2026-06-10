@@ -9,18 +9,15 @@ import os
 import sys
 import json
 import time
-import yaml
 import atexit
 import signal
 import tempfile
 import shutil
 from datetime import datetime
 from pathlib import Path
-from dotenv import load_dotenv
 from logging_config import setup_logging, LogMixin, SessionCapture
 
 from browser_max import BrowserMAX
-from config_utils import get_channel_url
 
 
 class MediaJournal:
@@ -148,7 +145,18 @@ class MediaArchiver(LogMixin):
     LARGE_FILE_THRESHOLD = 50 * 1024 * 1024  # 50 MB — files at or above trigger local browser
 
     def __init__(self, config_path: str = "config.yaml"):
-        self.config = self._load_config(config_path)
+        from config import init_config, get_config
+        init_config(config_path)
+        self.config = get_config().model_dump()
+        # Validate watch_dir (was in _load_config)
+        media_watch_dir = self.config.get('media_archiver', {}).get('watch_dir', '')
+        if not media_watch_dir:
+            print("✗ MEDIA_WATCH_DIR не указана.")
+            print("  Укажите в .env файле или переменной окружения")
+            sys.exit(1)
+        if not os.path.isdir(media_watch_dir):
+            print(f"✗ Папка медиа не найдена: {media_watch_dir}")
+            sys.exit(1)
         self.journal = MediaJournal("media_journal.json")
         self.browser: BrowserMAX | None = None
         self._shutdown = False
@@ -171,39 +179,6 @@ class MediaArchiver(LogMixin):
                 self.browser.close()
             except Exception:
                 pass
-
-    def _load_config(self, config_path: str) -> dict:
-        """Загрузить конфигурацию"""
-        load_dotenv()
-        config = {}
-
-        if os.path.exists(config_path):
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f) or {}
-
-        # Channel URL: standardized via config_utils
-        media_channel_url = get_channel_url(config, "media", label="Media канал")
-
-        # MEDIA_WATCH_DIR: env var > config.yaml
-        media_watch_dir = os.environ.get('MEDIA_WATCH_DIR', '')
-        if not media_watch_dir:
-            media_watch_dir = config.get('media_archiver', {}).get('watch_dir', '')
-
-        # Validate required values
-        if not media_watch_dir:
-            print("✗ MEDIA_WATCH_DIR не указана.")
-            print("  Укажите в .env файле или переменной окружения")
-            sys.exit(1)
-
-        if not os.path.isdir(media_watch_dir):
-            print(f"✗ Папка медиа не найдена: {media_watch_dir}")
-            sys.exit(1)
-
-        config.setdefault('media_archiver', {})
-        config['media_archiver']['channel_url'] = media_channel_url
-        config['media_archiver']['watch_dir'] = media_watch_dir
-
-        return config
 
     def _init_browser(self) -> BrowserMAX:
         """Инициализировать браузер MAX"""

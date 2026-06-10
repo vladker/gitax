@@ -35,37 +35,40 @@ class TestGetUserDataDir:
         assert "User Data" in result
         assert result.endswith("Default")
 
-    def test_returns_config_path(self):
-        """Returns configured user_data_dir when set in config.yaml."""
+    def test_returns_config_path(self, tmp_path):
+        """Returns user_data_dir from config when set."""
         from browser_max import BrowserMAX
+        from config import init_config, get_config
+
+        # Create a test config file with raw string to avoid escape issues
+        config_file = tmp_path / "test_config.yaml"
+        config_file.write_text("""browser:
+  user_data_dir: "C:\\\\Custom\\\\Chrome\\\\Profile"
+  profile_name: "Profile 1"
+channels:
+  max: https://web.max.ru/test
+""")
 
         bm = BrowserMAX("https://example.com")
-
-        fake_config = {
-            "browser": {
-                "user_data_dir": r"C:\Custom\Chrome\Profile",
-                "profile_name": "Profile 1"
-            }
-        }
-
-        with patch("os.path.exists", return_value=True):
-            with patch("builtins.open", MagicMock()):
-                with patch("yaml.safe_load", return_value=fake_config):
-                    result = bm._get_user_data_dir()
-
+        init_config(str(config_file))
+        result = bm._get_user_data_dir()
         assert r"C:\Custom\Chrome\Profile" in result
         assert "Profile 1" in result
 
-    def test_fallback_when_config_missing(self):
+    def test_fallback_when_config_missing(self, tmp_path):
         """Falls back to default when config file doesn't exist."""
         from browser_max import BrowserMAX
+        from config import init_config
 
+        # Use a non-existent config path
+        nonexistent = tmp_path / "nonexistent.yaml"
         bm = BrowserMAX("https://example.com")
-
-        with patch("os.path.exists", return_value=False):
-            result = bm._get_user_data_dir()
+        init_config(str(nonexistent))
+        result = bm._get_user_data_dir()
 
         assert os.path.isabs(result)
+        assert "Google" in result
+        assert "Chrome" in result
 
     def test_fallback_when_config_empty(self):
         """Falls back to default when browser section is empty."""

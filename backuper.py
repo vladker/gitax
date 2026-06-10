@@ -11,13 +11,12 @@ Backuper — Архивация папок в канал MAX и восстано
 import os
 import sys
 import time
-import yaml
+
 import glob
 import shutil
 import requests
 from datetime import datetime
 
-from dotenv import load_dotenv
 from logging_config import LogMixin
 
 from browser_max import (
@@ -33,7 +32,9 @@ class Backuper(LogMixin):
     """Архивация папок в MAX канал и восстановление"""
 
     def __init__(self, config_path: str = "config.yaml"):
-        self.config = self._load_config(config_path)
+        from config import init_config, get_config
+        init_config(config_path)
+        self.config = get_config().model_dump()
         self.journal = BackuperJournal("backuper_journal.json")
         self.browser: BrowserMAX | None = None
 
@@ -42,31 +43,6 @@ class Backuper(LogMixin):
         os.makedirs(output_dir, exist_ok=True)
         download_dir = self.config.get("backuper", {}).get("download_dir", "./restored")
         os.makedirs(download_dir, exist_ok=True)
-
-    # ── Config ──
-
-    @staticmethod
-    def _load_config(config_path: str) -> dict:
-        load_dotenv()
-        config = {}
-        if os.path.exists(config_path):
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = yaml.safe_load(f) or {}
-
-        channel_url = get_channel_url(config, "backup", label="Backup канал")
-        config.setdefault("backup", {})["channel_url"] = channel_url
-
-        config.setdefault("backuper", {})
-        bk = config["backuper"]
-        bk.setdefault("default_volume_size", "49M")
-        bk.setdefault("compression_level", "5")
-        bk.setdefault("output_dir", "./temp_backups")
-        bk.setdefault("download_dir", "./restored")
-        bk.setdefault("page_size", 10)
-        bk.setdefault("retries", 3)
-        bk.setdefault("retry_delay", 10)
-
-        return config
 
     # ── Browser ──
 
@@ -632,13 +608,15 @@ class Backuper(LogMixin):
     def _extract_7z(self, archive_path: str, extract_dir: str, password: str | None = None) -> bool:
         """Extract 7z archive to directory"""
         import subprocess
-        from browser_max import SEVEN_ZIP_EXE
+        from config import get_config
 
-        if not os.path.exists(SEVEN_ZIP_EXE):
-            self.logger.error(f"7z not found at {SEVEN_ZIP_EXE}")
+        seven_zip_exe = get_config().backuper.seven_zip_exe
+
+        if not os.path.exists(seven_zip_exe):
+            self.logger.error(f"7z not found at {seven_zip_exe}")
             return False
 
-        cmd = [SEVEN_ZIP_EXE, "x", archive_path, f"-o{extract_dir}", "-y"]
+        cmd = [seven_zip_exe, "x", archive_path, f"-o{extract_dir}", "-y"]
         if password:
             cmd.extend([f"-p{password}"])
 
@@ -697,6 +675,7 @@ def main():
     from logging_config import setup_logging, SessionCapture
     import signal
 
+    from dotenv import load_dotenv
     load_dotenv()
     session = SessionCapture()
     session.start()

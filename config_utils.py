@@ -319,3 +319,37 @@ def is_setup_complete(config: dict) -> bool:
 
     # Complete if at least one non-skipped channel configured, or all skipped
     return has_configured or len(skipped) >= 4
+
+
+# ── Thin wrapper over new config/ package ──
+# Deprecated: use from config import get_config, init_config instead
+
+def get_app_config():
+    """Get the centralized AppConfig singleton.
+
+    Returns:
+        AppConfig instance (pydantic BaseModel).
+
+    Note:
+        This is a thin re-export from config/ package for migration convenience.
+        New code should use: from config import get_config
+    """
+    from config import get_config
+    return get_config()
+
+
+def config_from_file(config_path: str = "config.yaml") -> dict:
+    """Load config using the centralized system and return as dict.
+
+    This replaces individual _load_config() calls across modules.
+    Returns a plain dict for backward compatibility.
+
+    Args:
+        config_path: Path to config.yaml
+
+    Returns:
+        Dict representation of the full config
+    """
+    from config import init_config, get_config
+    init_config(config_path)
+    return get_config().model_dump()

@@ -18,14 +18,14 @@ from playwright.sync_api import sync_playwright, Page, Browser, TimeoutError as 
 from logging_config import LogMixin, setup_logging
 
 
-# 7z volume size (49MB to leave buffer for CDN limits)
-SEVEN_ZIP_VOLUME_SIZE = "49M"
-
 # Module-level logger for standalone functions
 _logger = logging.getLogger("gitax")
 
-# 7-Zip executable path (Windows default)
-SEVEN_ZIP_EXE = "C:\\Program Files\\7-Zip\\7z.exe"
+
+def _get_seven_zip_exe() -> str:
+    """Get 7z executable path from config."""
+    from config import get_config
+    return get_config().backuper.seven_zip_exe
 
 
 @dataclass
@@ -35,18 +35,23 @@ class ContentSnapshot:
     file_count: int
 
 
-def split_file_with_7z(filepath: str, volume_size: str = SEVEN_ZIP_VOLUME_SIZE) -> list[str]:
+def split_file_with_7z(filepath: str, volume_size: str | None = None) -> list[str]:
     """
     Split a file into volumes using 7z.
 
     Args:
         filepath: Path to file to split
-        volume_size: Volume size (e.g., "49M", "100M"). Default: 49M
+        volume_size: Volume size (e.g., "49M", "100M"). Default: from config.
 
     Returns:
         List of volume file paths (e.g., ['file.7z.001', 'file.7z.002', ...])
         Returns empty list if split failed or file is small enough.
     """
+    if volume_size is None:
+        from config import get_config
+        volume_size = get_config().backuper.default_volume_size
+    seven_zip_exe = _get_seven_zip_exe()
+
     if not os.path.exists(filepath):
         return []
 
@@ -64,7 +69,7 @@ def split_file_with_7z(filepath: str, volume_size: str = SEVEN_ZIP_VOLUME_SIZE) 
     _cleanup_existing_volumes(output_base)
 
     cmd = [
-        SEVEN_ZIP_EXE,
+        seven_zip_exe,
         "a",
         "-v" + volume_size,  # Volume size (e.g., -v49m)
         "-mx=0",             # No compression (faster, raw split)
@@ -100,7 +105,7 @@ def split_file_with_7z(filepath: str, volume_size: str = SEVEN_ZIP_VOLUME_SIZE) 
         _cleanup_existing_volumes(output_base)
         return []
     except FileNotFoundError:
-        _logger.error(f"7z not found at {SEVEN_ZIP_EXE}")
+        _logger.error(f"7z not found at {seven_zip_exe}")
         return []
     except Exception as e:
         _logger.error(f"7z split error: {e}")
@@ -196,7 +201,7 @@ def group_volumes(filenames: list[str]) -> list[dict]:
 def archive_directory_to_volumes(
     source_dir: str,
     output_base: str,
-    volume_size: str = SEVEN_ZIP_VOLUME_SIZE,
+    volume_size: str | None = None,
     compression_level: int = 5,
     password: str | None = None,
     clean_existing: bool = True
@@ -218,15 +223,20 @@ def archive_directory_to_volumes(
     Returns:
         List of volume file paths, or empty list on failure.
     """
+    if volume_size is None:
+        from config import get_config
+        volume_size = get_config().backuper.default_volume_size
+    seven_zip_exe = _get_seven_zip_exe()
+
     if not os.path.isdir(source_dir):
         _logger.error(f"Source directory not found: {source_dir}")
         return []
-    if not os.path.exists(SEVEN_ZIP_EXE):
-        _logger.error(f"7z not found at {SEVEN_ZIP_EXE}")
+    if not os.path.exists(seven_zip_exe):
+        _logger.error(f"7z not found at {seven_zip_exe}")
         return []
     if clean_existing:
         _cleanup_existing_volumes(output_base)
-    cmd = [SEVEN_ZIP_EXE, "a", f"-mx={compression_level}", output_base, source_dir + os.sep]
+    cmd = [seven_zip_exe, "a", f"-mx={compression_level}", output_base, source_dir + os.sep]
     if volume_size:
         cmd.insert(2, "-v" + volume_size)
     if password:
@@ -259,7 +269,7 @@ def archive_directory_to_volumes(
         _cleanup_existing_volumes(output_base)
         return []
     except FileNotFoundError:
-        _logger.error(f"7z not found at {SEVEN_ZIP_EXE}")
+        _logger.error(f"7z not found at {seven_zip_exe}")
         return []
     except Exception as e:
         _logger.error(f"7z archive error: {e}")
@@ -459,38 +469,15 @@ class BrowserMAX(LogMixin):
             _logger.error(f"Failed to launch Chrome: {e}")
 
     def _get_user_data_dir(self) -> str:
-        """
-        Get Chrome user data directory path.
-
-        Reads browser.user_data_dir from config if set, otherwise falls back to
-        the default Chrome profile directory.
-
-        Returns:
-            Full path to Chrome user data directory with profile.
-        """
-        import yaml
-
-        # Try to read from config.yaml
-        user_data_dir = ""
-        profile_name = "Default"
-
-        try:
-            config_path = "config.yaml"
-            if os.path.exists(config_path):
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    config = yaml.safe_load(f) or {}
-                browser_config = config.get('browser', {})
-                user_data_dir = browser_config.get('user_data_dir', '')
-                profile_name = browser_config.get('profile_name', 'Default')
-        except Exception:
-            pass
-
-        # Fallback to default Chrome directory
+        """Get Chrome user data directory from config with fallback."""
+        from config import get_config
+        cfg = get_config()
+        user_data_dir = cfg.browser.user_data_dir
+        profile_name = cfg.browser.profile_name
         if not user_data_dir:
             user_data_dir = os.path.join(
                 os.path.expanduser("~"), "AppData", "Local", "Google", "Chrome", "User Data"
             )
-
         return os.path.join(user_data_dir, profile_name)
 
     def _disconnect_cdp(self) -> None:
@@ -3070,7 +3057,9 @@ class BrowserMAX(LogMixin):
         print(f"  \u26a1 \u0424\u0430\u0439\u043b: {filename} ({file_size_mb:.1f} MB)")
         print()
         print("  [1] \u041e\u0434\u043d\u043e\u0442\u043e\u043c\u043d\u044b\u0439 \u2014 \u0431\u0435\u0437 \u0440\u0430\u0437\u0434\u0435\u043b\u0435\u043d\u0438\u044f")
-        print(f"  [2] \u041c\u043d\u043e\u0433\u043e\u0442\u043e\u043c\u043d\u044b\u0439 \u2014 \u0440\u0430\u0437\u0434\u0435\u043b\u0438\u0442\u044c \u043d\u0430 \u0442\u043e\u043c\u0430 ({SEVEN_ZIP_VOLUME_SIZE})")
+        from config import get_config as _get_config
+        _default_size = _get_config().backuper.default_volume_size
+        print(f"  [2] \u041c\u043d\u043e\u0433\u043e\u0442\u043e\u043c\u043d\u044b\u0439 \u2014 \u0440\u0430\u0437\u0434\u0435\u043b\u0438\u0442\u044c \u043d\u0430 \u0442\u043e\u043c\u0430 ({_default_size})")
         print("  [3] \u0421\u0432\u043e\u0439 \u0440\u0430\u0437\u043c\u0435\u0440 \u0442\u043e\u043c\u0430")
         print()
 
@@ -3155,7 +3144,8 @@ class BrowserMAX(LogMixin):
             file_size_mb = os.path.getsize(fp) / 1024 / 1024
             filename = os.path.basename(fp)
             should_split = False
-            volume_size = SEVEN_ZIP_VOLUME_SIZE
+            from config import get_config as _get_config
+            volume_size = _get_config().backuper.default_volume_size
 
             # Determine split behavior based on split_mode
             if split_mode == "on":

@@ -11,7 +11,7 @@ import os
 import sys
 import json
 import time
-import yaml
+
 import atexit
 import signal
 import tempfile
@@ -19,11 +19,11 @@ import shutil
 import requests
 from datetime import datetime
 from pathlib import Path
-from dotenv import load_dotenv
+
 from logging_config import setup_logging, LogMixin, SessionCapture
 
 from browser_max import BrowserMAX
-from config_utils import get_channel_url
+
 
 
 class DownloadJournal:
@@ -194,7 +194,9 @@ class ChannelDownloader(LogMixin):
     """
 
     def __init__(self, config_path: str = "config.yaml"):
-        self.config = self._load_config(config_path)
+        from config import init_config, get_config
+        init_config(config_path)
+        self.config = get_config().model_dump()
         self.journal = DownloadJournal("download_journal.json")
         self.browser: BrowserMAX | None = None
         self._shutdown = False
@@ -217,28 +219,6 @@ class ChannelDownloader(LogMixin):
                 self.browser.close()
             except Exception:
                 pass
-
-    def _load_config(self, config_path: str) -> dict:
-        """Загрузить конфигурацию с дефолтами для channel_downloader"""
-        load_dotenv()
-        config = {}
-
-        if os.path.exists(config_path):
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f) or {}
-
-        # Channel URL: standardized via config_utils
-        channel_url = get_channel_url(config, "max", label="MAX канал")
-        config.setdefault('max', {})['channel_url'] = channel_url
-
-        # Set defaults for channel_downloader section
-        config.setdefault('channel_downloader', {})
-        cd_config = config['channel_downloader']
-        cd_config.setdefault('output_dir', './downloads')
-        cd_config.setdefault('retries', 3)
-        cd_config.setdefault('retry_delay', 5)
-
-        return config
 
     def _init_browser(self) -> BrowserMAX:
         """Инициализировать браузер MAX (реюз подключения)"""

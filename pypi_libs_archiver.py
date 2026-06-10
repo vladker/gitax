@@ -11,25 +11,29 @@ PyPI Libraries Archiver — Топ Python библиотек в MAX канал
 import os
 import sys
 import time
-import yaml
 import atexit
 import signal
 import shutil
 from datetime import datetime
-from dotenv import load_dotenv
 from logging_config import setup_logging, LogMixin, SessionCapture
 
 from pypi_api import PyPIAPI
 from browser_max import BrowserMAX
 from pypi_libs_journal import PyPILibsJournal
-from config_utils import get_channel_url, get_split_mode
+from config_utils import get_split_mode
 
 
 class PyPILibsArchiver(LogMixin):
     """Архиватор топ Python библиотек в MAX канал"""
 
     def __init__(self, config_path: str = "config.yaml"):
-        self.config = self._load_config(config_path)
+        from config import init_config, get_config
+        init_config(config_path)
+        self.config = get_config().model_dump()
+        # Ensure output dir exists (was in _load_config)
+        output_dir = self.config.get('pypi_libs_archiver', {}).get('output_dir', './temp_pypi_libs')
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
         self.pypi = PyPIAPI()
         self.journal = PyPILibsJournal("pypi_libs_journal.json")
         self.browser: BrowserMAX | None = None
@@ -70,32 +74,10 @@ class PyPILibsArchiver(LogMixin):
             except Exception:
                 pass
 
-    def _load_config(self, config_path: str) -> dict:
-        """Загрузить конфигурацию (.env + config.yaml)"""
-        load_dotenv()
-        config = {}
-
-        if os.path.exists(config_path):
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f) or {}
-
-        # Channel URL: standardized via config_utils
-        channel_url = get_channel_url(config, "pypi", label="PyPI канал")
-        config.setdefault('pypi_libs', {})['channel_url'] = channel_url
-
-        # Ensure output dir exists
-        config.setdefault('pypi_libs_archiver', {})
-        output_dir = config['pypi_libs_archiver'].get('output_dir', './temp_pypi_libs')
-        config['pypi_libs_archiver']['output_dir'] = output_dir
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir, exist_ok=True)
-
-        return config
-
     def _init_browser(self) -> BrowserMAX:
         """Инициализировать браузер MAX (реиспользует соединение, если живо)"""
         if self.browser is None:
-            channel_url = self.config.get('pypi_libs', {}).get('channel_url', '')
+            channel_url = self.config.get('channels', {}).get('pypi', '')
             use_local = self.config.get('pypi_libs_archiver', {}).get(
                 'use_local_browser',
                 self.config.get('archiver', {}).get('use_local_browser', False)

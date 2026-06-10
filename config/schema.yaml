@@ -1,0 +1,74 @@
+# config/schema.yaml
+# Auto-generated schema — mirrors AppConfig model defaults.
+# Copy to project root as config.yaml and customize.
+# Sensitive values (tokens, URLs) should go in .env instead.
+
+archiver:
+  limit: 1000
+  split_mode: auto           # auto | on | off | prompt
+  split_threshold_mb: 49     # Files above this size (MB) trigger 7z split
+  use_local_browser: false   # false = CDP, true = launch new Chrome
+  output_dir: ./temp
+  retries: 3
+  retry_delay: 10
+  repo_delay: 30
+
+browser:
+  cdp_port: 9222
+  profile_name: Default
+  user_data_dir: ""          # Empty = default Chrome profile path
+
+channels:
+  max: ""                    # MAX channel URL (or set CHANNEL_MAX env var)
+  pypi: ""                   # PyPI channel URL (or set CHANNEL_PYPI env var)
+  media: ""                  # Media channel URL (or set CHANNEL_MEDIA env var)
+  backup: ""                 # Backup channel URL (or set CHANNEL_BACKUP env var)
+
+backuper:
+  compression_level: "5"
+  default_volume_size: 49M   # 7z volume size (e.g., 49M, 100M, 1G)
+  seven_zip_exe: C:\Program Files\7-Zip\7z.exe
+  download_dir: ./restored
+  output_dir: ./temp_backups
+  page_size: 10
+  retries: 3
+  retry_delay: 10
+
+channel_downloader:
+  output_dir: ./downloads
+  retries: 3
+  retry_delay: 5
+
+media_archiver:
+  watch_dir: ""              # Directory to watch for media files
+  extensions:
+    images:
+      - .jpg
+      - .jpeg
+      - .png
+      - .gif
+      - .webp
+      - .bmp
+      - .tiff
+    videos:
+      - .mp4
+      - .mov
+      - .avi
+      - .mkv
+      - .webm
+  use_local_browser: false
+  retries: 3
+  retry_delay: 10
+
+pypi_libs_archiver:
+  limit: 20
+  output_dir: ./temp_pypi_libs
+  retries: 3
+  retry_delay: 10
+  split_mode: auto
+
+setup:
+  skipped_channels: []       # Channels to skip: max, pypi, media, backup
+
+github:
+  token: ""                  # GitHub token — prefer GITHUB_TOKEN env var

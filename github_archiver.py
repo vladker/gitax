@@ -116,7 +116,9 @@ class GitHubArchiver(LogMixin):
     """Главный класс программы"""
 
     def __init__(self, config_path: str = "config.yaml"):
-        self.config = self._load_config(config_path)
+        from config import init_config, get_config
+        init_config(config_path)
+        self.config = get_config().model_dump()
         self.journal = Journal("journal.json")
         self.github = None
         self.max_browser = None
@@ -288,27 +290,7 @@ class GitHubArchiver(LogMixin):
             return True  # Module 5 (service) always enabled
         return ch not in get_skipped_channels(self.config)
 
-    def _load_config(self, config_path: str) -> dict:
-        """Загрузить конфигурацию (config.yaml опционален)"""
-        load_dotenv()
-        config = {}
 
-        if os.path.exists(config_path):
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f) or {}
-
-        # GitHub token: env var > config.yaml
-        env_token = os.environ.get('GITHUB_TOKEN')
-        if env_token:
-            config.setdefault('github', {})['token'] = env_token
-
-        # Channel URL: standardized via config_utils
-        channel_url = get_channel_url(config, "max", label="MAX канал", required=False)
-        config.setdefault('max', {})['channel_url'] = channel_url
-
-
-
-        return config
 
     def _init_github(self) -> GitHubAPI:
         """Инициализировать GitHub API"""
@@ -2410,7 +2392,9 @@ class GitHubArchiver(LogMixin):
 
         # ── Reload config to pick up all changes ──
         load_dotenv(override=True)
-        self.config = self._load_config("config.yaml")
+        from config import init_config, get_config
+        init_config("config.yaml")
+        self.config = get_config().model_dump()
 
         print(f"\n  ✓ Настройка завершена!")
         print(f"  Переменные сохранены в .env и config.yaml")
