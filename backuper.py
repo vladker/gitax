@@ -409,19 +409,25 @@ class Backuper(LogMixin):
                 vol_path = os.path.join(temp_vol_dir, vol_name)
                 print(f"    ↓ {vol_name} ...", end="", flush=True)
 
-                # Find download URL from channel messages
+                # Try URL-based download first (for old journal entries)
                 dl_url = self._find_download_url(browser, vol_name, arch.get("volume_urls", {}))
-                if not dl_url:
-                    print(" ✗ URL не найден")
-                    all_vols_downloaded = False
-                    break
+                if dl_url:
+                    try:
+                        self._download_file(browser, dl_url, vol_path)
+                        print(" ✓")
+                        downloaded_paths.append(vol_path)
+                        continue
+                    except Exception as e:
+                        print(f" ✗ {e}")
+                        all_vols_downloaded = False
+                        break
 
-                try:
-                    self._download_file(browser, dl_url, vol_path)
+                # Fallback: click MAX's download button and capture via Playwright
+                if self._download_via_playwright(browser, vol_name, vol_path):
                     print(" ✓")
                     downloaded_paths.append(vol_path)
-                except Exception as e:
-                    print(f" ✗ {e}")
+                else:
+                    print(" ✗ URL не найден")
                     all_vols_downloaded = False
                     break
 
@@ -519,85 +525,53 @@ class Backuper(LogMixin):
         except Exception as e:
             self.logger.warning(f"Failed to find download URL for {filename}: {e}")
 
-        # ── Debug diagnostics ──
-        # Try cached debug data from scan phase first (DOM may have changed)
-        print(f"  [DEBUG] URL не найден для '{filename}'. Сбор диагностики...")
+        # ── Diagnostic summary ──
         try:
             cached_debug = browser.page.evaluate("() => window.__gitax_url_extract_debug || null")
             if cached_debug and isinstance(cached_debug, dict):
-                samples = cached_debug.get("archiveMsgSamples", [])
                 total_msgs = cached_debug.get("totalMessages", 0)
                 strat = cached_debug.get("byStrategy", {})
-                print(f"  [DEBUG] При сканировании: {total_msgs} сообщений в DOM")
-                print(f"  [DEBUG]   Стратегии: a[download]={strat.get('a_download',0)}, "
+                n_7z = len(cached_debug.get("archiveMsgSamples", []))
+                print(f"  [DEBUG] При сканировании: {total_msgs} сообщений, "
+                      f"{n_7z} с .7z, URL не найдены "
+                      f"(стратегии: a[download]={strat.get('a_download',0)}, "
                       f"a[href]={strat.get('a_href_download',0)}, "
-                      f"video={strat.get('video',0)}, img={strat.get('img',0)}, "
-                      f"genericFile={strat.get('genericFile',0)}")
-                print(f"  [DEBUG]   Без filename: {cached_debug.get('skippedNoFilename',0)}, "
-                      f"с filename без URL: {cached_debug.get('skippedNoUrl',0)}")
-                if samples:
-                    print(f"  [DEBUG]   {len(samples)} сообщений с .7z в DOM при сканировании:")
-                    for i, s in enumerate(samples):
-                        print(f"  [DEBUG]   #{i}: class='{s.get('className','')[:80]}' "
-                              f"tag={s.get('tagName','')}")
-                        print(f"  [DEBUG]     Текст: {s.get('text','')[:200]}")
-                        outer = s.get('outerHTML', '')
-                        if outer:
-                            print(f"  [DEBUG]     outerHTML (первые 2000):")
-                            print(outer[:2000])
-                        links = s.get("links", [])
-                        if links:
-                            print(f"  [DEBUG]     {len(links)} ссылок:")
-                            for li in links:
-                                print(f"      href='{li.get('href','')[:200]}' "
-                                      f"download='{li.get('download','')}' "
-                                      f"text='{li.get('text','')[:60]}'")
-                        buttons = s.get("buttons", [])
-                        if buttons:
-                            print(f"  [DEBUG]     {len(buttons)} кнопок:")
-                            for b in buttons[:5]:
-                                print(f"      text='{b.get('text','')[:60]}'")
-                        data_attrs = s.get("dataAttrs", {})
-                        if data_attrs:
-                            print(f"  [DEBUG]     data-атрибуты: "
-                                  f"{dict(list(data_attrs.items())[:15])}")
-                        all_attrs = s.get("allAttrs", {})
-                        if all_attrs:
-                            print(f"  [DEBUG]     атрибуты сообщения: "
-                                  f"{dict(list(all_attrs.items())[:15])}")
-                else:
-                    print(f"  [DEBUG]   Нет сообщений с .7z в DOM при сканировании")
-                    # Show first message sample if available
-                    first_sample = cached_debug.get("firstMsgSample", "")
-                    if first_sample:
-                        print(f"  [DEBUG]   Первое сообщение в DOM:")
-                        print(f"    class={cached_debug.get('firstMsgClasses','')[:100]}")
-                        print(f"    tag={cached_debug.get('firstMsgTag','')}")
-                        print(f"    outerHTML: {first_sample[:1500]}")
-            else:
-                print(f"  [DEBUG] Нет кэшированных данных сканирования")
-        except Exception as ce:
-            self.logger.debug(f"_find_download_url: cached debug read failed: {ce}")
-
-        # Also try live DOM dump (may be empty due to virtual scrolling)
-        try:
-            live_info = browser._debug_dump_file_messages(filename)
-            total_live = live_info.get("total_messages", 0)
-            if total_live > 0:
-                print(f"  [DEBUG] LIVE DOM: {total_live} сообщений, "
-                      f"{len(live_info.get('matching_messages',[]))} содержат '{filename}'")
-            api_urls = live_info.get("api_urls", [])
-            if api_urls:
-                print(f"  [DEBUG] API file-related URLs ({len(api_urls)}):")
-                for u in api_urls[:5]:
-                    print(f"    {u}")
+                      f"genericFile={strat.get('genericFile',0)})")
+                print(f"  [DEBUG] MAX не хранит download URL в DOM "
+                      f"— используется Playwright click-to-download")
         except Exception:
             pass
 
         return None
+
+    def _download_via_playwright(self, browser: BrowserMAX, filename: str, output_path: str) -> bool:
+        """Download file by clicking MAX download button and capturing via Playwright
+
+        MAX doesn't embed download URLs in the DOM — the download button is a
+        <button> with a JavaScript click handler. This method clicks the button
+        and uses Playwright's download event to capture the file.
+        """
+        try:
+            # Find the download button within the message containing the filename
+            button = (
+                browser.page.locator('[class*="message"]')
+                .filter(has_text=filename)
+                .locator('button[aria-label="Скачать"]')
+                .first
+            )
+
+            # Click and capture download via Playwright
+            with browser.page.expect_download() as download_info:
+                button.click(timeout=10000)
+
+            download = download_info.value
+            download.save_as(output_path)
+            self.logger.info(f"Downloaded '{filename}' via Playwright: {output_path}")
+            return True
+
         except Exception as e:
-            self.logger.warning(f"Failed to find download URL for {filename}: {e}")
-            return None
+            self.logger.warning(f"Playwright download failed for '{filename}': {e}")
+            return False
 
     def _download_file(self, browser: BrowserMAX, url: str, output_path: str):
         """Download file using requests + browser cookies"""
