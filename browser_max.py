@@ -4105,10 +4105,12 @@ class BrowserMAX(LogMixin):
                                 })),
                                 dataAttrs: (() => {
                                     const attrs = {};
-                                    const all = msg.querySelectorAll('[data-*]');
+                                    // NOTE: [data-*] is NOT a valid CSS selector.
+                                    // Use JS loop over all elements + attribute check.
+                                    const all = msg.querySelectorAll('*');
                                     all.forEach(el => {
                                         Array.from(el.attributes).forEach(a => {
-                                            if (a.name.startsWith('data-')) {
+                                            if (a.name.startsWith('data-') && !(a.name in attrs)) {
                                                 attrs[a.name] = (a.value || '').slice(0, 200);
                                             }
                                         });
@@ -4367,10 +4369,13 @@ class BrowserMAX(LogMixin):
                         });
 
                         // data-* attributes from all children
+                        // NOTE: [data-*] is NOT a valid CSS selector.
+                        // Use JS loop over all elements + attribute check.
                         const dataAttrMap = {};
-                        msg.querySelectorAll('[data-*]').forEach(el => {
+                        const allElements = msg.querySelectorAll('*');
+                        allElements.forEach(el => {
                             Array.from(el.attributes).forEach(a => {
-                                if (a.name.startsWith('data-') && !dataAttrMap[a.name]) {
+                                if (a.name.startsWith('data-') && !(a.name in dataAttrMap)) {
                                     dataAttrMap[a.name] = (a.value || '').slice(0, 200);
                                 }
                             });

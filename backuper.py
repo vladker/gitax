@@ -485,8 +485,8 @@ class Backuper(LogMixin):
         if url_map and filename in url_map:
             return url_map[filename]
 
-        # Fallback: direct DOM query (for old journal entries, manual calls)
         self.logger.debug(f"_find_download_url: fast path miss for '{filename}', trying DOM fallback")
+        # Fallback: direct DOM query (for old journal entries, manual calls)
         try:
             url = browser.page.evaluate("""
                 (filename) => {
@@ -514,50 +514,87 @@ class Backuper(LogMixin):
                 return url
             else:
                 self.logger.warning(
-                    f"_find_download_url: DOM fallback returned null for '{filename}'. "
-                    f"Running debug DOM dump..."
+                    f"_find_download_url: DOM fallback returned null for '{filename}'."
                 )
-                # Dump DOM debug info to help diagnose the issue
-                try:
-                    debug_info = browser._debug_dump_file_messages(filename)
-                    total_m = debug_info.get("total_messages", 0)
-                    matching = debug_info.get("matching_messages", [])
-                    api_urls = debug_info.get("api_urls", [])
-                    print(f"  [DEBUG] DOM: {total_m} сообщений, {len(matching)} содержат '{filename}'")
-                    if matching:
-                        for m in matching:
-                            print(f"  [DEBUG]   Msg #{m.get('index')}: tag={m.get('tagName')} "
-                                  f"class='{m.get('className','')[:80]}'")
-                            print(f"  [DEBUG]   Текст: {m.get('textPreview','')[:200]}")
-                            print(f"  [DEBUG]   outerHTML (первые 1500): {m.get('outerHTML','')[:1500]}")
-                            links = m.get("links", [])
-                            if links:
-                                print(f"  [DEBUG]   {len(links)} ссылок:")
-                                for li in links:
-                                    print(f"    href='{li.get('href','')[:200]}' "
-                                          f"download='{li.get('download','')}' "
-                                          f"text='{li.get('text','')[:60]}'")
-                            buttons = m.get("buttons", [])
-                            if buttons:
-                                print(f"  [DEBUG]   {len(buttons)} кнопок:")
-                                for b in buttons[:5]:
-                                    print(f"    text='{b.get('text','')[:60]}' "
-                                          f"ariaLabel='{b.get('ariaLabel','')[:60]}'")
-                            attrs = m.get("attributes", {})
-                            if attrs:
-                                print(f"  [DEBUG]   Атрибуты сообщения: {dict(list(attrs.items())[:15])}")
-                            data_attrs = m.get("dataAttrs", {})
-                            if data_attrs:
-                                print(f"  [DEBUG]   data-* атрибуты: {dict(list(data_attrs.items())[:15])}")
-                    if api_urls:
-                        print(f"  [DEBUG] API URL (file-related): {len(api_urls)}")
-                        for u in api_urls:
-                            print(f"    {u}")
-                    else:
-                        print(f"  [DEBUG] API responses: нет file-related URL")
-                except Exception as de:
-                    self.logger.warning(f"_find_download_url: debug dump failed: {de}")
-                return None
+        except Exception as e:
+            self.logger.warning(f"Failed to find download URL for {filename}: {e}")
+
+        # ── Debug diagnostics ──
+        # Try cached debug data from scan phase first (DOM may have changed)
+        print(f"  [DEBUG] URL не найден для '{filename}'. Сбор диагностики...")
+        try:
+            cached_debug = browser.page.evaluate("() => window.__gitax_url_extract_debug || null")
+            if cached_debug and isinstance(cached_debug, dict):
+                samples = cached_debug.get("archiveMsgSamples", [])
+                total_msgs = cached_debug.get("totalMessages", 0)
+                strat = cached_debug.get("byStrategy", {})
+                print(f"  [DEBUG] При сканировании: {total_msgs} сообщений в DOM")
+                print(f"  [DEBUG]   Стратегии: a[download]={strat.get('a_download',0)}, "
+                      f"a[href]={strat.get('a_href_download',0)}, "
+                      f"video={strat.get('video',0)}, img={strat.get('img',0)}, "
+                      f"genericFile={strat.get('genericFile',0)}")
+                print(f"  [DEBUG]   Без filename: {cached_debug.get('skippedNoFilename',0)}, "
+                      f"с filename без URL: {cached_debug.get('skippedNoUrl',0)}")
+                if samples:
+                    print(f"  [DEBUG]   {len(samples)} сообщений с .7z в DOM при сканировании:")
+                    for i, s in enumerate(samples):
+                        print(f"  [DEBUG]   #{i}: class='{s.get('className','')[:80]}' "
+                              f"tag={s.get('tagName','')}")
+                        print(f"  [DEBUG]     Текст: {s.get('text','')[:200]}")
+                        outer = s.get('outerHTML', '')
+                        if outer:
+                            print(f"  [DEBUG]     outerHTML (первые 2000):")
+                            print(outer[:2000])
+                        links = s.get("links", [])
+                        if links:
+                            print(f"  [DEBUG]     {len(links)} ссылок:")
+                            for li in links:
+                                print(f"      href='{li.get('href','')[:200]}' "
+                                      f"download='{li.get('download','')}' "
+                                      f"text='{li.get('text','')[:60]}'")
+                        buttons = s.get("buttons", [])
+                        if buttons:
+                            print(f"  [DEBUG]     {len(buttons)} кнопок:")
+                            for b in buttons[:5]:
+                                print(f"      text='{b.get('text','')[:60]}'")
+                        data_attrs = s.get("dataAttrs", {})
+                        if data_attrs:
+                            print(f"  [DEBUG]     data-атрибуты: "
+                                  f"{dict(list(data_attrs.items())[:15])}")
+                        all_attrs = s.get("allAttrs", {})
+                        if all_attrs:
+                            print(f"  [DEBUG]     атрибуты сообщения: "
+                                  f"{dict(list(all_attrs.items())[:15])}")
+                else:
+                    print(f"  [DEBUG]   Нет сообщений с .7z в DOM при сканировании")
+                    # Show first message sample if available
+                    first_sample = cached_debug.get("firstMsgSample", "")
+                    if first_sample:
+                        print(f"  [DEBUG]   Первое сообщение в DOM:")
+                        print(f"    class={cached_debug.get('firstMsgClasses','')[:100]}")
+                        print(f"    tag={cached_debug.get('firstMsgTag','')}")
+                        print(f"    outerHTML: {first_sample[:1500]}")
+            else:
+                print(f"  [DEBUG] Нет кэшированных данных сканирования")
+        except Exception as ce:
+            self.logger.debug(f"_find_download_url: cached debug read failed: {ce}")
+
+        # Also try live DOM dump (may be empty due to virtual scrolling)
+        try:
+            live_info = browser._debug_dump_file_messages(filename)
+            total_live = live_info.get("total_messages", 0)
+            if total_live > 0:
+                print(f"  [DEBUG] LIVE DOM: {total_live} сообщений, "
+                      f"{len(live_info.get('matching_messages',[]))} содержат '{filename}'")
+            api_urls = live_info.get("api_urls", [])
+            if api_urls:
+                print(f"  [DEBUG] API file-related URLs ({len(api_urls)}):")
+                for u in api_urls[:5]:
+                    print(f"    {u}")
+        except Exception:
+            pass
+
+        return None
         except Exception as e:
             self.logger.warning(f"Failed to find download URL for {filename}: {e}")
             return None
