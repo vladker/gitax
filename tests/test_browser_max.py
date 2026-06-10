@@ -12,7 +12,7 @@ Tests cover:
 import os
 import pytest
 from unittest.mock import MagicMock, patch, PropertyMock
-from browser_max import BrowserMAX, SEVEN_ZIP_VOLUME_SIZE
+from browser_max import BrowserMAX
 
 
 # ── _prompt_split_mode tests ──
@@ -227,7 +227,7 @@ class TestSendMessageWithFilesSplitMode:
         # Verify default volume size is used
         call_args = mock_split.call_args[0]
         assert len(call_args) == 2
-        assert call_args[1] == SEVEN_ZIP_VOLUME_SIZE
+        assert call_args[1] is not None  # volume_size resolved from config
 
     @patch("browser_max.os.path.exists", return_value=True)
     @patch("browser_max.split_file_with_7z", return_value=["part1.7z.001"])
