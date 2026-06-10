@@ -183,7 +183,7 @@ class MediaArchiver(LogMixin):
     def _init_browser(self) -> BrowserMAX:
         """Инициализировать браузер MAX"""
         if self.browser is None:
-            channel_url = self.config.get('media_archiver', {}).get('channel_url', '')
+            channel_url = self.config.get('channels', {}).get('media', '')
             use_local = self.config.get('media_archiver', {}).get('use_local_browser',
                          self.config.get('archiver', {}).get('use_local_browser', False))
             self.browser = BrowserMAX(channel_url, use_local_browser=use_local)

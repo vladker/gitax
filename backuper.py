@@ -48,7 +48,7 @@ class Backuper(LogMixin):
 
     def _init_browser(self) -> BrowserMAX:
         if self.browser is None:
-            channel_url = self.config.get("backup", {}).get("channel_url", "")
+            channel_url = self.config.get("channels", {}).get("backup", "")
             use_local = self.config.get("archiver", {}).get("use_local_browser", False)
             self.browser = BrowserMAX(channel_url, use_local_browser=use_local)
         return self.browser

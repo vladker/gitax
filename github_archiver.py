@@ -303,7 +303,7 @@ class GitHubArchiver(LogMixin):
     def _init_max_browser(self) -> BrowserMAX:
         """Initialize MAX browser (reuses connection if alive)"""
         if self.max_browser is None:
-            channel_url = self.config.get('max', {}).get('channel_url', '')
+            channel_url = self.config.get('channels', {}).get('max', '')
             # Default to CDP (existing browser) for seamless UX
             # Use local browser only if explicitly requested
             use_local = self.config.get('archiver', {}).get('use_local_browser', False)
