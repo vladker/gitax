@@ -161,6 +161,112 @@ def cleanup_volumes(volume_paths: list[str]):
             _logger.warning(f"Failed to remove {vp}: {e}")
 
 
+def group_volumes(filenames: list[str]) -> list[dict]:
+    """
+    Group 7z volume files by base archive name.
+
+    Groups:
+    - "documents.7z.001", "documents.7z.002" -> base "documents.7z"
+    - "photos.7z" -> base "photos.7z"
+
+    Args:
+        filenames: List of 7z-related filenames
+
+    Returns:
+        List of dicts: [{"base_name": "docs.7z", "volume_count": 3,
+                         "volumes": ["docs.7z.001", ...]}, ...]
+    """
+    import re
+    groups: dict[str, list[str]] = {}
+    for fn in filenames:
+        m = re.match(r'^(.+\.7z)(\.\d+)?$', fn)
+        if m:
+            base = m.group(1)
+            groups.setdefault(base, []).append(fn)
+    result = []
+    for base, volumes in groups.items():
+        result.append({
+            "base_name": base,
+            "volume_count": len(volumes),
+            "volumes": sorted(volumes),
+        })
+    return result
+
+
+def archive_directory_to_volumes(
+    source_dir: str,
+    output_base: str,
+    volume_size: str = SEVEN_ZIP_VOLUME_SIZE,
+    compression_level: int = 5,
+    password: str | None = None,
+    clean_existing: bool = True
+) -> list[str]:
+    """
+    Archive an entire directory into 7z volumes with compression and optional password.
+
+    Unlike split_file_with_7z() which does raw split (-mx=0), this creates
+    proper compressed 7z archives with encryption.
+
+    Args:
+        source_dir: Path to directory to archive
+        output_base: Base path for output (e.g., "./temp/name.7z")
+        volume_size: Volume size string (e.g., "49M"). None for single archive.
+        compression_level: 7z compression level 0-9 (default 5)
+        password: Optional encryption password
+        clean_existing: Remove existing volumes before archiving
+
+    Returns:
+        List of volume file paths, or empty list on failure.
+    """
+    if not os.path.isdir(source_dir):
+        _logger.error(f"Source directory not found: {source_dir}")
+        return []
+    if not os.path.exists(SEVEN_ZIP_EXE):
+        _logger.error(f"7z not found at {SEVEN_ZIP_EXE}")
+        return []
+    if clean_existing:
+        _cleanup_existing_volumes(output_base)
+    cmd = [SEVEN_ZIP_EXE, "a", f"-mx={compression_level}", output_base, source_dir + os.sep]
+    if volume_size:
+        cmd.insert(2, "-v" + volume_size)
+    if password:
+        cmd.insert(2, f"-p{password}")
+        cmd.insert(2, "-mhe=on")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        if result.returncode != 0:
+            _logger.warning(f"7z archive failed: {result.stderr}")
+            if clean_existing:
+                _cleanup_existing_volumes(output_base)
+            return []
+        volumes = _find_volumes(output_base)
+        if not volumes and not volume_size:
+            single = output_base if output_base.endswith('.7z') else output_base + '.7z'
+            if os.path.exists(single):
+                volumes = [single]
+        if volumes:
+            total_size = sum(os.path.getsize(v) for v in volumes if os.path.exists(v))
+            _logger.info(
+                f"Archived {source_dir} -> {len(volumes)} volume(s), "
+                f"total {total_size / 1024 / 1024:.1f} MB"
+            )
+            return volumes
+        else:
+            _logger.warning("7z succeeded but no output files found")
+            return []
+    except subprocess.TimeoutExpired:
+        _logger.error("7z archive timeout")
+        _cleanup_existing_volumes(output_base)
+        return []
+    except FileNotFoundError:
+        _logger.error(f"7z not found at {SEVEN_ZIP_EXE}")
+        return []
+    except Exception as e:
+        _logger.error(f"7z archive error: {e}")
+        _cleanup_existing_volumes(output_base)
+        return []
+
+
 class BrowserMAXError(Exception):
     """Base exception for BrowserMAX errors"""
     pass
@@ -3848,6 +3954,549 @@ class BrowserMAX(LogMixin):
         self.logger.info(f"Total unique messages: {len(all_messages)} ({total_passes + reload_count} passes)")
 
         return all_messages
+
+    def _extract_file_urls(self) -> dict[str, str]:
+        """
+        Extract filename → download_url map from current DOM.
+
+        Uses a single page.evaluate() JS call that scans all message-like
+        elements, applying the same CSS selectors as scan_channel_for_files().
+
+        On failure or empty result, logs debug info (message count, strategy
+        match stats, first message outerHTML sample) to help diagnose MAX's
+        DOM structure for file messages.
+
+        Returns:
+            Dict mapping filename (str) → download URL (str).
+            Empty dict if no files found or on error.
+        """
+        self._check_connection()
+        try:
+            result = self.page.evaluate(r"""
+                () => {
+                    const result = {};
+                    const seen = new Set();
+
+                    // Debug counters
+                    const debug = {
+                        totalMessages: 0,
+                        byStrategy: { a_download: 0, a_href_download: 0, video: 0, img: 0, genericFile: 0 },
+                        withFilenameOnly: 0,  // strategy 5 hit but no URL
+                        skippedNoFilename: 0,
+                        skippedNoUrl: 0,
+                        firstMsgClasses: '',
+                        firstMsgTag: '',
+                        firstMsgSample: '',
+                        archiveMsgSamples: [],  // outerHTML of messages containing .7z
+                    };
+
+                    // Find all message-like elements in the feed
+                    const messages = document.querySelectorAll(
+                        '[class*="message"],[class*="msg"],' +
+                        '[class*="lenta-item"],[class*="feed-item"]'
+                    );
+                    debug.totalMessages = messages.length;
+
+                    if (messages.length > 0) {
+                        const first = messages[0];
+                        debug.firstMsgClasses = first.className || '';
+                        debug.firstMsgTag = first.tagName || '';
+                        debug.firstMsgSample = (first.outerHTML || '').slice(0, 1500);
+                    }
+
+                    messages.forEach((msg) => {
+                        let filename = '';
+                        let downloadUrl = '';
+                        const msgText = msg.textContent || '';
+
+                        // 1. Direct download links: a[download]
+                        const downloadLinks = msg.querySelectorAll('a[download]');
+                        for (const a of downloadLinks) {
+                            const href = a.getAttribute('href') || '';
+                            const name = a.getAttribute('download') || '';
+                            if (name && href) {
+                                filename = name;
+                                downloadUrl = href;
+                                debug.byStrategy.a_download++;
+                                break;
+                            }
+                        }
+
+                        // 2. Alternative download links (a[href*="download"])
+                        if (!filename) {
+                            const altLinks = msg.querySelectorAll(
+                                'a[href*="download"],a[href*="attachment"]'
+                            );
+                            for (const a of altLinks) {
+                                const href = a.getAttribute('href') || '';
+                                if (href) {
+                                    downloadUrl = href;
+                                    filename = a.textContent?.trim()
+                                        || href.split('/').pop() || '';
+                                    debug.byStrategy.a_href_download++;
+                                    break;
+                                }
+                            }
+                        }
+
+                        // 3. Video elements with src attribute
+                        if (!filename) {
+                            const videos = msg.querySelectorAll('video[src]');
+                            if (videos.length > 0) {
+                                const src = videos[0].getAttribute('src') || '';
+                                downloadUrl = src;
+                                filename = videos[0].getAttribute('title')
+                                    || src.split('/').pop() || 'video.mp4';
+                                debug.byStrategy.video++;
+                            }
+                        }
+
+                        // 4. Image elements (non-emoji, non-avatar)
+                        if (!filename) {
+                            const imgs = msg.querySelectorAll('img[src]');
+                            for (const img of imgs) {
+                                const src = img.getAttribute('src') || '';
+                                if (src && !src.includes('emoji')
+                                    && !src.includes('avatar')) {
+                                    downloadUrl = src;
+                                    filename = img.getAttribute('alt')
+                                        || src.split('/').pop() || 'image.jpg';
+                                    debug.byStrategy.img++;
+                                    break;
+                                }
+                            }
+                        }
+
+                        // 5. Generic file/attachment indicator classes (NAME ONLY, no URL)
+                        if (!filename) {
+                            const fileEls = msg.querySelectorAll(
+                                '[class*="file"],[class*="attach"]'
+                            );
+                            for (const el of fileEls) {
+                                const title = el.getAttribute('title')
+                                    || el.getAttribute('alt') || '';
+                                if (title) {
+                                    filename = title;
+                                    debug.byStrategy.genericFile++;
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Collect .7z message samples for debug
+                        if (msgText.includes('.7z')) {
+                            debug.archiveMsgSamples.push({
+                                text: msgText.slice(0, 300),
+                                html: (msg.innerHTML || '').slice(0, 2000),
+                                outerHTML: (msg.outerHTML || '').slice(0, 2000),
+                                className: msg.className || '',
+                                tagName: msg.tagName || '',
+                                links: Array.from(msg.querySelectorAll('a')).map(a => ({
+                                    href: a.getAttribute('href') || '',
+                                    download: a.getAttribute('download') || '',
+                                    text: (a.textContent || '').trim().slice(0, 100),
+                                    rel: a.getAttribute('rel') || '',
+                                    target: a.getAttribute('target') || '',
+                                    onclick: a.getAttribute('onclick') ? true : false,
+                                })),
+                                buttons: Array.from(msg.querySelectorAll('button')).map(b => ({
+                                    text: (b.textContent || '').trim().slice(0, 100),
+                                    onclick: b.getAttribute('onclick') ? true : false,
+                                })),
+                                dataAttrs: (() => {
+                                    const attrs = {};
+                                    const all = msg.querySelectorAll('[data-*]');
+                                    all.forEach(el => {
+                                        Array.from(el.attributes).forEach(a => {
+                                            if (a.name.startsWith('data-')) {
+                                                attrs[a.name] = (a.value || '').slice(0, 200);
+                                            }
+                                        });
+                                    });
+                                    return attrs;
+                                })(),
+                                allAttrs: (() => {
+                                    const attrs = {};
+                                    Array.from(msg.attributes).forEach(a => {
+                                        attrs[a.name] = (a.value || '').slice(0, 200);
+                                    });
+                                    return attrs;
+                                })(),
+                            });
+                            // Keep max 3 samples to avoid huge payload
+                            if (debug.archiveMsgSamples.length >= 3) return;
+                        }
+
+                        // Skip messages without filenames
+                        if (!filename) {
+                            debug.skippedNoFilename++;
+                            return;
+                        }
+                        if (!downloadUrl) {
+                            debug.skippedNoUrl++;
+                            debug.withFilenameOnly++;
+                            return;
+                        }
+
+                        // Deduplicate by filename (first occurrence wins)
+                        if (seen.has(filename)) return;
+                        seen.add(filename);
+
+                        result[filename] = downloadUrl;
+                    });
+
+                    // Store debug info for Python-side retrieval
+                    window.__gitax_url_extract_debug = debug;
+
+                    return { urlMap: result, debug: debug };
+                }
+            """)
+            url_map = result.get("urlMap", {}) if isinstance(result, dict) else {}
+            debug = result.get("debug", {}) if isinstance(result, dict) else {}
+
+            if not isinstance(url_map, dict):
+                url_map = {}
+
+            # Log debug info if empty or suspicious
+            total_msgs = debug.get("totalMessages", 0)
+            skipped_url = debug.get("skippedNoUrl", 0)
+            skipped_fn = debug.get("skippedNoFilename", 0)
+            strat = debug.get("byStrategy", {})
+
+            if total_msgs == 0:
+                self.logger.warning(
+                    "_extract_file_urls: 0 message-like elements found in DOM. "
+                    "MAX may use different CSS class names."
+                )
+            elif not url_map and total_msgs > 0:
+                self.logger.warning(
+                    f"_extract_file_urls: no files found in {total_msgs} messages. "
+                    f"Skipped (no filename): {skipped_fn}, (no URL): {skipped_url}. "
+                    f"Strategy hits: a[download]={strat.get('a_download',0)}, "
+                    f"a[href*=download]={strat.get('a_href_download',0)}, "
+                    f"video={strat.get('video',0)}, img={strat.get('img',0)}, "
+                    f"genericFile={strat.get('genericFile',0)}. "
+                    f"First msg class: {debug.get('firstMsgClasses','')[:100]}"
+                )
+                # Print to stderr so user sees it in console
+                print(
+                    f"  [DEBUG] _extract_file_urls: 0 URL в {total_msgs} сообщениях. "
+                    f"Стратегии: a[download]={strat.get('a_download',0)}, "
+                    f"a[href]={strat.get('a_href_download',0)}, "
+                    f"video={strat.get('video',0)}, img={strat.get('img',0)}, "
+                    f"genericFile={strat.get('genericFile',0)}",
+                    file=sys.stderr,
+                )
+            elif url_map:
+                self.logger.info(
+                    f"_extract_file_urls: {len(url_map)} file(s) from {total_msgs} messages. "
+                    f"Strategy hits: a[download]={strat.get('a_download',0)}, "
+                    f"a[href*=download]={strat.get('a_href_download',0)}"
+                )
+
+            # Dump .7z message samples to log for debugging
+            samples = debug.get("archiveMsgSamples", [])
+            if samples:
+                self.logger.info(f"_extract_file_urls: {len(samples)} .7z message(s) in DOM")
+                for i, s in enumerate(samples):
+                    self.logger.info(
+                        f"  .7z msg #{i}: class='{s.get('className','')[:120]}' "
+                        f"tag={s.get('tagName','')} "
+                        f"text='{s.get('text','')[:200]}'"
+                    )
+                    self.logger.info(
+                        f"  .7z msg #{i} outerHTML (first 1000): {s.get('outerHTML','')[:1000]}"
+                    )
+                    links = s.get("links", [])
+                    if links:
+                        self.logger.info(f"  .7z msg #{i}: {len(links)} link(s):")
+                        for li in links:
+                            self.logger.info(
+                                f"    href='{li.get('href','')[:200]}' "
+                                f"download='{li.get('download','')}' "
+                                f"text='{li.get('text','')[:80]}' "
+                                f"onclick={li.get('onclick',False)}"
+                            )
+                    buttons = s.get("buttons", [])
+                    if buttons:
+                        self.logger.info(f"  .7z msg #{i}: {len(buttons)} button(s)")
+                    data_attrs = s.get("dataAttrs", {})
+                    if data_attrs:
+                        self.logger.info(f"  .7z msg #{i}: data attrs: {dict(list(data_attrs.items())[:10])}")
+                    all_attrs = s.get("allAttrs", {})
+                    if all_attrs:
+                        self.logger.info(f"  .7z msg #{i}: all attrs: {dict(list(all_attrs.items())[:15])}")
+
+            return url_map
+        except Exception:
+            self.logger.warning("_extract_file_urls: evaluate failed", exc_info=True)
+            return {}
+
+    def _debug_dump_file_messages(self, target_filename: str | None = None) -> dict:
+        """
+        Debug helper: dump DOM structure of file messages for diagnosis.
+
+        Runs a JS evaluate that scans all message-like elements and returns
+        their outerHTML, attributes, links, and button info. If target_filename
+        is provided, filters to messages containing that filename.
+
+        Also checks window.__gitax_api_responses for file download URLs.
+
+        Returns:
+            Dict with keys:
+            - total_messages: int
+            - matching_messages: list of dicts with message DOM details
+            - api_urls: list of API response URLs found in interceptor
+        """
+        self._check_connection()
+        result: dict = {"total_messages": 0, "matching_messages": [], "api_urls": []}
+
+        try:
+            dump = self.page.evaluate("""
+                (targetFn) => {
+                    const msgs = document.querySelectorAll(
+                        '[class*="message"],[class*="msg"],' +
+                        '[class*="lenta-item"],[class*="feed-item"]'
+                    );
+                    const matching = [];
+                    let total = msgs.length;
+
+                    msgs.forEach((msg, idx) => {
+                        const text = msg.textContent || '';
+                        if (targetFn && !text.includes(targetFn)) return;
+
+                        const info = {
+                            index: idx,
+                            tagName: msg.tagName,
+                            className: (msg.className || '').slice(0, 500),
+                            textPreview: text.slice(0, 300),
+                            outerHTML: (msg.outerHTML || '').slice(0, 3000),
+                            innerHTML: (msg.innerHTML || '').slice(0, 1500),
+                            attributes: {},
+                            links: [],
+                            buttons: [],
+                            inputs: [],
+                            imgs: [],
+                            videos: [],
+                            audios: [],
+                            iframes: [],
+                            dataAttrs: {},
+                        };
+
+                        // All attributes
+                        Array.from(msg.attributes).forEach(a => {
+                            info.attributes[a.name] = (a.value || '').slice(0, 300);
+                        });
+
+                        // Links
+                        msg.querySelectorAll('a').forEach(a => {
+                            info.links.push({
+                                href: a.getAttribute('href') || '',
+                                download: a.getAttribute('download') || '',
+                                text: (a.textContent || '').trim().slice(0, 100),
+                                rel: a.getAttribute('rel') || '',
+                                target: a.getAttribute('target') || '',
+                                type: a.getAttribute('type') || '',
+                                onclick: !!a.getAttribute('onclick'),
+                                className: (a.className || '').slice(0, 100),
+                                role: a.getAttribute('role') || '',
+                                ariaLabel: a.getAttribute('aria-label') || '',
+                            });
+                        });
+
+                        // Buttons
+                        msg.querySelectorAll('button').forEach(b => {
+                            info.buttons.push({
+                                text: (b.textContent || '').trim().slice(0, 100),
+                                onclick: !!b.getAttribute('onclick'),
+                                className: (b.className || '').slice(0, 100),
+                                type: b.getAttribute('type') || '',
+                                ariaLabel: b.getAttribute('aria-label') || '',
+                                value: b.getAttribute('value') || '',
+                                formAction: b.getAttribute('formaction') || '',
+                            });
+                        });
+
+                        // Inputs
+                        msg.querySelectorAll('input').forEach(inp => {
+                            info.inputs.push({
+                                type: inp.getAttribute('type') || '',
+                                name: inp.getAttribute('name') || '',
+                                value: inp.getAttribute('value') || '',
+                                src: inp.getAttribute('src') || '',
+                                accept: inp.getAttribute('accept') || '',
+                            });
+                        });
+
+                        // Images (non-emoji)
+                        msg.querySelectorAll('img').forEach(img => {
+                            const src = img.getAttribute('src') || '';
+                            if (!src.includes('emoji') && !src.includes('avatar')) {
+                                info.imgs.push({
+                                    src: src.slice(0, 300),
+                                    alt: img.getAttribute('alt') || '',
+                                    title: img.getAttribute('title') || '',
+                                });
+                            }
+                        });
+
+                        // Video
+                        msg.querySelectorAll('video').forEach(v => {
+                            info.videos.push({
+                                src: v.getAttribute('src') || '',
+                                title: v.getAttribute('title') || '',
+                                poster: v.getAttribute('poster') || '',
+                                className: (v.className || '').slice(0, 100),
+                            });
+                        });
+
+                        // Audio
+                        msg.querySelectorAll('audio').forEach(a => {
+                            info.audios.push({
+                                src: a.getAttribute('src') || '',
+                                title: a.getAttribute('title') || '',
+                            });
+                        });
+
+                        // iframe
+                        msg.querySelectorAll('iframe').forEach(f => {
+                            info.iframes.push({
+                                src: f.getAttribute('src') || '',
+                                title: f.getAttribute('title') || '',
+                            });
+                        });
+
+                        // data-* attributes from all children
+                        const dataAttrMap = {};
+                        msg.querySelectorAll('[data-*]').forEach(el => {
+                            Array.from(el.attributes).forEach(a => {
+                                if (a.name.startsWith('data-') && !dataAttrMap[a.name]) {
+                                    dataAttrMap[a.name] = (a.value || '').slice(0, 200);
+                                }
+                            });
+                        });
+                        info.dataAttrs = dataAttrMap;
+
+                        matching.push(info);
+                    });
+
+                    return { totalMessages: total, matching: matching };
+                }
+            """, target_filename)
+
+            if isinstance(dump, dict):
+                result["total_messages"] = dump.get("totalMessages", 0)
+                result["matching_messages"] = dump.get("matching", [])
+        except Exception as e:
+            self.logger.warning(f"_debug_dump_file_messages: evaluate failed: {e}")
+
+        # Also check API responses for file URLs
+        try:
+            api_responses = self.page.evaluate("() => window.__gitax_api_responses || []")
+            if api_responses and isinstance(api_responses, list):
+                file_urls = set()
+                for entry in api_responses:
+                    url = entry.get("url", "")
+                    if url and ("file" in url.lower() or "download" in url.lower()
+                                or "upload" in url.lower() or "attach" in url.lower()):
+                        file_urls.add(url[:300])
+                result["api_urls"] = sorted(file_urls)
+                if file_urls:
+                    self.logger.info(
+                        f"_debug_dump_file_messages: found {len(file_urls)} file-related API URLs"
+                    )
+                    for u in sorted(file_urls):
+                        self.logger.info(f"  API URL: {u}")
+        except Exception as e:
+            self.logger.debug(f"_debug_dump_file_messages: api check failed: {e}")
+
+        return result
+
+    def scan_channel_for_archives(self) -> list[dict]:
+        """
+        Scan the MAX channel for 7z archive files and group them by archive.
+
+        Collects all messages, extracts filenames of .7z files, groups volumes
+        by base archive name, and returns structured archive info.
+
+        Returns:
+            List of dicts:
+            [
+                {
+                    "base_name": "documents.7z",
+                    "archive_name": "documents",
+                    "volume_count": 3,
+                    "volumes": ["documents.7z.001", "documents.7z.002", "documents.7z.003"],
+                    "message_indices": [5, 12, 18],
+                    "volume_urls": {                          # ← NEW
+                        "documents.7z.001": "https://...",   # ← NEW
+                        "documents.7z.002": "https://...",   # ← NEW
+                    },                                         # ← NEW
+                },
+                ...
+            ]
+        """
+        self._check_connection()
+        messages = self.collect_all_messages()
+        if not messages:
+            self.logger.warning("No messages found in channel")
+            return []
+        import re
+        archive_files: list[tuple[str, int]] = []
+        for idx, msg in enumerate(messages):
+            text = msg.get("text", "") or ""
+            html = msg.get("html", "") or ""
+            content = text + " " + html
+            matches = re.findall(r'\b([a-zA-Z0-9_\-\.]+\.(?:7z(?:\.\d{3})?))\b', content)
+            for match in matches:
+                if match.endswith('.7z') or re.search(r'\.7z\.\d{3}$', match):
+                    archive_files.append((match, idx))
+        if not archive_files:
+            self.logger.info("No 7z archive files found in channel")
+            return []
+        seen: dict[str, int] = {}
+        for fn, idx in archive_files:
+            if fn not in seen:
+                seen[fn] = idx
+        filenames = list(seen.keys())
+        self.logger.info(f"Found {len(filenames)} archive file(s) in channel")
+        groups = group_volumes(filenames)
+        result = []
+        for group in groups:
+            archive_name = group["base_name"].replace(".7z", "")
+            msg_indices = [seen[vol] for vol in group["volumes"] if vol in seen]
+            result.append({
+                "base_name": group["base_name"],
+                "archive_name": archive_name,
+                "volume_count": group["volume_count"],
+                "volumes": group["volumes"],
+                "message_indices": msg_indices,
+            })
+
+        # Extract download URLs from DOM while it's still populated
+        url_map = self._extract_file_urls()
+        missing_urls = []
+        for arch in result:
+            arch["volume_urls"] = {}
+            for vol in arch["volumes"]:
+                if vol in url_map:
+                    arch["volume_urls"][vol] = url_map[vol]
+                else:
+                    missing_urls.append(vol)
+
+        if missing_urls:
+            self.logger.warning(
+                f"scan_channel_for_archives: {len(missing_urls)} volume(s) without URL: "
+                f"{missing_urls[:5]}{'...' if len(missing_urls) > 5 else ''}"
+            )
+            print(
+                f"  [DEBUG] {len(missing_urls)} том(ов) без download URL. "
+                f"Будет использован fallback DOM-запрос.",
+                file=sys.stderr,
+            )
+
+        self.logger.info(f"Grouped into {len(result)} archive(s)")
+        return result
 
     def parse_message(self, msg: dict) -> dict:
         """

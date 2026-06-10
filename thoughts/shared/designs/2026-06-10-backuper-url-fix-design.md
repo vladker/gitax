@@ -121,13 +121,70 @@ run_restore()
 
 ---
 
-## Error Handling
+## Debug Diagnostics
+
+Когда URL не найден, система теперь генерирует подробный debug report. Это нужно потому что MAX может не использовать стандартные HTML-элементы для ссылок скачивания.
+
+### В `_extract_file_urls()` — автоматическая диагностика
+
+JS evaluate возвращает `{ urlMap, debug }`, где `debug` содержит:
+
+- `totalMessages` — количество message-подобных DOM-элементов
+- `byStrategy` — сколько элементов совпало по каждой стратегии (`a_download`, `a_href_download`, `video`, `img`, `genericFile`)
+- `skippedNoUrl` — сколько сообщений нашли filename но не нашли URL (стратегия 5)
+- `archiveMsgSamples` — outerHTML + ссылки + кнопки + data-атрибуты до 3 сообщений с `.7z`
+
+Python-side логирует это в `archiver.log` и печатает в stderr при пустом результате.
+
+### В `_find_download_url()` — debug dump при ошибке
+
+Когда fast path (url_map) и DOM fallback оба не находят URL:
+
+- Вызывается `browser._debug_dump_file_messages(filename)`
+- Дампит в консоль: tag, class, text, outerHTML, ссылки, кнопки, data-атрибуты
+- Проверяет API responses (`window.__gitax_api_responses`) на file-related URL
+
+### Новый метод: `_debug_dump_file_messages(target_filename=None)`
+
+Однократный `page.evaluate()` который собирает полную структуру DOM для сообщений, содержащих target_filename:
+
+- `tagName`, `className`, `textPreview` (первые 300 символов)
+- `outerHTML` (первые 3000 символов)
+- `attributes` — все атрибуты сообщения
+- `links` — все `<a>` с href, download, text, rel, target, onclick
+- `buttons` — все `<button>` с text, onclick, ariaLabel, formAction
+- `inputs`, `imgs`, `videos`, `audios`, `iframes` — все медиа-элементы
+- `dataAttrs` — все `data-*` атрибуты из всех дочерних элементов
+
+Также проверяет `window.__gitax_api_responses` на URL содержащие `file`, `download`, `upload`, `attach`.
+
+### Ожидаемый вывод при ошибке
+
+При повторении ошибки `URL не найден`, пользователь увидит:
+
+```
+  [DEBUG] DOM: 150 сообщений, 1 содержат 'Screenshots_20260610_0953.7z'
+  [DEBUG]   Msg #42: tag=DIV class='message-item file-wrapper'
+  [DEBUG]   Текст: Screenshots_20260610_0953.7z 15.4 MB
+  [DEBUG]   outerHTML: <div class="message-item">...
+  [DEBUG]   2 ссылок:
+    href='https://cdn.max.ru/api/files/123' download=''
+    href='' download=''
+  [DEBUG]   1 кнопок:
+    text='Скачать' ariaLabel='download file'
+  [DEBUG]   data-* атрибуты: {'data-file-id': 'abc-123', 'data-url': 'https://...'}
+  [DEBUG] API URL (file-related): 3
+    https://web.max.ru/api/files/...
+```
+
+### Error Handling
 
 | Сценарий | Поведение |
 |----------|-----------|
 | `_extract_file_urls()` возвращает пустой dict | Fallback на DOM query в `_find_download_url()` |
 | URL найден для одних томов, но не для других | Для найденных — прямой URL, для остальных — fallback |
 | `page.evaluate()` падает с ошибкой | Возвращаем пустой dict, логируем warning, fallback |
+| Debug dump тоже падает | Логируем warning, продолжаем без debug-информации |
 
 ---
 
@@ -142,11 +199,29 @@ run_restore()
 - Пустой DOM возвращает пустой dict
 - Ошибка `page.evaluate()` возвращает пустой dict
 - Дедупликация по filename
+- Пустой filename не попадает в результат
+
+**Новые тесты для `_debug_dump_file_messages()`:**
+
+- Метод существует
+- Возвращает dict с ключами `total_messages`, `matching_messages`, `api_urls`
+- Пустой результат при отсутствии совпадений
+- Возвращает структурированную информацию о ссылках
+- Ошибка `page.evaluate()` возвращается graceful
+- Проверка connection first
 
 **Модифицированные тесты для `scan_channel_for_archives()`:**
 
 - Проверить что `volume_urls` присутствует в результате
 - Проверить что URL подставляются в `volume_urls` для соответствующих томов
+- Частичная url_map — только найденные тома имеют URL
+- Пустая url_map — volume_urls пустой
+
+**Существующие тесты (не менять):**
+
+- `test_channel_scan.py` — все тесты остаются без изменений
+- `test_backuper_journal.py` — без изменений
+- `test_channel_downloader.py` — без изменений
 
 **Существующие тесты (не менять):**
 

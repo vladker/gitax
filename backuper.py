@@ -410,7 +410,7 @@ class Backuper(LogMixin):
                 print(f"    ↓ {vol_name} ...", end="", flush=True)
 
                 # Find download URL from channel messages
-                dl_url = self._find_download_url(browser, vol_name)
+                dl_url = self._find_download_url(browser, vol_name, arch.get("volume_urls", {}))
                 if not dl_url:
                     print(" ✗ URL не найден")
                     all_vols_downloaded = False
@@ -479,8 +479,14 @@ class Backuper(LogMixin):
         print(f"  Архивы в: {download_dir}")
         self._close_browser()
 
-    def _find_download_url(self, browser: BrowserMAX, filename: str) -> str | None:
+    def _find_download_url(self, browser: BrowserMAX, filename: str, url_map: dict | None = None) -> str | None:
         """Find download URL for a specific filename in the channel"""
+        # Fast path: use pre-extracted URL map from scan phase
+        if url_map and filename in url_map:
+            return url_map[filename]
+
+        # Fallback: direct DOM query (for old journal entries, manual calls)
+        self.logger.debug(f"_find_download_url: fast path miss for '{filename}', trying DOM fallback")
         try:
             url = browser.page.evaluate("""
                 (filename) => {
@@ -503,7 +509,55 @@ class Backuper(LogMixin):
                     return null;
                 }
             """, filename)
-            return url
+            if url:
+                self.logger.info(f"_find_download_url: DOM fallback found URL for '{filename}'")
+                return url
+            else:
+                self.logger.warning(
+                    f"_find_download_url: DOM fallback returned null for '{filename}'. "
+                    f"Running debug DOM dump..."
+                )
+                # Dump DOM debug info to help diagnose the issue
+                try:
+                    debug_info = browser._debug_dump_file_messages(filename)
+                    total_m = debug_info.get("total_messages", 0)
+                    matching = debug_info.get("matching_messages", [])
+                    api_urls = debug_info.get("api_urls", [])
+                    print(f"  [DEBUG] DOM: {total_m} сообщений, {len(matching)} содержат '{filename}'")
+                    if matching:
+                        for m in matching:
+                            print(f"  [DEBUG]   Msg #{m.get('index')}: tag={m.get('tagName')} "
+                                  f"class='{m.get('className','')[:80]}'")
+                            print(f"  [DEBUG]   Текст: {m.get('textPreview','')[:200]}")
+                            print(f"  [DEBUG]   outerHTML (первые 1500): {m.get('outerHTML','')[:1500]}")
+                            links = m.get("links", [])
+                            if links:
+                                print(f"  [DEBUG]   {len(links)} ссылок:")
+                                for li in links:
+                                    print(f"    href='{li.get('href','')[:200]}' "
+                                          f"download='{li.get('download','')}' "
+                                          f"text='{li.get('text','')[:60]}'")
+                            buttons = m.get("buttons", [])
+                            if buttons:
+                                print(f"  [DEBUG]   {len(buttons)} кнопок:")
+                                for b in buttons[:5]:
+                                    print(f"    text='{b.get('text','')[:60]}' "
+                                          f"ariaLabel='{b.get('ariaLabel','')[:60]}'")
+                            attrs = m.get("attributes", {})
+                            if attrs:
+                                print(f"  [DEBUG]   Атрибуты сообщения: {dict(list(attrs.items())[:15])}")
+                            data_attrs = m.get("dataAttrs", {})
+                            if data_attrs:
+                                print(f"  [DEBUG]   data-* атрибуты: {dict(list(data_attrs.items())[:15])}")
+                    if api_urls:
+                        print(f"  [DEBUG] API URL (file-related): {len(api_urls)}")
+                        for u in api_urls:
+                            print(f"    {u}")
+                    else:
+                        print(f"  [DEBUG] API responses: нет file-related URL")
+                except Exception as de:
+                    self.logger.warning(f"_find_download_url: debug dump failed: {de}")
+                return None
         except Exception as e:
             self.logger.warning(f"Failed to find download URL for {filename}: {e}")
             return None
