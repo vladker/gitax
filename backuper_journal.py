@@ -60,7 +60,7 @@ class BackuperJournal(LogMixin):
 
     def _create_empty(self) -> dict:
         """Create empty journal structure"""
-        return {"backups": [], "downloads": [], "passwords": {}}
+        return {"backups": [], "downloads": [], "passwords": {}, "files": {}}
 
     def clear(self):
         """Clear journal — reset all data"""
@@ -237,3 +237,40 @@ class BackuperJournal(LogMixin):
     def get_count(self) -> int:
         """Get number of backup entries"""
         return len(self.data.get("backups", []))
+
+    # ── File upload tracking (for upload-as-is mode) ──
+
+    def is_file_uploaded(self, file_key: str, size_bytes: int) -> bool:
+        """
+        Check if a file was already uploaded successfully.
+
+        Args:
+            file_key: Unique key for the file (e.g., "folder_name/relative/path")
+            size_bytes: File size in bytes (for additional verification)
+
+        Returns:
+            True if file was uploaded with same size
+        """
+        files = self.data.get("files", {})
+        entry = files.get(file_key)
+        if not entry:
+            return False
+        return entry.get("size_bytes") == size_bytes and entry.get("status") == "uploaded"
+
+    def mark_file_uploaded(self, file_key: str, size_bytes: int):
+        """Mark a file as successfully uploaded"""
+        self.data.setdefault("files", {})[file_key] = {
+            "size_bytes": size_bytes,
+            "status": "uploaded",
+            "uploaded_at": datetime.now().isoformat()
+        }
+        self.save()
+
+    def mark_file_failed(self, file_key: str, size_bytes: int):
+        """Mark a file as failed to upload"""
+        self.data.setdefault("files", {})[file_key] = {
+            "size_bytes": size_bytes,
+            "status": "failed",
+            "attempted_at": datetime.now().isoformat()
+        }
+        self.save()

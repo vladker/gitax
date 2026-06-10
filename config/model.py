@@ -46,6 +46,10 @@ class BackuperConfig(BaseModel):
     page_size: int = 10
     retries: int = 3
     retry_delay: int = 10
+    # Upload-as-is mode settings
+    upload_as_is_extensions: list[str] = Field(default_factory=list)  # Empty = all extensions
+    upload_as_is_max_size_mb: int = 0  # 0 = no limit
+    upload_as_is_recursive: bool = True
 
 
 class ChannelDownloaderConfig(BaseModel):

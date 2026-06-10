@@ -94,6 +94,88 @@ class Backuper(LogMixin):
                     pass
         return total
 
+    def _scan_files_for_upload(
+        self,
+        source_path: str,
+        recursive: bool = True,
+        allowed_extensions: list[str] | None = None,
+        max_size_mb: int = 0
+    ) -> list[tuple[str, int]]:
+        """
+        Scan folder for files to upload as-is.
+
+        Args:
+            source_path: Root folder to scan
+            recursive: Whether to scan subdirectories
+            allowed_extensions: List of allowed extensions (e.g., ['.txt', '.pdf']).
+                                Empty list = all extensions allowed.
+            max_size_mb: Maximum file size in MB. 0 = no limit.
+
+        Returns:
+            List of (filepath, size_bytes) tuples, sorted by path
+        """
+        files = []
+        max_size_bytes = max_size_mb * 1024 * 1024 if max_size_mb > 0 else 0
+        allowed_ext = set(ext.lower() for ext in allowed_extensions) if allowed_extensions else None
+
+        walker = os.walk(source_path) if recursive else [(source_path, [], os.listdir(source_path))]
+
+        for dirpath, _dirs, filenames in walker:
+            for fname in filenames:
+                filepath = os.path.join(dirpath, fname)
+
+                # Check extension filter
+                if allowed_ext is not None:
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext not in allowed_ext:
+                        continue
+
+                try:
+                    size = os.path.getsize(filepath)
+                    if size == 0:
+                        continue
+                    if max_size_bytes and size > max_size_bytes:
+                        self.logger.info(f"Skipping {fname}: {size / 1024 / 1024:.1f} MB > {max_size_mb} MB limit")
+                        continue
+                    files.append((filepath, size))
+                except OSError:
+                    continue
+
+        # Sort by relative path for consistent ordering
+        files.sort(key=lambda x: os.path.relpath(x[0], source_path))
+        return files
+
+    def _convert_exe_to_zip(self, exe_path: str) -> str | None:
+        """Convert .exe file to .zip using 7z (store mode, no compression)"""
+        import subprocess
+        from config import get_config
+
+        seven_zip_exe = get_config().backuper.seven_zip_exe
+        if not os.path.exists(seven_zip_exe):
+            self.logger.error(f"7z not found at {seven_zip_exe}")
+            return None
+
+        # Output zip path in same directory
+        zip_path = exe_path[:-4] + ".zip"  # Replace .exe with .zip
+
+        # Use 7z to create zip with store compression (-mx=0)
+        cmd = [seven_zip_exe, "a", "-tzip", "-mx=0", zip_path, exe_path]
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if result.returncode == 0 and os.path.exists(zip_path):
+                self.logger.info(f"Converted {exe_path} -> {zip_path}")
+                return zip_path
+            else:
+                self.logger.warning(f"7z conversion failed: {result.stderr}")
+                return None
+        except subprocess.TimeoutExpired:
+            self.logger.error("7z conversion timeout")
+            return None
+        except Exception as e:
+            self.logger.error(f"7z conversion error: {e}")
+            return None
+
     # ── Backup Mode ──
 
     def run_backup(self):
@@ -126,22 +208,29 @@ class Backuper(LogMixin):
         print("  Будет добавлено в сообщение при отправке в канал.")
         description = input("  Описание: ").strip()
 
-        # 4. Volume mode
-        print("\n  Режим томов:")
-        print("    [1] Однотомный архив")
-        print("    [2] Многотомный (размер из конфига)")
-        print("    [3] Многотомный (свой размер)")
-        vol_choice = input("  Выбор [1-3]: ").strip()
+        # 4. Mode selection
+        print("\n  Режим бэкапа:")
+        print("    [1] Архив (7z) — однотомный")
+        print("    [2] Архив (7z) — многотомный (размер из конфига)")
+        print("    [3] Архив (7z) — многотомный (свой размер)")
+        print("    [4] Загрузить файлы как есть (без архивации)")
+        mode_choice = input("  Выбор [1-4]: ").strip()
 
+        if mode_choice == "4":
+            # Delegate to upload-as-is mode with already-selected folder
+            self.run_backup_as_is(source_path=source_path)
+            return
+
+        # 5. Volume mode (for archive modes 1-3)
         volume_size = None
-        if vol_choice == "2":
+        if mode_choice == "2":
             volume_size = self.config.get("backuper", {}).get("default_volume_size", "49M")
             print(f"  Размер тома: {volume_size}")
-        elif vol_choice == "3":
+        elif mode_choice == "3":
             volume_size = input('  Размер тома (напр. "49M", "100M"): ').strip()
             if not volume_size:
                 volume_size = self.config.get("backuper", {}).get("default_volume_size", "49M")
-        elif vol_choice != "1":
+        elif mode_choice != "1":
             print("  Неверный выбор, использую однотомный архив.")
 
         # 5. Password
@@ -250,6 +339,202 @@ class Backuper(LogMixin):
             })
 
         cleanup_volumes(volumes)
+        self._close_browser()
+
+    # ── Upload As-Is Mode ──
+
+    def run_backup_as_is(self, source_path: str | None = None):
+        """Интерактивный режим: загрузка файлов из папки как есть (без архивации)"""
+        print("\n" + "=" * 60)
+        print("  Загрузка файлов как есть — без архивации")
+        print("=" * 60)
+
+        # 1. Source path (only ask if not provided)
+        if source_path is None:
+            print()
+            source_path = input("  Папка для загрузки: ").strip().strip('"').strip("'")
+            if not source_path or not os.path.isdir(source_path):
+                print("  ✗ Папка не найдена или не является директорией.")
+                return
+        else:
+            print(f"\n  Папка: {source_path}")
+
+        # 2. Description
+        print()
+        print("  Описание (необязательно):")
+        print("  Будет добавлено в каждое сообщение при отправке.")
+        description = input("  Описание: ").strip()
+
+        # 3. Filter options
+        print("\n  Фильтры файлов (Enter = без фильтра):")
+        ext_input = input("  Расширения через запятую (напр. .txt,.pdf,.jpg): ").strip()
+        allowed_extensions = [e.strip().lower() for e in ext_input.split(",") if e.strip()] if ext_input else []
+
+        size_input = input("  Макс. размер файла в MB (0 = без лимита): ").strip()
+        max_size_mb = int(size_input) if size_input.isdigit() else 0
+
+        recursive_input = input("  Рекурсивно (включая подпапки)? [Y/n]: ").strip().lower()
+        recursive = recursive_input != "n"
+
+        # 3b. Auto-convert .exe to .zip
+        convert_exe = input("  Конвертировать .exe в .zip перед загрузкой? [y/N]: ").strip().lower() == "y"
+
+        # 4. Scan files
+        print("\n  Сканирование папки ...")
+        files = self._scan_files_for_upload(
+            source_path=source_path,
+            recursive=recursive,
+            allowed_extensions=allowed_extensions if allowed_extensions else None,
+            max_size_mb=max_size_mb
+        )
+
+        if not files:
+            print("  ✗ Файлы не найдены (или все отфильтрованы).")
+            return
+
+        total_files = len(files)
+        total_size = sum(size for _, size in files)
+        print(f"  ✓ Найдено: {total_files} файл(ов), {self._format_size(total_size)}")
+
+        # Show first few files
+        print("\n  Первые файлы:")
+        for filepath, size in files[:10]:
+            rel_path = os.path.relpath(filepath, source_path)
+            print(f"    {rel_path} ({self._format_size(size)})")
+        if total_files > 10:
+            print(f"    ... и ещё {total_files - 10}")
+
+        # 5. Confirm
+        confirm = input(f"\n  Загрузить {total_files} файл(ов)? [Y/n]: ").strip().lower()
+        if confirm == "n":
+            print("  Отменено.")
+            return
+
+        # 6. Connect to browser
+        try:
+            browser = self._ensure_browser_connected()
+        except Exception as e:
+            print(f"\n  ✗ Не удалось подключиться к MAX: {e}")
+            return
+
+        # 7. Upload each file
+        retries = int(self.config.get("backuper", {}).get("retries", 3))
+        retry_delay = int(self.config.get("backuper", {}).get("retry_delay", 10))
+        large_file_threshold = 50 * 1024 * 1024  # 50 MB
+
+        sent_count = 0
+        skipped_count = 0
+        failed_count = 0
+        failed_files = []
+        temp_files_to_cleanup = []
+
+        print(f"\n  Начинаю загрузку {total_files} файл(ов)...\n")
+
+        for idx, (filepath, size) in enumerate(files, 1):
+            filename = os.path.basename(filepath)
+            rel_path = os.path.relpath(filepath, source_path)
+            size_str = self._format_size(size)
+
+            print(f"  [{idx}/{total_files}] {rel_path} ({size_str})")
+
+            # Check journal for deduplication
+            # Use a composite key: archive_name = folder_name + rel_path
+            folder_name = os.path.basename(source_path)
+            journal_key = f"{folder_name}/{rel_path}"
+
+            if self.journal.is_file_uploaded(journal_key, size):
+                print(f"    ✓ Уже загружен (журнал)")
+                skipped_count += 1
+                continue
+
+            # Build message text
+            msg_parts = []
+            if description:
+                msg_parts.append(f"📝 {description}")
+            msg_parts.append(f"📁 {folder_name}")
+            msg_parts.append(f"📄 {rel_path}")
+            msg_parts.append(f"📊 {size_str}")
+            msg_parts.append(f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+            msg_text = "\n\n".join(msg_parts)
+
+            # Handle .exe to .zip conversion
+            upload_filepath = filepath
+            upload_filename = filename
+            ext = os.path.splitext(filename)[1].lower()
+
+            if convert_exe and ext == ".exe":
+                print(f"    → Конвертация .exe в .zip...")
+                zip_path = self._convert_exe_to_zip(filepath)
+                if zip_path and os.path.exists(zip_path):
+                    upload_filepath = zip_path
+                    upload_filename = os.path.basename(zip_path)
+                    ext = ".zip"
+                    size = os.path.getsize(zip_path)
+                    size_str = self._format_size(size)
+                    temp_files_to_cleanup.append(zip_path)
+                    print(f"    → Конвертировано: {upload_filename} ({size_str})")
+                else:
+                    print(f"    ⚠ Конвертация не удалась, загружаю оригинал")
+
+            # Upload
+            try:
+                if size >= large_file_threshold:
+                    print(f"    → Большой файл, загрузка через локальный браузер...")
+                    success = browser._upload_large_file(
+                        upload_filepath, upload_filename, size,
+                        retries=retries,
+                        retry_delay=retry_delay,
+                        baseline_count=0,
+                        expected_extensions=[ext]
+                    )
+                else:
+                    print(f"    → Отправка в MAX...")
+                    success, _ = browser.send_message_with_files(
+                        text=msg_text,
+                        filepaths=[upload_filepath],
+                        retries=retries,
+                        retry_delay=retry_delay,
+                        split_threshold_mb=9999,  # Don't split
+                        expected_extensions=[ext]
+                    )
+
+                if success:
+                    print(f"    ✓ Загружен")
+                    self.journal.mark_file_uploaded(journal_key, size)
+                    sent_count += 1
+                else:
+                    print(f"    ✗ Ошибка загрузки")
+                    self.journal.mark_file_failed(journal_key, size)
+                    failed_count += 1
+                    failed_files.append(rel_path)
+
+            except Exception as e:
+                print(f"    ✗ Ошибка: {e}")
+                self.journal.mark_file_failed(journal_key, size)
+                failed_count += 1
+                failed_files.append(rel_path)
+
+        # Cleanup temp zip files
+        for tf in temp_files_to_cleanup:
+            try:
+                if os.path.exists(tf):
+                    os.remove(tf)
+            except Exception:
+                pass
+
+        # Summary
+        print()
+        print("=" * 60)
+        print("Загрузка завершена")
+        print(f"  Загружено: {sent_count}")
+        print(f"  Пропущено (уже в журнале): {skipped_count}")
+        print(f"  Ошибок: {failed_count}")
+        if failed_files:
+            print("\n  Файлы с ошибками:")
+            for f in failed_files:
+                print(f"    - {f}")
+        print("=" * 60)
+
         self._close_browser()
 
     # ── Restore Mode ──
