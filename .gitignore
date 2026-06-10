@@ -51,6 +51,9 @@ tmp/
 *.swp
 *.swo
 
+# opencode
+opencode.jsonc
+
 # OS
 .DS_Store
 Thumbs.db
