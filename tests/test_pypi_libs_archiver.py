@@ -146,6 +146,8 @@ class TestConfigValidation:
     def test_missing_channel_url_exits(self, tmp_path, monkeypatch):
         """Test missing channel URL causes exit"""
         monkeypatch.delenv("CHANNEL_PYPI", raising=False)
+        # Mock load_dotenv to prevent .env from overriding test config
+        monkeypatch.setattr("config.loader.load_dotenv", lambda **kwargs: None)
         config_file = tmp_path / "test_config.yaml"
         config_file.write_text("channels: {}\n")
         from pypi_libs_archiver import PyPILibsArchiver
@@ -153,8 +155,10 @@ class TestConfigValidation:
         # The new config system validates but doesn't exit in __init__
         # Channel URL validation happens when browser is initialized
         archiver = PyPILibsArchiver(str(config_file))
-        # Config loads but channel URL is empty
+        # Config loads but channel URL is empty (no migration happened)
         assert archiver.config['channels']['pypi'] == ""
+        # No registry entry created when no URL is available
+        assert len(archiver.config['channel_registry']['pypi']) == 0
 
     def test_channel_url_from_env(self, tmp_path, monkeypatch):
         """Test channel URL is read from CHANNEL_pypi env var"""
@@ -164,8 +168,8 @@ class TestConfigValidation:
         from pypi_libs_archiver import PyPILibsArchiver
 
         archiver = PyPILibsArchiver(str(config_file))
-        # Legacy channel cleared after migration to registry
-        assert archiver.config['channels']['pypi'] == ""
+        # Legacy channel preserved for backward compat
+        assert archiver.config['channels']['pypi'] == "https://web.max.ru/pypi-channel"
         assert len(archiver.config['channel_registry']['pypi']) == 1
         assert archiver.config['channel_registry']['pypi'][0]['url'] == "https://web.max.ru/pypi-channel"
 
@@ -178,8 +182,8 @@ class TestConfigValidation:
         with patch("config.loader.load_dotenv"):
             from pypi_libs_archiver import PyPILibsArchiver
             archiver = PyPILibsArchiver(str(config_file))
-        # Legacy channel cleared after migration to registry
-        assert archiver.config['channels']['pypi'] == ""
+        # Legacy channel preserved for backward compat
+        assert archiver.config['channels']['pypi'] == "https://web.max.ru/pypi-channel"
         assert len(archiver.config['channel_registry']['pypi']) == 1
         assert archiver.config['channel_registry']['pypi'][0]['url'] == "https://web.max.ru/pypi-channel"
 

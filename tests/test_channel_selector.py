@@ -105,3 +105,83 @@ class TestChannelSelector:
         from config_utils import get_channels_for_function
         channels = get_channels_for_function("pypi")
         assert len(channels) == 0
+
+    def test_allow_add_with_existing_channels(self, tmp_path, monkeypatch, isolated_env):
+        """When allow_add=True with existing channels, shows add option."""
+        monkeypatch.chdir(tmp_path)
+        import yaml
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(yaml.dump({
+            "channel_registry": {
+                "github": [
+                    {"url": "https://web.max.ru/ch1", "label": "Main", "enabled": True},
+                ]
+            }
+        }), encoding="utf-8")
+
+        from config import init_config, get_config
+        init_config(str(cfg_file))
+
+        from channel_registry_ui import select_channel
+        from config_utils import get_channels_for_function
+        # Use iterator to simulate multiple input calls
+        inputs = iter(["1", "https://web.max.ru/new", "New Channel"])
+        monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+        
+        result = select_channel("github", allow_add=True)
+        # Should return the newly added channel
+        assert result is not None
+        assert result.url == "https://web.max.ru/new"
+        assert result.label == "New Channel"
+        # Verify it was added to registry
+        channels = get_channels_for_function("github")
+        assert len(channels) == 2
+        urls = [ch.url for ch in channels]
+        assert "https://web.max.ru/new" in urls
+
+    def test_allow_add_with_no_channels(self, tmp_path, monkeypatch, isolated_env):
+        """When allow_add=True with no channels, prompts to add."""
+        monkeypatch.chdir(tmp_path)
+        import yaml
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(yaml.dump({
+            "channel_registry": {}
+        }), encoding="utf-8")
+
+        from config import init_config, get_config
+        init_config(str(cfg_file))
+
+        from channel_registry_ui import select_channel
+        # Simulate URL and label input
+        inputs = iter(["https://web.max.ru/first", "First Channel"])
+        monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+        
+        result = select_channel("github", allow_add=True)
+        assert result is not None
+        assert result.url == "https://web.max.ru/first"
+
+    def test_allow_add_default_label(self, tmp_path, monkeypatch, isolated_env):
+        """When label is empty, auto-generate label."""
+        monkeypatch.chdir(tmp_path)
+        import yaml
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(yaml.dump({
+            "channel_registry": {
+                "github": [
+                    {"url": "https://web.max.ru/existing", "label": "Existing", "enabled": True},
+                ]
+            }
+        }), encoding="utf-8")
+
+        from config import init_config, get_config
+        init_config(str(cfg_file))
+
+        from channel_registry_ui import select_channel
+        # Simulate choosing add [1], then URL, then empty label
+        inputs = iter(["1", "https://web.max.ru/new", ""])
+        monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+        
+        result = select_channel("github", allow_add=True)
+        assert result is not None
+        assert result.url == "https://web.max.ru/new"
+        assert result.label == "GitHub #2"  # Auto-generated label

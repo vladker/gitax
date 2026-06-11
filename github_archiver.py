@@ -288,12 +288,12 @@ class GitHubArchiver(LogMixin):
         }
         function = _CHANNEL_TO_FUNCTION.get(channel_name, channel_name)
 
-        # Try channel registry first
-        selected = select_channel(function)
+        # Try channel registry first (allow inline add of new channels)
+        selected = select_channel(function, allow_add=True)
         if selected:
             self._active_channel_url = selected.url
             self._active_channel_label = selected.label or selected.url
-            print(f"  ✓ Channel: {self._active_channel_label}")
+            print(f"  ✓ Канал: {self._active_channel_label}")
         else:
             # Fall back to legacy config
             url = ensure_channel_url(self.config, channel_name, label)
@@ -612,8 +612,20 @@ class GitHubArchiver(LogMixin):
         if use_parallel:
             github_channels = get_channels_for_function("github")
             if len(github_channels) <= 1:
-                print("\n  ⚠ Только один канал настроен. Использую обычный режим.")
-                use_parallel = False
+                print("\n  ⚠ Для параллельной отправки нужно 2+ канала.")
+                print("  Сейчас доступен только 1 канал. Добавить новый?")
+                add_choice = input("  [Y/N]: ").strip().lower()
+                if add_choice == 'y':
+                    new_ch = select_channel("github", allow_add=True)
+                    if new_ch:
+                        # Reload channels list after adding
+                        github_channels = get_channels_for_function("github")
+                    else:
+                        print("\n  Отменено. Использую обычный режим.")
+                        use_parallel = False
+                else:
+                    print("\n  Использую обычный режим.")
+                    use_parallel = False
 
         if use_parallel:
             channels = [
@@ -883,8 +895,19 @@ class GitHubArchiver(LogMixin):
         if use_parallel:
             github_channels = get_channels_for_function("github")
             if len(github_channels) <= 1:
-                print("\n  ⚠ Только один канал настроен. Использую обычный режим.")
-                use_parallel = False
+                print("\n  ⚠ Для параллельной отправки нужно 2+ канала.")
+                print("  Сейчас доступен только 1 канал. Добавить новый?")
+                add_choice = input("  [Y/N]: ").strip().lower()
+                if add_choice == 'y':
+                    new_ch = select_channel("github", allow_add=True)
+                    if new_ch:
+                        github_channels = get_channels_for_function("github")
+                    else:
+                        print("\n  Отменено. Использую обычный режим.")
+                        use_parallel = False
+                else:
+                    print("\n  Использую обычный режим.")
+                    use_parallel = False
 
         loaded_count = 0
         error_count = 0

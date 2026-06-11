@@ -68,30 +68,47 @@ def show_channels(function: str) -> None:
     _print_channels(channels, function)
 
 
-def select_channel(function: str) -> ChannelEntry | None:
-    """Interactive channel selection prompt."""
+def select_channel(function: str, allow_add: bool = False) -> ChannelEntry | None:
+    """Interactive channel selection prompt.
+
+    Args:
+        function: Function key ("github", "pypi", "media", "backup")
+        allow_add: If True, show option to add a new channel inline
+
+    Returns:
+        Selected ChannelEntry, or None if cancelled/no channels
+    """
     config = get_config()
     channels = config.channel_registry.get_enabled(function)
 
     if not channels:
-        print(f"\n  ✗ No enabled channels for {function}")
-        print("  Use 'Channel Registry' menu to add/enable channels.")
+        if allow_add:
+            return _prompt_add_channel(function)
+        print(f"\n  ✗ Нет активных каналов для {function}")
+        print("  Используйте меню 'Управление каналами' чтобы добавить.")
         return None
 
-    if len(channels) == 1:
-        print(f"\n  Using default channel: {channels[0].label or channels[0].url}")
+    if len(channels) == 1 and not allow_add:
+        print(f"\n  Используется канал по умолчанию: {channels[0].label or channels[0].url}")
         return channels[0]
 
-    print(f"\n  Available channels for {function}:")
+    # Show channel list
+    print(f"\n  Доступные каналы для {function}:")
     for i, ch in enumerate(channels):
-        print(f"    [{i}] {ch.label or ch.url}")
+        print(f"    [{i}] {ch.label or ch.url} ({ch.url})")
+    
+    add_idx = None
+    if allow_add:
+        add_idx = len(channels)
+        print(f"    [{add_idx}] + Добавить новый канал")
     print()
 
+    max_choice = add_idx if add_idx is not None else len(channels) - 1
     while True:
         try:
-            choice = input(f"  Select channel [0-{len(channels)-1}]: ").strip()
+            choice = input(f"  Выберите канал [0-{max_choice}]: ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\n  Selection cancelled.")
+            print("\n  Отменено.")
             return None
 
         if not choice:
@@ -99,11 +116,49 @@ def select_channel(function: str) -> ChannelEntry | None:
 
         try:
             idx = int(choice)
+            if add_idx is not None and idx == add_idx:
+                return _prompt_add_channel(function)
             if 0 <= idx < len(channels):
                 return channels[idx]
-            print(f"  Invalid index. Enter 0-{len(channels)-1}.")
+            print(f"  Неверный индекс. Введите 0-{max_choice}.")
         except ValueError:
-            print("  Please enter a number.")
+            print("  Введите число.")
+
+
+def _prompt_add_channel(function: str) -> ChannelEntry | None:
+    """Prompt user to add a new channel inline."""
+    print()
+    try:
+        url = input("  URL канала: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Отменено.")
+        return None
+
+    if not url:
+        print("  ✗ Пустой URL, отменено.")
+        return None
+
+    if not url.startswith(("http://", "https://")):
+        print("  ✗ URL должен начинаться с http:// или https://")
+        return None
+
+    try:
+        label = input("  Название (опционально): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Отменено.")
+        return None
+
+    if not label:
+        config = get_config()
+        count = len(getattr(config.channel_registry, function, []))
+        func_labels = {"github": "GitHub", "pypi": "PyPI", "media": "Media", "backup": "Backup"}
+        label = f"{func_labels.get(function, function)} #{count + 1}"
+
+    add_channel(function, url, label)
+    # Return the newly added channel
+    config = get_config()
+    channels = config.channel_registry.get_enabled(function)
+    return channels[-1] if channels else None
 
 
 def channel_registry_menu() -> None:

@@ -410,8 +410,8 @@ class TestChannelDownloaderEnvConfig:
         config_file.write_text("channels: {}\n")
         from channel_downloader import ChannelDownloader
         cd = ChannelDownloader(str(config_file))
-        # Legacy channel cleared after migration to registry
-        assert cd.config['channels']['max'] == ""
+        # Legacy channel preserved for backward compat
+        assert cd.config['channels']['max'] == "https://web.max.ru/env-channel"
         assert len(cd.config['channel_registry']['github']) == 1
         assert cd.config['channel_registry']['github'][0]['url'] == "https://web.max.ru/env-channel"
 
@@ -422,8 +422,8 @@ class TestChannelDownloaderEnvConfig:
         config_file.write_text("channels:\n  max: https://web.max.ru/yaml-channel\n")
         from channel_downloader import ChannelDownloader
         cd = ChannelDownloader(str(config_file))
-        # Legacy channel cleared after migration to registry
-        assert cd.config['channels']['max'] == ""
+        # Legacy channel preserved for backward compat
+        assert cd.config['channels']['max'] == "https://web.max.ru/env-channel"
         assert len(cd.config['channel_registry']['github']) == 1
         assert cd.config['channel_registry']['github'][0]['url'] == "https://web.max.ru/env-channel"
 
@@ -436,7 +436,7 @@ class TestChannelDownloaderEnvConfig:
         config_file.write_text("channels:\n  max: https://web.max.ru/yaml-channel\n")
         from channel_downloader import ChannelDownloader
         cd = ChannelDownloader(str(config_file))
-        # Legacy channel cleared after migration to registry
-        assert cd.config['channels']['max'] == ""
+        # Legacy channel preserved for backward compat
+        assert cd.config['channels']['max'] == "https://web.max.ru/yaml-channel"
         assert len(cd.config['channel_registry']['github']) == 1
         assert cd.config['channel_registry']['github'][0]['url'] == "https://web.max.ru/yaml-channel"
