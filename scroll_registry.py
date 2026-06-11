@@ -2,8 +2,11 @@
 """Scroll registry — stores message sequence from channel scan for two-pass deletion."""
 
 import json
+import logging
 import os
 from datetime import datetime
+
+_logger = logging.getLogger("gitax")
 
 DATA_FILE = "scroll_registry.json"
 
@@ -24,7 +27,7 @@ class ScrollRegistry:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except (OSError, PermissionError) as e:
-            print(f"[ScrollRegistry] Failed to save {path}: {e}")
+            _logger.warning(f"ScrollRegistry: Failed to save {path}: {e}")
             raise
 
     def load(self, path: str = DATA_FILE) -> bool:

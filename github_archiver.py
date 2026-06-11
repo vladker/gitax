@@ -5,6 +5,7 @@ GitHub Archiver — Резервное копирование репозитор
 Главный скрипт с меню и основной логикой
 """
 
+import glob
 import os
 import re
 import sys
@@ -84,7 +85,6 @@ class GracefulShutdown:
 
     def _cleanup_temp_files(self):
         """Remove any remaining files in the temp directory"""
-        import glob
         import logging
         logger = logging.getLogger("gitax")
 
@@ -199,7 +199,6 @@ class GitHubArchiver(LogMixin):
         Args:
             output_dir: Directory to check for orphaned files
         """
-        import glob
         import logging
         logger = logging.getLogger("gitax")
 

@@ -3,6 +3,7 @@
 MAX messenger automation using Playwright
 """
 
+import glob
 import os
 import re
 import time
@@ -145,7 +146,6 @@ def _parse_size(size_str: str) -> int:
 
 def _cleanup_existing_volumes(base_path: str):
     """Remove any existing volume files matching base pattern"""
-    import glob
     pattern = base_path + ".*"
     for f in glob.glob(pattern):
         try:
@@ -156,7 +156,6 @@ def _cleanup_existing_volumes(base_path: str):
 
 def _find_volumes(base_path: str) -> list[str]:
     """Find all volume files matching base.7z.xxx pattern, sorted"""
-    import glob
     pattern = base_path + ".*"
     volumes = sorted(glob.glob(pattern))
     return volumes

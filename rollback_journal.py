@@ -5,9 +5,12 @@ Rollback journal.json: revert CLEANED entries that were wrongly set
 to their original SENT status.
 """
 import json
+import logging
 import os
 import shutil
 import tempfile
+
+_logger = logging.getLogger("gitax")
 
 JOURNAL_PATH = "journal.json"
 
@@ -15,7 +18,7 @@ JOURNAL_PATH = "journal.json"
 def rollback():
     """Revert CLEANED entries back to SENT status with atomic write."""
     if not os.path.exists(JOURNAL_PATH):
-        print(f"[ERROR] {JOURNAL_PATH} not found")
+        _logger.error(f"{JOURNAL_PATH} not found")
         return
 
     with open(JOURNAL_PATH, "r", encoding="utf-8") as f:
@@ -54,9 +57,9 @@ def rollback():
                 os.remove(temp_path)
             raise
 
-        print(f"[OK] Откачено {reverted} записей: cleaned -> sent")
+        _logger.info(f"Откачено {reverted} записей: cleaned -> sent")
     else:
-        print("  Нет записей со статусом 'cleaned'")
+        _logger.info("Нет записей со статусом 'cleaned'")
 
 
 if __name__ == "__main__":
