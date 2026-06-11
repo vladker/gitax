@@ -237,7 +237,8 @@ class GitHubArchiver(LogMixin):
             try:
                 size_mb = os.path.getsize(f) / 1024 / 1024
                 print(f"      {os.path.basename(f)} ({size_mb:.1f} MB)")
-            except OSError:
+            except OSError as e:
+                logger.warning(f"Could not stat orphaned file {f}: {e}")
                 print(f"      {os.path.basename(f)}")
         if len(orphaned) > 5:
             print(f"      ... and {len(orphaned) - 5} more")
@@ -256,10 +257,12 @@ class GitHubArchiver(LogMixin):
                         deleted += 1
                         logger.info(f"Deleted orphaned: {f}")
                     else:
-                        logger.warning(f"Failed to delete {f}")
+                        logger.warning(f"Failed to delete orphaned file: {f}")
                 print(f"  ✓ Deleted {deleted}/{len(orphaned)} orphaned file(s)")
             elif choice == '3':
                 print("  Will not ask again this session")
+        except KeyboardInterrupt:
+            logger.info("Orphaned file cleanup cancelled by user")
         except Exception as e:
             logger.warning(f"Orphaned file check error: {e}")
 

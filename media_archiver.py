@@ -18,6 +18,9 @@ from pathlib import Path
 from logging_config import setup_logging, LogMixin, SessionCapture
 
 from browser_max import BrowserMAX
+from browser_init import BrowserInitMixin
+from signal_handler import SignalHandler
+from utils import format_file_size
 
 
 class MediaJournal:
@@ -134,8 +137,11 @@ class MediaJournal:
         }
 
 
-class MediaArchiver(LogMixin):
+class MediaArchiver(LogMixin, BrowserInitMixin):
     """Архиватор медиафайлов — загрузка фото и видео в MAX канал"""
+
+    _channel_key = "media"
+    _section_key = "media_archiver"
 
     MEDIA_EXTENSIONS = {
         '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff',
@@ -151,27 +157,20 @@ class MediaArchiver(LogMixin):
             self.config.get('archiver', {}).get('large_file_threshold_mb', 50) * 1024 * 1024
         )
         # Validate watch_dir (was in _load_config)
+        from utils import ConfigurationError
         media_watch_dir = self.config.get('media_archiver', {}).get('watch_dir', '')
         if not media_watch_dir:
-            print("✗ MEDIA_WATCH_DIR не указана.")
-            print("  Укажите в .env файле или переменной окружения")
-            sys.exit(1)
+            raise ConfigurationError(
+                "MEDIA_WATCH_DIR не указана. Укажите в .env файле или переменной окружения"
+            )
         if not os.path.isdir(media_watch_dir):
-            print(f"✗ Папка медиа не найдена: {media_watch_dir}")
-            sys.exit(1)
+            raise ConfigurationError(f"Папка медиа не найдена: {media_watch_dir}")
         self.journal = MediaJournal("media_journal.json")
         self.browser: BrowserMAX | None = None
         self._shutdown = False
 
         # Register cleanup
-        atexit.register(self._cleanup)
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
-
-    def _signal_handler(self, signum, frame):
-        """Handle shutdown signals"""
-        self.logger.info(f"Received signal {signum}, shutting down...")
-        self._shutdown = True
+        SignalHandler().register(self, on_cleanup=self._cleanup)
 
     def _cleanup(self):
         """Clean up resources on exit"""
@@ -181,34 +180,6 @@ class MediaArchiver(LogMixin):
                 self.browser.close()
             except Exception:
                 pass
-
-    def _init_browser(self) -> BrowserMAX:
-        """Инициализировать браузер MAX"""
-        if self.browser is None:
-            channel_url = self.config.get('channels', {}).get('media', '')
-            use_local = self.config.get('media_archiver', {}).get('use_local_browser',
-                         self.config.get('archiver', {}).get('use_local_browser', False))
-            self.browser = BrowserMAX(channel_url, use_local_browser=use_local)
-        return self.browser
-
-    def _ensure_browser_connected(self):
-        """Ensure browser is connected and ready"""
-        browser = self._init_browser()
-        if not browser.keep_alive_connect():
-            raise Exception("Failed to connect to MAX")
-        browser.navigate()
-        browser.ensure_page_ready()
-        return browser
-
-    def _format_file_size(self, size_bytes: int) -> str:
-        """Форматировать размер файла"""
-        if size_bytes >= 1024 * 1024 * 1024:
-            return f"{size_bytes / 1024 / 1024 / 1024:.1f} GB"
-        elif size_bytes >= 1024 * 1024:
-            return f"{size_bytes / 1024 / 1024:.1f} MB"
-        elif size_bytes >= 1024:
-            return f"{size_bytes / 1024:.1f} KB"
-        return f"{size_bytes} B"
 
     def _scan_files(self, watch_dir: str) -> list[str]:
         """
@@ -292,7 +263,7 @@ class MediaArchiver(LogMixin):
             except OSError:
                 file_size = 0
 
-            file_size_str = self._format_file_size(file_size)
+            file_size_str = format_file_size(file_size)
             ext = os.path.splitext(filename)[1].lower()
 
             print(f"\n  [{i}/{len(files)}] {filename} ({file_size_str}, {ext})")

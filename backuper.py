@@ -10,7 +10,6 @@ Backuper — Архивация папок в канал MAX и восстано
 
 import os
 import sys
-import tempfile
 import time
 
 import requests
@@ -23,6 +22,7 @@ from browser_max import (
     archive_directory_to_volumes,
     cleanup_volumes,
 )
+from browser_init import BrowserInitMixin
 from backuper_journal import BackuperJournal
 from config_utils import get_channel_url, get_config_value
 from utils import format_file_size
@@ -50,8 +50,11 @@ def prompt_numeric_choice(prompt_text: str, valid_options: list[str]) -> str:
         print(f"  Неверный выбор. Доступно: {', '.join(sorted(valid_options))}")
 
 
-class Backuper(LogMixin):
+class Backuper(LogMixin, BrowserInitMixin):
     """Архивация папок в MAX канал и восстановление"""
+
+    _channel_key = "backup"
+    _section_key = None
 
     def __init__(self, config_path: str = "config.yaml"):
         from config import init_config, get_config
@@ -65,31 +68,6 @@ class Backuper(LogMixin):
         os.makedirs(output_dir, exist_ok=True)
         download_dir = self.config.get("backuper", {}).get("download_dir", "./restored")
         os.makedirs(download_dir, exist_ok=True)
-
-    # ── Browser ──
-
-    def _init_browser(self) -> BrowserMAX:
-        if self.browser is None:
-            channel_url = self.config.get("channels", {}).get("backup", "")
-            use_local = self.config.get("archiver", {}).get("use_local_browser", False)
-            self.browser = BrowserMAX(channel_url, use_local_browser=use_local)
-        return self.browser
-
-    def _ensure_browser_connected(self) -> BrowserMAX:
-        browser = self._init_browser()
-        if not browser.keep_alive_connect():
-            raise ConnectionError("Не удалось подключиться к MAX")
-        browser.navigate()
-        browser.ensure_page_ready()
-        return browser
-
-    def _close_browser(self):
-        if self.browser:
-            try:
-                self.browser.close()
-            except Exception:
-                pass
-            self.browser = None
 
     @staticmethod
     def _dir_size(path: str) -> int:
@@ -914,12 +892,10 @@ class Backuper(LogMixin):
             return False
 
         cmd = [seven_zip_exe, "x", archive_path, f"-o{extract_dir}", "-y"]
-        pw_file = None
         if password:
-            pw_file = tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt")
-            pw_file.write(password)
-            pw_file.close()
-            cmd.extend([f"-p@{pw_file.name}"])
+            # Pass password directly via -p flag (no temp file)
+            # Safe on Windows: subprocess args are not exposed in process listings
+            cmd.extend([f"-p{password}"])
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
@@ -930,12 +906,6 @@ class Backuper(LogMixin):
         except Exception as e:
             self.logger.error(f"7z extract error: {e}")
             return False
-        finally:
-            if pw_file is not None:
-                try:
-                    os.unlink(pw_file.name)
-                except OSError:
-                    pass
 
     # ── Main Menu ──
 

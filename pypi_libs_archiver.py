@@ -19,12 +19,18 @@ from logging_config import setup_logging, LogMixin, SessionCapture
 
 from pypi_api import PyPIAPI
 from browser_max import BrowserMAX
+from browser_init import BrowserInitMixin
 from pypi_libs_journal import PyPILibsJournal
 from config_utils import get_split_mode
+from signal_handler import SignalHandler
+from utils import format_file_size
 
 
-class PyPILibsArchiver(LogMixin):
+class PyPILibsArchiver(LogMixin, BrowserInitMixin):
     """Архиватор топ Python библиотек в MAX канал"""
+
+    _channel_key = "pypi"
+    _section_key = None
 
     def __init__(self, config_path: str = "config.yaml"):
         from config import init_config, get_config
@@ -40,14 +46,7 @@ class PyPILibsArchiver(LogMixin):
         self._shutdown = False
 
         # Register cleanup handlers
-        atexit.register(self._cleanup)
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
-
-    def _signal_handler(self, signum, frame):
-        """Handle shutdown signals"""
-        self.logger.info(f"Received signal {signum}, shutting down...")
-        self._shutdown = True
+        SignalHandler().register(self, on_cleanup=self._cleanup)
 
     def _cleanup(self):
         """Clean up resources on exit"""
@@ -58,26 +57,6 @@ class PyPILibsArchiver(LogMixin):
                 self.browser.close()
             except Exception:
                 pass
-
-    def _init_browser(self) -> BrowserMAX:
-        """Инициализировать браузер MAX (реиспользует соединение, если живо)"""
-        if self.browser is None:
-            channel_url = self.config.get('channels', {}).get('pypi', '')
-            use_local = self.config.get('pypi_libs_archiver', {}).get(
-                'use_local_browser',
-                self.config.get('archiver', {}).get('use_local_browser', False)
-            )
-            self.browser = BrowserMAX(channel_url, use_local_browser=use_local)
-        return self.browser
-
-    def _ensure_browser_connected(self):
-        """Ensure browser is connected and ready"""
-        browser = self._init_browser()
-        if not browser.keep_alive_connect():
-            raise Exception("Failed to connect to MAX")
-        browser.navigate()
-        browser.ensure_page_ready()
-        return browser
 
     # ── Formatting helpers ──
 
@@ -91,17 +70,6 @@ class PyPILibsArchiver(LogMixin):
         elif count >= 1_000:
             return f"{count / 1_000:.1f}K"
         return str(count)
-
-    @staticmethod
-    def _format_file_size(size_bytes: int) -> str:
-        """Форматировать размер файла"""
-        if size_bytes >= 1024 * 1024 * 1024:
-            return f"{size_bytes / 1024 / 1024 / 1024:.1f} GB"
-        elif size_bytes >= 1024 * 1024:
-            return f"{size_bytes / 1024 / 1024:.1f} MB"
-        elif size_bytes >= 1024:
-            return f"{size_bytes / 1024:.1f} KB"
-        return f"{size_bytes} B"
 
     def _build_message_text(self, pkg_data: dict, file_sizes: list[int]) -> str:
         """
@@ -136,7 +104,7 @@ class PyPILibsArchiver(LogMixin):
 
         if file_sizes:
             for i, size in enumerate(file_sizes):
-                text += f"\n📦 Файл {i + 1}: {self._format_file_size(size)}"
+                text += f"\n📦 Файл {i + 1}: {format_file_size(size)}"
 
         return text
 
@@ -293,7 +261,7 @@ class PyPILibsArchiver(LogMixin):
             for fp in file_paths:
                 size = os.path.getsize(fp)
                 file_sizes.append(size)
-                print(f"    ✓ {os.path.basename(fp)} ({self._format_file_size(size)})")
+                print(f"    ✓ {os.path.basename(fp)} ({format_file_size(size)})")
 
             # Формируем текст сообщения
             pkg_data = {

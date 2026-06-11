@@ -23,6 +23,9 @@ from pathlib import Path
 from logging_config import setup_logging, LogMixin, SessionCapture
 
 from browser_max import BrowserMAX
+from browser_init import BrowserInitMixin
+from signal_handler import SignalHandler
+from utils import format_file_size
 
 
 
@@ -182,7 +185,7 @@ class DownloadJournal:
         }
 
 
-class ChannelDownloader(LogMixin):
+class ChannelDownloader(BrowserInitMixin, LogMixin):
     """Скачивание всех файлов из MAX канала в локальную папку
 
     Оркестрирует процесс:
@@ -193,6 +196,9 @@ class ChannelDownloader(LogMixin):
     5. Ведение журнала скачанных файлов (resume support)
     """
 
+    _channel_key = "max"
+    _section_key = None
+
     def __init__(self, config_path: str = "config.yaml"):
         from config import init_config, get_config
         init_config(config_path)
@@ -202,14 +208,7 @@ class ChannelDownloader(LogMixin):
         self._shutdown = False
 
         # Register cleanup handlers (same pattern as media_archiver.py)
-        atexit.register(self._cleanup)
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
-
-    def _signal_handler(self, signum, frame):
-        """Handle shutdown signals"""
-        self.logger.info(f"Received signal {signum}, shutting down...")
-        self._shutdown = True
+        SignalHandler().register(self, on_cleanup=self._cleanup)
 
     def _cleanup(self):
         """Clean up resources on exit"""
@@ -219,33 +218,6 @@ class ChannelDownloader(LogMixin):
                 self.browser.close()
             except Exception:
                 pass
-
-    def _init_browser(self) -> BrowserMAX:
-        """Инициализировать браузер MAX (реюз подключения)"""
-        if self.browser is None:
-            channel_url = self.config.get('channels', {}).get('max', '')
-            use_local = self.config.get('archiver', {}).get('use_local_browser', False)
-            self.browser = BrowserMAX(channel_url, use_local_browser=use_local)
-        return self.browser
-
-    def _ensure_browser_connected(self):
-        """Подключиться к MAX и перейти в канал"""
-        browser = self._init_browser()
-        if not browser.keep_alive_connect():
-            raise Exception("Failed to connect to MAX")
-        browser.navigate()
-        browser.ensure_page_ready()
-        return browser
-
-    def _format_file_size(self, size_bytes: int) -> str:
-        """Форматировать размер файла (человекочитаемый)"""
-        if size_bytes >= 1073741824:
-            return f"{size_bytes / 1073741824:.1f} GB"
-        elif size_bytes >= 1048576:
-            return f"{size_bytes / 1048576:.1f} MB"
-        elif size_bytes >= 1024:
-            return f"{size_bytes / 1024:.1f} KB"
-        return f"{size_bytes} B"
 
     def _get_output_dir(self) -> str:
         """Спросить у пользователя папку для скачивания (дефолт из config)"""
@@ -356,14 +328,14 @@ class ChannelDownloader(LogMixin):
 
         # 4. Show file summary
         total_size = sum(f.get("file_size", 0) for f in files)
-        print(f"  Найдено: {len(files)} файлов ({self._format_file_size(total_size)})")
+        print(f"  Найдено: {len(files)} файлов ({format_file_size(total_size)})")
 
         # Show table
         print(f"\n  {'#':>3}  {'Имя файла':<50} {'Размер':>10}")
         print(f"  {'─'*3}  {'─'*50} {'─'*10}")
         for i, f in enumerate(files, 1):
             fname = f.get("filename", "?")
-            fsize = self._format_file_size(f.get("file_size", 0))
+            fsize = format_file_size(f.get("file_size", 0))
             display_name = fname[:47] + "..." if len(fname) > 50 else fname
             print(f"  {i:>3}  {display_name:<50} {fsize:>10}")
 
@@ -407,7 +379,7 @@ class ChannelDownloader(LogMixin):
             file_size = file_info.get("file_size", 0)
             download_url = file_info.get("download_url", "")
             has_direct_url = file_info.get("has_direct_url", False)
-            file_size_str = self._format_file_size(file_size)
+            file_size_str = format_file_size(file_size)
 
             # Check journal for deduplication
             if self.journal.is_downloaded(filename, file_size):

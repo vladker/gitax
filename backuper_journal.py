@@ -4,59 +4,14 @@ Journal for backuper module — tracks backups, downloads, and passwords.
 Stored in backuper_journal.json.
 """
 
-import json
 import os
-import time
-import tempfile
-import shutil
 import hashlib
 from datetime import datetime
-from pathlib import Path
-from logging_config import LogMixin
+from shared_journal import BaseJournal
 
 
-class BackuperJournal(LogMixin):
+class BackuperJournal(BaseJournal):
     """Backup and download journal with password protection tracking"""
-
-    def __init__(self, file_path: str = "backuper_journal.json"):
-        self.file_path = file_path
-        self._lock_file = f"{file_path}.lock"
-        self.data = self._load()
-
-    def _acquire_lock(self) -> bool:
-        """Acquire exclusive lock for safe writes (5 min stale timeout)"""
-        try:
-            if os.path.exists(self._lock_file):
-                lock_age = time.time() - os.path.getmtime(self._lock_file)
-                if lock_age > 300:
-                    self._release_lock()
-                else:
-                    return False
-            Path(self._lock_file).touch()
-            return True
-        except Exception:
-            return False
-
-    def _release_lock(self):
-        """Release lock file"""
-        try:
-            if os.path.exists(self._lock_file):
-                os.remove(self._lock_file)
-        except Exception:
-            pass
-
-    def _load(self) -> dict:
-        """Load journal from file, recover from corruption"""
-        if os.path.exists(self.file_path):
-            try:
-                with open(self.file_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, IOError):
-                backup_path = f"{self.file_path}.backup"
-                if os.path.exists(self.file_path):
-                    os.rename(self.file_path, backup_path)
-                return self._create_empty()
-        return self._create_empty()
 
     def _create_empty(self) -> dict:
         """Create empty journal structure"""
@@ -67,35 +22,6 @@ class BackuperJournal(LogMixin):
             "password_hints": {},
             "files": {}
         }
-
-    def clear(self):
-        """Clear journal — reset all data"""
-        self.data = self._create_empty()
-        self.save()
-        self.logger.info("Backuper journal cleared")
-
-    def save(self):
-        """Save journal to file (atomic write via temp+rename)"""
-        if not self._acquire_lock():
-            self.logger.warning("Journal locked, skipping save")
-            return
-        try:
-            temp_fd, temp_path = tempfile.mkstemp(
-                suffix='.json',
-                dir=os.path.dirname(self.file_path) or '.'
-            )
-            try:
-                with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
-                    json.dump(self.data, f, ensure_ascii=False, indent=2)
-                if os.path.exists(self.file_path):
-                    shutil.copy2(self.file_path, f"{self.file_path}.bak")
-                os.replace(temp_path, self.file_path)
-            except Exception:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-                raise
-        finally:
-            self._release_lock()
 
     def add_backup(self, backup_data: dict) -> bool:
         """

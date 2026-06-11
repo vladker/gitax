@@ -4,7 +4,7 @@ Unit tests for PyPILibsArchiver class.
 Tests cover:
 - _build_message_text() formatting
 - _format_downloads() helper
-- _format_file_size() helper
+- format_file_size() helper (via utils)
 - Config validation (missing channel_url)
 - Journal integration (dedup check in load path)
 """
@@ -42,26 +42,26 @@ class TestFormatDownloads:
 
 
 class TestFormatFileSize:
-    """Test _format_file_size static method"""
+    """Test utils.format_file_size (used by PyPILibsArchiver)"""
 
     def test_format_file_size_gb(self):
-        from pypi_libs_archiver import PyPILibsArchiver
-        assert "GB" in PyPILibsArchiver._format_file_size(2_000_000_000)
+        from utils import format_file_size
+        assert "GB" in format_file_size(2_000_000_000)
 
     def test_format_file_size_mb(self):
-        from pypi_libs_archiver import PyPILibsArchiver
-        assert PyPILibsArchiver._format_file_size(1_048_576) == "1.0 MB"
-        assert "MB" in PyPILibsArchiver._format_file_size(50_000_000)
+        from utils import format_file_size
+        assert format_file_size(1_048_576) == "1.0 MB"
+        assert "MB" in format_file_size(50_000_000)
 
     def test_format_file_size_kb(self):
-        from pypi_libs_archiver import PyPILibsArchiver
-        assert "KB" in PyPILibsArchiver._format_file_size(1_024)
-        assert PyPILibsArchiver._format_file_size(500) == "500 B"
+        from utils import format_file_size
+        assert "KB" in format_file_size(1_024)
+        assert format_file_size(500) == "500 B"
 
     def test_format_file_size_bytes(self):
-        from pypi_libs_archiver import PyPILibsArchiver
-        assert PyPILibsArchiver._format_file_size(0) == "0 B"
-        assert PyPILibsArchiver._format_file_size(100) == "100 B"
+        from utils import format_file_size
+        assert format_file_size(0) == "0 B"
+        assert format_file_size(100) == "100 B"
 
 
 class TestBuildMessageText:

@@ -6,92 +6,16 @@
 Атомарная запись (write+rename), как в journal.py / MediaJournal.
 """
 
-import json
-import os
-import time
-import tempfile
-import shutil
 from datetime import datetime
-from pathlib import Path
-from logging_config import LogMixin
+from shared_journal import BaseJournal
 
 
-class PyPILibsJournal(LogMixin):
+class PyPILibsJournal(BaseJournal):
     """Журнал отправленных PyPI библиотек"""
-
-    def __init__(self, file_path: str = "pypi_libs_journal.json"):
-        self.file_path = file_path
-        self._lock_file = f"{file_path}.lock"
-        self.data = self._load()
-
-    def _acquire_lock(self) -> bool:
-        """Acquire exclusive lock for safe writes (5 min stale timeout)"""
-        try:
-            if os.path.exists(self._lock_file):
-                lock_age = time.time() - os.path.getmtime(self._lock_file)
-                if lock_age > 300:
-                    self._release_lock()
-                else:
-                    return False
-            Path(self._lock_file).touch()
-            return True
-        except Exception:
-            return False
-
-    def _release_lock(self):
-        """Release lock file"""
-        try:
-            if os.path.exists(self._lock_file):
-                os.remove(self._lock_file)
-        except Exception:
-            pass
-
-    def _load(self) -> dict:
-        """Загрузить журнал из файла"""
-        if os.path.exists(self.file_path):
-            try:
-                with open(self.file_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, IOError):
-                backup_path = f"{self.file_path}.backup"
-                if os.path.exists(self.file_path):
-                    os.rename(self.file_path, backup_path)
-                return self._create_empty()
-        return self._create_empty()
 
     def _create_empty(self) -> dict:
         """Создать пустой журнал"""
         return {"libraries": []}
-
-    def clear(self):
-        """Очистить журнал — сбросить все данные"""
-        self.data = self._create_empty()
-        self.save()
-        self.logger.info("PyPI libs journal cleared")
-
-    def save(self):
-        """Сохранить журнал в файл (атомарная запись через write+rename)"""
-        if not self._acquire_lock():
-            self.logger.warning("Journal locked, skipping save")
-            return
-        try:
-            temp_fd, temp_path = tempfile.mkstemp(
-                suffix='.json',
-                dir=os.path.dirname(self.file_path) or '.'
-            )
-            try:
-                with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
-                    json.dump(self.data, f, ensure_ascii=False, indent=2)
-                if os.path.exists(self.file_path):
-                    backup_path = f"{self.file_path}.bak"
-                    shutil.copy2(self.file_path, backup_path)
-                os.replace(temp_path, self.file_path)
-            except Exception:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-                raise
-        finally:
-            self._release_lock()
 
     def add(self, name: str, version: str, description: str,
             downloads: int, files: list[str]) -> bool:

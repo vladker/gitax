@@ -249,19 +249,23 @@ class TestChannelDownloaderInit:
 
 
 class TestChannelDownloaderFormatSize:
-    """Tests for _format_file_size"""
+    """Tests for utils.format_file_size (used by ChannelDownloader)"""
 
-    def test_bytes(self, channel_downloader):
-        assert channel_downloader._format_file_size(500) == "500 B"
+    def test_bytes(self):
+        from utils import format_file_size
+        assert format_file_size(500) == "500 B"
 
-    def test_kb(self, channel_downloader):
-        assert channel_downloader._format_file_size(2048) == "2.0 KB"
+    def test_kb(self):
+        from utils import format_file_size
+        assert format_file_size(2048) == "2.0 KB"
 
-    def test_mb(self, channel_downloader):
-        assert channel_downloader._format_file_size(1048576) == "1.0 MB"
+    def test_mb(self):
+        from utils import format_file_size
+        assert format_file_size(1048576) == "1.0 MB"
 
-    def test_gb(self, channel_downloader):
-        result = channel_downloader._format_file_size(2147483648)
+    def test_gb(self):
+        from utils import format_file_size
+        result = format_file_size(2147483648)
         assert "GB" in result
 
 
@@ -270,7 +274,7 @@ class TestChannelDownloaderIntegration:
 
     def test_init_browser_creates_browsermax(self, channel_downloader):
         """_init_browser creates BrowserMAX instance"""
-        with patch('channel_downloader.BrowserMAX') as mock_bm:
+        with patch('browser_init.BrowserMAX') as mock_bm:
             browser = channel_downloader._init_browser()
             mock_bm.assert_called_once()
 
@@ -352,7 +356,10 @@ class TestChannelDownloaderCleanup:
 
     def test_signal_handler_sets_shutdown_flag(self, channel_downloader):
         """Signal handler sets _shutdown to True"""
-        channel_downloader._signal_handler(None, None)
+        import signal
+        for sig_handler in (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)):
+            if sig_handler:
+                sig_handler(None, None)
         assert channel_downloader._shutdown is True
 
     def test_cleanup_calls_browser_close(self, channel_downloader):
