@@ -38,7 +38,16 @@ def get_config(config_path: Optional[str] = None) -> AppConfig:
         Validated AppConfig singleton with env overrides applied.
     """
     effective_path = config_path or _config_path
-    return load_config(effective_path)
+    config = load_config(effective_path)
+    # Store path on instance for save() to use
+    config._config_path_attr = effective_path or "config.yaml"
+    return config
+
+
+def save_config() -> None:
+    """Persist current config to disk."""
+    config = get_config()
+    config.save()
 
 
 def init_config(config_path: str) -> None:
@@ -56,4 +65,5 @@ __all__ = [
     "AppConfig",
     "get_config",
     "init_config",
+    "save_config",
 ]

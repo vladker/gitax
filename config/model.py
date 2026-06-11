@@ -6,7 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ArchiverConfig(BaseModel):
@@ -99,6 +99,60 @@ class GitHubConfig(BaseModel):
     token: str = ""
 
 
+VALID_CHANNEL_FUNCTIONS = ("github", "pypi", "media", "backup")
+
+
+class ChannelEntry(BaseModel):
+    """Single channel entry in the registry."""
+    url: str = Field(min_length=1)
+    label: str = ""
+    enabled: bool = True
+
+    @field_validator("url")
+    @classmethod
+    def url_must_be_http(cls, v: str) -> str:
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("Channel URL must start with http:// or https://")
+        return v
+
+
+class ChannelRegistry(BaseModel):
+    """Registry of channels per function. Replaces flat channels.{key} = url."""
+    github: list[ChannelEntry] = Field(default_factory=list)
+    pypi: list[ChannelEntry] = Field(default_factory=list)
+    media: list[ChannelEntry] = Field(default_factory=list)
+    backup: list[ChannelEntry] = Field(default_factory=list)
+
+    def get_enabled(self, function: str) -> list[ChannelEntry]:
+        """Return enabled channels for a function."""
+        if function not in VALID_CHANNEL_FUNCTIONS:
+            raise ValueError(f"Invalid function: {function}. Must be one of {VALID_CHANNEL_FUNCTIONS}")
+        channels = getattr(self, function, [])
+        return [ch for ch in channels if ch.enabled]
+
+    def has_channels(self, function: str) -> bool:
+        """Check if a function has any channels configured."""
+        channels = getattr(self, function, [])
+        return len(channels) > 0
+
+    def toggle_channel(self, function: str, index: int) -> None:
+        """Toggle enabled state of a channel."""
+        channels = getattr(self, function, [])
+        if 0 <= index < len(channels):
+            channels[index].enabled = not channels[index].enabled
+
+    def remove_channel(self, function: str, index: int) -> None:
+        """Remove a channel by index."""
+        channels = getattr(self, function, [])
+        if 0 <= index < len(channels):
+            del channels[index]
+
+    def add_channel(self, function: str, url: str, label: str = "") -> None:
+        """Add a new channel entry."""
+        channels = getattr(self, function, [])
+        channels.append(ChannelEntry(url=url, label=label))
+
+
 class AppConfig(BaseModel):
     """Root config model — composes all section models.
     Every section is optional (defaults to its own defaults)."""
@@ -111,5 +165,26 @@ class AppConfig(BaseModel):
     pypi_libs_archiver: PyPILibsArchiverConfig = PyPILibsArchiverConfig()
     setup: SetupConfig = SetupConfig()
     github: GitHubConfig = GitHubConfig()
+    channel_registry: ChannelRegistry = Field(default_factory=ChannelRegistry)
 
     model_config = {"extra": "ignore"}  # Silently ignore unknown YAML keys
+
+    def clear_legacy_channels(self) -> None:
+        """Clear legacy channels.* fields after migration to prevent re-migration."""
+        self.channels.max = ""
+        self.channels.pypi = ""
+        self.channels.media = ""
+        self.channels.backup = ""
+
+    def save(self) -> None:
+        """Persist config to YAML file.
+
+        Uses _config_path_attr set by config/__init__.py during init_config().
+        """
+        import yaml
+        config_path = getattr(self, "_config_path_attr", None)
+        if config_path is None:
+            config_path = "config.yaml"
+        data = self.model_dump()
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)

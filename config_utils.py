@@ -352,3 +352,63 @@ def config_from_file(config_path: str = "config.yaml") -> dict:
     from config import init_config, get_config
     init_config(config_path)
     return get_config().model_dump()
+
+
+# ── Channel Registry Utilities ──
+
+_CHANNEL_TO_FUNCTION = {
+    "max": "github",
+    "pypi": "pypi",
+    "media": "media",
+    "backup": "backup",
+}
+
+
+def get_channels_for_function(function: str) -> list:
+    """
+    Get enabled channels for a function from channel_registry.
+
+    Args:
+        function: Function key ("github", "pypi", "media", "backup")
+
+    Returns:
+        List of ChannelEntry objects (enabled only)
+
+    Raises:
+        ValueError: If function is invalid
+    """
+    from config import get_config
+    config = get_config()
+    return config.channel_registry.get_enabled(function)
+
+
+def get_channel_url_for_channel_key(channel_key: str) -> str:
+    """
+    Get the first enabled channel URL for a legacy channel key.
+
+    Backward compatibility wrapper: returns the URL of the first enabled channel
+    for a given channel key (e.g., "max" -> first github channel).
+    Falls back to old channels.{key} if registry is empty.
+
+    Args:
+        channel_key: Legacy channel key ("max", "pypi", "media", "backup")
+
+    Returns:
+        Channel URL string, or empty string if not found
+    """
+    from config import get_config
+    config = get_config()
+
+    function = _CHANNEL_TO_FUNCTION.get(channel_key, channel_key)
+    try:
+        enabled = config.channel_registry.get_enabled(function)
+        if enabled:
+            return enabled[0].url
+    except (ValueError, AttributeError):
+        pass
+
+    old_url = getattr(config.channels, channel_key, "")
+    if old_url:
+        return old_url
+
+    return ""

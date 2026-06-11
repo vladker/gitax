@@ -410,7 +410,10 @@ class TestChannelDownloaderEnvConfig:
         config_file.write_text("channels: {}\n")
         from channel_downloader import ChannelDownloader
         cd = ChannelDownloader(str(config_file))
-        assert cd.config['channels']['max'] == "https://web.max.ru/env-channel"
+        # Legacy channel cleared after migration to registry
+        assert cd.config['channels']['max'] == ""
+        assert len(cd.config['channel_registry']['github']) == 1
+        assert cd.config['channel_registry']['github'][0]['url'] == "https://web.max.ru/env-channel"
 
     def test_env_var_overrides_yaml(self, tmp_path, monkeypatch):
         """Env var takes priority over config.yaml value"""
@@ -419,13 +422,21 @@ class TestChannelDownloaderEnvConfig:
         config_file.write_text("channels:\n  max: https://web.max.ru/yaml-channel\n")
         from channel_downloader import ChannelDownloader
         cd = ChannelDownloader(str(config_file))
-        assert cd.config['channels']['max'] == "https://web.max.ru/env-channel"
+        # Legacy channel cleared after migration to registry
+        assert cd.config['channels']['max'] == ""
+        assert len(cd.config['channel_registry']['github']) == 1
+        assert cd.config['channel_registry']['github'][0]['url'] == "https://web.max.ru/env-channel"
 
     def test_yaml_fallback_when_no_env(self, tmp_path, monkeypatch):
         """config.yaml channels.max is used when env var is not set"""
         monkeypatch.delenv("CHANNEL_MAX", raising=False)
+        # Prevent load_dotenv from loading .env and overriding test config
+        monkeypatch.setattr("config.loader.load_dotenv", lambda: None)
         config_file = tmp_path / "test_config.yaml"
         config_file.write_text("channels:\n  max: https://web.max.ru/yaml-channel\n")
         from channel_downloader import ChannelDownloader
         cd = ChannelDownloader(str(config_file))
-        assert cd.config['channels']['max'] == "https://web.max.ru/yaml-channel"
+        # Legacy channel cleared after migration to registry
+        assert cd.config['channels']['max'] == ""
+        assert len(cd.config['channel_registry']['github']) == 1
+        assert cd.config['channel_registry']['github'][0]['url'] == "https://web.max.ru/yaml-channel"

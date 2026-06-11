@@ -14,6 +14,7 @@ import shutil
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
+import threading
 
 from logging_config import LogMixin
 
@@ -25,6 +26,8 @@ class BaseJournal(LogMixin):
         self.file_path = file_path
         self._lock_file = f"{file_path}.lock"
         self.data = self._load()
+
+    _write_lock = threading.Lock()
 
     # ── Locking ──────────────────────────────────────────────
 
@@ -68,9 +71,11 @@ class BaseJournal(LogMixin):
     # ── Save (atomic write) ─────────────────────────────────
 
     def save(self):
-        """Save journal to file (atomic write via tempfile → copy2 → os.replace)"""
-        if not self._acquire_lock():
-            self.logger.warning("Journal locked, skipping save")
+        """Save journal to file (atomic write via tempfile → copy2 → os.replace).
+        Thread-safe via class-level lock."""
+        acquired = self._write_lock.acquire(timeout=5)
+        if not acquired:
+            self.logger.warning("Journal write lock timeout, skipping save")
             return
         try:
             self._pre_save()
@@ -90,7 +95,7 @@ class BaseJournal(LogMixin):
                     os.remove(temp_path)
                 raise
         finally:
-            self._release_lock()
+            self._write_lock.release()
 
     def _pre_save(self):
         """Hook called before writing data. Subclasses can override for custom logic."""

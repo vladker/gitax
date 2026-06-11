@@ -47,7 +47,10 @@ class TestLoadConfig:
         cfg = load_config(cfg_file)
         assert cfg.archiver.limit == 50
         assert cfg.archiver.split_mode == "off"
-        assert cfg.channels.max == "https://example.com/max"
+        # Legacy channel cleared after migration to registry
+        assert cfg.channels.max == ""
+        assert len(cfg.channel_registry.github) == 1
+        assert cfg.channel_registry.github[0].url == "https://example.com/max"
         # Unset fields get defaults
         assert cfg.archiver.repo_delay == 30
         assert cfg.browser.cdp_port == 9222
@@ -79,7 +82,10 @@ class TestLoadConfig:
         monkeypatch.setenv("CHANNEL_MAX", "https://channel.from.env")
         from config.loader import load_config
         cfg = load_config(tmp_path / "nonexistent.yaml")
-        assert cfg.channels.max == "https://channel.from.env"
+        # Legacy channel cleared after migration to registry
+        assert cfg.channels.max == ""
+        assert len(cfg.channel_registry.github) == 1
+        assert cfg.channel_registry.github[0].url == "https://channel.from.env"
 
     def test_env_override_legacy_media_watch_dir(self, tmp_path, monkeypatch):
         """MEDIA_WATCH_DIR env var maps to media_archiver.watch_dir."""

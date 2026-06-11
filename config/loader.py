@@ -7,10 +7,59 @@ import os
 from pathlib import Path
 from typing import Any
 
+import logging
 import yaml
 from dotenv import load_dotenv
 
 from config.model import AppConfig
+from config.model import ChannelEntry
+
+_logger = logging.getLogger("gitax")
+
+_CHANNEL_MIGRATION_MAP = {
+    "max": ("github", "GitHub Main"),
+    "pypi": ("pypi", "PyPI Main"),
+    "media": ("media", "Media Main"),
+    "backup": ("backup", "Backup Main"),
+}
+
+
+def _migrate_channels_to_registry(config: AppConfig) -> AppConfig:
+    """Auto-migrate old channels.{key} URLs to channel_registry on first load.
+
+    Runs every load cycle to ensure registry stays in sync with legacy sources
+    (env vars, config.yaml channels section). Only adds entries that don't
+    already exist — idempotent across reloads.
+    """
+    skipped = config.setup.skipped_channels or []
+
+    migrated = 0
+    for old_key, (reg_func, default_label) in _CHANNEL_MIGRATION_MAP.items():
+        old_url = getattr(config.channels, old_key, "")
+        if not old_url:
+            continue
+        if old_key in skipped:
+            continue
+
+        # Check if this URL already exists in the registry (idempotent)
+        existing = getattr(config.channel_registry, reg_func, [])
+        if any(ch.url == old_url for ch in existing):
+            continue
+
+        entry = ChannelEntry(url=old_url, label=default_label, enabled=True)
+        getattr(config.channel_registry, reg_func).append(entry)
+        migrated += 1
+
+    if migrated > 0:
+        _logger.debug(
+            f"Auto-migrated {migrated} channel(s) from legacy channels.* format "
+            f"to channel_registry."
+        )
+        # NOTE: Do NOT clear_legacy_channels() — existing archiver code still reads
+        # from config.channels.* for backward compatibility. Legacy fields are kept
+        # populated so self.config.get('channels', {}).get('pypi') continues to work.
+
+    return config
 
 
 def _coerce_value(raw: str, target_type: Any) -> Any:
@@ -113,5 +162,6 @@ def load_config(yaml_path: Path | str | None = None) -> AppConfig:
 
     # Apply env overrides on top
     config = _apply_env_overrides(config)
+    config = _migrate_channels_to_registry(config)
 
     return config
