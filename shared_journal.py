@@ -103,8 +103,22 @@ class BaseJournal(LogMixin):
 
     # ── Clear ────────────────────────────────────────────────
 
-    def clear(self):
-        """Clear journal — reset all data"""
+    def clear(self, confirm: bool = False):
+        """Clear journal — reset all data.
+
+        Args:
+            confirm: If True, asks for user confirmation before clearing.
+                     Default is False for backward compatibility with tests.
+        """
+        if confirm:
+            try:
+                response = input(f"  ⚠ Очистить журнал {self.__class__.__name__}? Все данные будут потеряны. (y/N): ")
+                if response.strip().lower() not in ('y', 'yes'):
+                    print("  Отмена.")
+                    return
+            except (EOFError, KeyboardInterrupt):
+                print("\n  Отмена.")
+                return
         self.data = self._create_empty()
         self.save()
         self.logger.info(f"{self.__class__.__name__} cleared")

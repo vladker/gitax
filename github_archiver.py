@@ -2925,6 +2925,18 @@ def main():
     if len(sys.argv) > 1:
         config_path = sys.argv[1]
 
+    # Initialize config early for health checks
+    from config import init_config
+    init_config(config_path)
+
+    # Health checks
+    from health_check import run_health_checks
+    checks_ok = run_health_checks()
+    if not checks_ok:
+        print("\n  Критические проверки не пройдены.")
+        print("  Исправьте проблемы выше или запустите с --skip-health-check")
+        sys.exit(1)
+
     archiver = None
     shutdown = None
 

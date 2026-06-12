@@ -424,16 +424,11 @@ class ChannelDownloader(BrowserInitMixin, LogMixin):
                         success = True
                         break
                     else:
-                        # Fallback via browser evaluate for files below threshold
-                        if file_size < large_file_threshold:
-                            print(f"    → Fallback: загрузка через браузер...")
-                            raise NotImplementedError(
-                                "Browser-based download fallback not yet implemented"
-                            )
-                        else:
-                            threshold_mb = large_file_threshold // (1024 * 1024)
-                            print(f"    ✗ Нет URL для скачивания (файл >{threshold_mb}MB)")
-                            break
+                        # No direct download URL available
+                        threshold_mb = large_file_threshold // (1024 * 1024)
+                        print(f"    ✗ Нет URL для скачивания (файл <{threshold_mb}MB, browser fallback N/A)")
+                        error_count += 1
+                        break
 
                 except (ConnectionError, TimeoutError) as e:
                     if attempt < retries:
