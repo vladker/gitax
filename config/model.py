@@ -35,6 +35,7 @@ class ChannelsConfig(BaseModel):
     pypi: str = ""
     media: str = ""
     backup: str = ""
+    npm: str = ""
 
 
 class BackuperConfig(BaseModel):
@@ -88,6 +89,15 @@ class PyPILibsArchiverConfig(BaseModel):
     split_mode: Literal["auto", "on", "off", "prompt"] = "auto"
 
 
+class NpmArchiverConfig(BaseModel):
+    """Settings: config.yaml → npm_archiver section."""
+    limit: int = 20
+    output_dir: str = "./temp_npm"
+    retries: int = 3
+    retry_delay: int = 10
+    split_mode: Literal["auto", "on", "off", "prompt"] = "auto"
+
+
 class SetupConfig(BaseModel):
     """Settings: config.yaml → setup section."""
     skipped_channels: list[str] = Field(default_factory=list)
@@ -99,7 +109,7 @@ class GitHubConfig(BaseModel):
     token: str = ""
 
 
-VALID_CHANNEL_FUNCTIONS = ("github", "pypi", "media", "backup")
+VALID_CHANNEL_FUNCTIONS = ("github", "pypi", "media", "backup", "npm")
 
 
 class ChannelEntry(BaseModel):
@@ -122,6 +132,7 @@ class ChannelRegistry(BaseModel):
     pypi: list[ChannelEntry] = Field(default_factory=list)
     media: list[ChannelEntry] = Field(default_factory=list)
     backup: list[ChannelEntry] = Field(default_factory=list)
+    npm: list[ChannelEntry] = Field(default_factory=list)
 
     def get_enabled(self, function: str) -> list[ChannelEntry]:
         """Return enabled channels for a function."""
@@ -163,6 +174,7 @@ class AppConfig(BaseModel):
     channel_downloader: ChannelDownloaderConfig = ChannelDownloaderConfig()
     media_archiver: MediaArchiverConfig = MediaArchiverConfig()
     pypi_libs_archiver: PyPILibsArchiverConfig = PyPILibsArchiverConfig()
+    npm_archiver: NpmArchiverConfig = NpmArchiverConfig()
     setup: SetupConfig = SetupConfig()
     github: GitHubConfig = GitHubConfig()
     channel_registry: ChannelRegistry = Field(default_factory=ChannelRegistry)
@@ -175,6 +187,7 @@ class AppConfig(BaseModel):
         self.channels.pypi = ""
         self.channels.media = ""
         self.channels.backup = ""
+        self.channels.npm = ""
 
     def save(self) -> None:
         """Persist config to YAML file.

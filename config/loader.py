@@ -21,6 +21,7 @@ _CHANNEL_MIGRATION_MAP = {
     "pypi": ("pypi", "PyPI Main"),
     "media": ("media", "Media Main"),
     "backup": ("backup", "Backup Main"),
+    "npm": ("npm", "NPM Main"),
 }
 
 
@@ -91,6 +92,7 @@ def _apply_env_overrides(config: AppConfig) -> AppConfig:
         "CHANNEL_PYPI": ("channels", "pypi"),
         "CHANNEL_MEDIA": ("channels", "media"),
         "CHANNEL_BACKUP": ("channels", "backup"),
+        "CHANNEL_NPM": ("channels", "npm"),
     }
     for env_key, (section, field) in legacy_map.items():
         raw = os.environ.get(env_key, "").strip()

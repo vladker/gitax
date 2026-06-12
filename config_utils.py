@@ -303,7 +303,7 @@ def is_setup_complete(config: dict) -> bool:
     channels = config.get("channels", {}) or {}
 
     has_configured = False
-    for ch_name in ("max", "pypi", "media", "backup"):
+    for ch_name in ("max", "pypi", "media", "backup", "npm"):
         if ch_name in skipped:
             continue
         env_var = f"CHANNEL_{ch_name.upper()}"
@@ -317,7 +317,7 @@ def is_setup_complete(config: dict) -> bool:
             return False
 
     # Complete if at least one non-skipped channel configured, or all skipped
-    return has_configured or len(skipped) >= 4
+    return has_configured or len(skipped) >= 5
 
 
 # ── Thin wrapper over new config/ package ──
@@ -361,6 +361,7 @@ _CHANNEL_TO_FUNCTION = {
     "pypi": "pypi",
     "media": "media",
     "backup": "backup",
+    "npm": "npm",
 }
 
 
