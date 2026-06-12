@@ -26,6 +26,7 @@ from browser_max import BrowserMAX
 from browser_init import BrowserInitMixin
 from signal_handler import SignalHandler
 from utils import format_file_size
+from retry import retry
 
 
 
@@ -228,6 +229,12 @@ class ChannelDownloader(BrowserInitMixin, LogMixin):
         except (EOFError, KeyboardInterrupt):
             return default
 
+    @retry(
+        max_retries=3,
+        delay=5.0,
+        backoff=1.0,
+        exceptions=(ConnectionError, TimeoutError),
+    )
     def _download_with_requests(self, browser: BrowserMAX, url: str, output_path: str):
         """
         Скачать файл через requests + cookies из браузера.
@@ -484,6 +491,7 @@ class ChannelDownloader(BrowserInitMixin, LogMixin):
 
 def main():
     """Точка входа для запуска как standalone"""
+    load_dotenv()
     session = SessionCapture()
     session.start()
     print(f" Session log: {session.path}")

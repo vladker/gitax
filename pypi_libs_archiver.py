@@ -15,6 +15,7 @@ import atexit
 import signal
 import shutil
 from datetime import datetime
+from dotenv import load_dotenv
 from logging_config import setup_logging, LogMixin, SessionCapture
 
 from pypi_api import PyPIAPI
@@ -542,6 +543,7 @@ class PyPILibsArchiver(LogMixin, BrowserInitMixin):
 
 def main():
     """Точка входа для самостоятельного запуска"""
+    load_dotenv()
     session = SessionCapture()
     session.start()
     print(f"📋 Session log: {session.path}")

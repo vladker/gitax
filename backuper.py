@@ -105,9 +105,7 @@ class Backuper(LogMixin, BrowserInitMixin):
         max_size_bytes = max_size_mb * 1024 * 1024 if max_size_mb > 0 else 0
         allowed_ext = set(ext.lower() for ext in allowed_extensions) if allowed_extensions else None
 
-        walker = os.walk(source_path) if recursive else [(source_path, [], [f for f in os.listdir(source_path) if os.path.isfile(os.path.join(source_path, f))])]
-
-        for dirpath, _dirs, filenames in walker:
+        for dirpath, _dirs, filenames in os.walk(source_path, topdown=True):
             for fname in filenames:
                 filepath = os.path.join(dirpath, fname)
 
@@ -127,6 +125,9 @@ class Backuper(LogMixin, BrowserInitMixin):
                     files.append((filepath, size))
                 except OSError:
                     continue
+
+            if not recursive:
+                break
 
         # Sort by relative path for consistent ordering
         files.sort(key=lambda x: os.path.relpath(x[0], source_path))

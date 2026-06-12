@@ -329,7 +329,7 @@ class TestChannelDownloaderIntegration:
                 assert stats["downloaded"] >= 1  # was already downloaded
 
     def test_download_with_requests_connection_error(self, channel_downloader):
-        """_download_with_requests raises ConnectionError (retry is in run())"""
+        """_download_with_requests retries on ConnectionError via @retry decorator"""
         mock_browser = MagicMock()
         url = "https://cdn.max.ru/file/test.zip"
         output_path = "/tmp/dl/test.zip"
@@ -340,7 +340,8 @@ class TestChannelDownloaderIntegration:
             with pytest.raises(ConnectionError, match="Network timeout"):
                 channel_downloader._download_with_requests(mock_browser, url, output_path)
 
-            assert mock_get.call_count == 1
+            # 1 initial + 3 retries = 4 calls
+            assert mock_get.call_count == 4
 
     def test_download_with_requests_raises_on_final_failure(self, channel_downloader):
         """All retries exhausted raises the last error"""

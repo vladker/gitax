@@ -9,6 +9,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from retry import retry
+
 _logger = logging.getLogger("gitax")
 
 
@@ -68,7 +70,7 @@ class ParallelGroupUploader:
                 target=self._upload_to_channel,
                 args=(channel_info, semaphore, mock_browser_class),
                 name=f"upload-{channel_info.get('label', 'unknown')}",
-                daemon=True,
+                daemon=False,
             )
             threads.append(t)
             time.sleep(self.stagger_delay_sec)
@@ -77,7 +79,11 @@ class ParallelGroupUploader:
             t.start()
 
         for t in threads:
-            t.join(timeout=600)
+            t.join(timeout=300)
+            if t.is_alive():
+                _logger.warning(
+                    f"Thread {t.name} did not complete within 300s timeout"
+                )
 
         summary = self._build_summary()
 
@@ -85,6 +91,24 @@ class ParallelGroupUploader:
             self._cleanup_files(summary)
 
         return summary
+
+    @retry(max_retries=3, delay=5.0, backoff=1.0)
+    def _upload_single_file(
+        self,
+        browser,
+        filepath: str,
+        label: str,
+    ) -> None:
+        """Upload a single file with retry support."""
+        filename = os.path.basename(filepath)
+        success, msg = browser.send_message_with_file(
+            text=f"📦 {filename}",
+            filepath=filepath,
+            retries=1,
+            retry_delay=5,
+        )
+        if not success:
+            raise RuntimeError(f"[{label}] Upload failed: {msg}")
 
     def _upload_to_channel(
         self,
@@ -124,35 +148,12 @@ class ParallelGroupUploader:
                         continue
 
                     filename = os.path.basename(filepath)
-                    retries = 3
-                    for attempt in range(1, retries + 1):
-                        try:
-                            success, msg = browser.send_message_with_file(
-                                text=f"📦 {filename}",
-                                filepath=filepath,
-                                retries=1,
-                                retry_delay=5,
-                            )
-                            if success:
-                                result.files.append(filepath)
-                                uploaded += 1
-                                break
-                            else:
-                                _logger.warning(
-                                    f"[{label}] Upload attempt {attempt} failed: {msg}"
-                                )
-                                if attempt < retries:
-                                    time.sleep(5)
-                                else:
-                                    result.errors.append(
-                                        f"Failed to upload {filename}: {msg}"
-                                    )
-                        except Exception as e:
-                            _logger.error(f"[{label}] Upload error: {e}")
-                            if attempt < retries:
-                                time.sleep(5)
-                            else:
-                                result.errors.append(f"Error uploading {filename}: {e}")
+                    try:
+                        self._upload_single_file(browser, filepath, label)
+                        result.files.append(filepath)
+                        uploaded += 1
+                    except Exception as e:
+                        result.errors.append(f"Failed to upload {filename}: {e}")
 
                 result.success = uploaded > 0
                 _logger.info(

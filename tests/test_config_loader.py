@@ -28,8 +28,16 @@ class TestLoadConfig:
     def test_no_file_returns_defaults(self, tmp_path, monkeypatch):
         """App starts without config.yaml using all defaults."""
         monkeypatch.chdir(tmp_path)
-        from config.loader import load_config
-        cfg = load_config(tmp_path / "nonexistent.yaml")
+        # Isolate from .env — mock load_dotenv before any import
+        monkeypatch.setattr('dotenv.load_dotenv', lambda *a, **k: None)
+        # Clear channel env vars from os.environ
+        for key in ["CHANNEL_max", "CHANNEL_pypi", "CHANNEL_media", "CHANNEL_backup"]:
+            monkeypatch.setitem(os.environ, key, "")
+        # Force reimport to pick up mocked load_dotenv
+        import importlib
+        import config.loader
+        importlib.reload(config.loader)
+        cfg = config.loader.load_config(tmp_path / "nonexistent.yaml")
         assert cfg.archiver.limit == 1000
         assert cfg.archiver.split_mode == "auto"
         assert cfg.browser.cdp_port == 9222
@@ -37,14 +45,20 @@ class TestLoadConfig:
 
     def test_load_from_yaml(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
+        # Isolate from .env
+        monkeypatch.setattr('dotenv.load_dotenv', lambda *a, **k: None)
+        for key in ["CHANNEL_max", "CHANNEL_pypi", "CHANNEL_media", "CHANNEL_backup"]:
+            monkeypatch.setitem(os.environ, key, "")
         cfg_file = tmp_path / "config.yaml"
         cfg_file.write_text(yaml.dump({
             "archiver": {"limit": 50, "split_mode": "off"},
             "channels": {"max": "https://example.com/max"},
         }), encoding="utf-8")
 
-        from config.loader import load_config
-        cfg = load_config(cfg_file)
+        import importlib
+        import config.loader
+        importlib.reload(config.loader)
+        cfg = config.loader.load_config(cfg_file)
         assert cfg.archiver.limit == 50
         assert cfg.archiver.split_mode == "off"
         # Legacy channel cleared after migration to registry

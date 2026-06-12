@@ -15,6 +15,7 @@ import tempfile
 import shutil
 from datetime import datetime
 from pathlib import Path
+from dotenv import load_dotenv
 from logging_config import setup_logging, LogMixin, SessionCapture
 
 from browser_max import BrowserMAX
@@ -335,6 +336,7 @@ class MediaArchiver(LogMixin, BrowserInitMixin):
 
 def main():
     """Точка входа"""
+    load_dotenv()
     session = SessionCapture()
     session.start()
     print(f"📋 Session log: {session.path}")

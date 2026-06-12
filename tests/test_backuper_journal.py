@@ -11,7 +11,7 @@ class TestBackuperJournalInit:
     def test_init_creates_empty(self, tmp_path):
         from backuper_journal import BackuperJournal
         j = BackuperJournal(str(tmp_path / "j.json"))
-        assert j.data == {"backups": [], "downloads": [], "passwords": {}, "files": {}}
+        assert j.data == {"backups": [], "downloads": [], "password_protected": [], "password_hints": {}, "files": {}}
 
     def test_init_loads_existing(self, tmp_path):
         from backuper_journal import BackuperJournal
@@ -20,11 +20,13 @@ class TestBackuperJournalInit:
             json.dump({
                 "backups": [{"archive_name": "docs", "status": "uploaded"}],
                 "downloads": [],
-                "passwords": {"docs": {"password": "secret", "hint": "my hint"}}
+                "password_protected": ["docs"],
+                "password_hints": {"docs": "my hint"},
+                "files": {}
             }, f)
         j = BackuperJournal(jp)
         assert len(j.data["backups"]) == 1
-        assert j.get_password("docs") == "secret"
+        assert j.has_password("docs") is True
         assert j.get_password_hint("docs") == "my hint"
 
     def test_init_handles_corrupted_json(self, tmp_path):
@@ -33,7 +35,7 @@ class TestBackuperJournalInit:
         with open(jp, 'w') as f:
             f.write("invalid{{{")
         j = BackuperJournal(jp)
-        assert j.data == {"backups": [], "downloads": [], "passwords": {}, "files": {}}
+        assert j.data == {"backups": [], "downloads": [], "password_protected": [], "password_hints": {}, "files": {}}
         assert os.path.exists(jp + ".backup")
 
     def test_logger_property(self):
@@ -82,61 +84,38 @@ class TestBackuperJournalAddBackup:
 
 
 class TestBackuperJournalPasswords:
-    """Test password storage"""
+    """Test password protection flags and hints (passwords are NOT stored)"""
 
-    def test_store_and_get(self, tmp_path):
+    def test_mark_and_check(self, tmp_path):
         from backuper_journal import BackuperJournal
         j = BackuperJournal(str(tmp_path / "j.json"))
-        j.store_password("docs", "secret")
-        assert j.get_password("docs") == "secret"
+        j.mark_password_protected("docs")
         assert j.has_password("docs") is True
-
-    def test_missing_password(self, tmp_path):
-        from backuper_journal import BackuperJournal
-        j = BackuperJournal(str(tmp_path / "j.json"))
-        assert j.get_password("unknown") is None
         assert j.has_password("unknown") is False
 
-    def test_store_with_hint(self, tmp_path):
+    def test_hint_storage(self, tmp_path):
         from backuper_journal import BackuperJournal
         j = BackuperJournal(str(tmp_path / "j.json"))
-        j.store_password("docs", "secret", hint="my email")
-        assert j.get_password("docs") == "secret"
+        j.store_password_hint("docs", "my email")
         assert j.get_password_hint("docs") == "my email"
-        assert j.has_password("docs") is True
-
-    def test_hint_none_when_not_set(self, tmp_path):
-        from backuper_journal import BackuperJournal
-        j = BackuperJournal(str(tmp_path / "j.json"))
-        j.store_password("docs", "secret")  # no hint
-        assert j.get_password("docs") == "secret"
-        assert j.get_password_hint("docs") is None
-
-    def test_hint_none_for_missing(self, tmp_path):
-        from backuper_journal import BackuperJournal
-        j = BackuperJournal(str(tmp_path / "j.json"))
         assert j.get_password_hint("unknown") is None
 
-    def test_backward_compat_old_format(self, tmp_path):
-        """Old-format passwords (plain string) must still work"""
+    def test_mark_idempotent(self, tmp_path):
         from backuper_journal import BackuperJournal
-        jp = str(tmp_path / "j.json")
-        # Write old-format data directly
-        import json
-        with open(jp, 'w', encoding='utf-8') as f:
-            json.dump({"backups": [], "downloads": [], "passwords": {"docs": "secret"}}, f)
-        j = BackuperJournal(jp)
-        assert j.get_password("docs") == "secret"
-        assert j.get_password_hint("docs") is None
-        assert j.has_password("docs") is True
+        j = BackuperJournal(str(tmp_path / "j.json"))
+        j.mark_password_protected("docs")
+        j.mark_password_protected("docs")
+        protected = j.data.get("password_protected", [])
+        assert protected.count("docs") == 1
 
     def test_hint_survives_save_load(self, tmp_path):
         from backuper_journal import BackuperJournal
         jp = str(tmp_path / "j.json")
         j = BackuperJournal(jp)
-        j.store_password("docs", "secret", hint="my email")
+        j.mark_password_protected("docs")
+        j.store_password_hint("docs", "my email")
         j2 = BackuperJournal(jp)
-        assert j2.get_password("docs") == "secret"
+        assert j2.has_password("docs") is True
         assert j2.get_password_hint("docs") == "my email"
 
 
@@ -225,14 +204,14 @@ class TestBackuperJournalStats:
         j.add_backup({"archive_name": "docs", "status": "uploaded"})
         j.add_backup({"archive_name": "photos", "status": "failed"})
         j.add_download({"archive_name": "docs", "status": "completed"})
-        j.store_password("docs", "x")
+        j.mark_password_protected("docs")
         s = j.get_stats()
         assert s["total_backups"] == 2
         assert s["uploaded"] == 1
         assert s["failed"] == 1
         assert s["total_downloads"] == 1
         assert s["completed_downloads"] == 1
-        assert s["passwords_stored"] == 1
+        assert s["password_protected"] == 1
 
 
 class TestBackuperJournalClear:
@@ -242,9 +221,9 @@ class TestBackuperJournalClear:
         from backuper_journal import BackuperJournal
         j = BackuperJournal(str(tmp_path / "j.json"))
         j.add_backup({"archive_name": "docs", "status": "uploaded"})
-        j.store_password("docs", "secret")
+        j.mark_password_protected("docs")
         j.clear()
-        assert j.data == {"backups": [], "downloads": [], "passwords": {}, "files": {}}
+        assert j.data == {"backups": [], "downloads": [], "password_protected": [], "password_hints": {}, "files": {}}
 
     def test_clear_persists(self, tmp_path):
         from backuper_journal import BackuperJournal
