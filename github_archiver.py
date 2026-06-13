@@ -539,6 +539,7 @@ class GitHubArchiver(LogMixin):
         if is_setup_complete(self.config):
             print("  [2] ⚙ Настройки")
         print("  [3] Каналы — управление каналами")
+        print("  [4] Верификация журналов")
         print("  [0] Назад")
         print()
 
@@ -2896,11 +2897,11 @@ class GitHubArchiver(LogMixin):
             self._service_menu()
             setup_done = is_setup_complete(self.config)
             if setup_done:
-                valid_opts = ["0", "1", "2", "3"]
-                prompt_text = "Выберите действие [0-3]"
+                valid_opts = ["0", "1", "2", "3", "4"]
+                prompt_text = "Выберите действие [0-4]"
             else:
-                valid_opts = ["0", "1", "3"]
-                prompt_text = "Выберите действие [0-3]"
+                valid_opts = ["0", "1", "3", "4"]
+                prompt_text = "Выберите действие [0-4]"
             choice = prompt_numeric_choice(prompt_text, valid_opts)
 
             if choice == '0':
@@ -2911,7 +2912,156 @@ class GitHubArchiver(LogMixin):
                 self._initial_setup()
             elif choice == '3':
                 channel_registry_menu()
+            elif choice == '4':
+                self._run_verifier()
 
+
+    def _run_verifier(self):
+        """Верификация журналов — сравнение с каналом"""
+        from verifier import JournalChannelVerifier, VerifierMode
+        from verifier.adapters_github import (
+            GitHubChannelAdapter, GitHubJournalAdapter
+        )
+        from verifier.adapters_pypi import (
+            PyPIChannelAdapter, PyPIJournalAdapter
+        )
+        from verifier.adapters_backuper import (
+            BackuperChannelAdapter, BackuperJournalAdapter
+        )
+        from verifier.adapters_media import (
+            MediaChannelAdapter, MediaJournalAdapter
+        )
+
+        print("\n" + "═" * 60)
+        print("  Верификация журналов")
+        print("─" * 60)
+        print()
+        print("  Выберите журнал для проверки:")
+        print()
+
+        from journal import Journal
+        from pypi_libs_journal import PyPILibsJournal
+        from backuper_journal import BackuperJournal
+        from media_archiver import MediaJournal
+
+        gh_journal = Journal("journal.json")
+        pypi_journal = PyPILibsJournal("pypi_libs_journal.json")
+        bp_journal = BackuperJournal("backuper_journal.json")
+        md_journal = MediaJournal("media_journal.json")
+
+        options = []
+        if gh_journal.get_count() > 0:
+            options.append(("1", "GitHub", gh_journal))
+        if pypi_journal.get_count() > 0:
+            options.append(("2", "PyPI", pypi_journal))
+        if bp_journal.get_count() > 0:
+            options.append(("3", "Backuper", bp_journal))
+        if md_journal.get_count() > 0:
+            options.append(("4", "Media", md_journal))
+
+        if not options:
+            print("  ⚠ Все журналы пусты. Верификация не требуется.")
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        for num, name, journal in options:
+            stats = journal.get_stats()
+            total = stats.get("total", stats.get("total_backups", 0))
+            print(f"  [{num}] {name} — {total} записей")
+        print()
+
+        choice = input("  Выберите журнал [1-4]: ").strip()
+        selected = None
+        for num, name, journal in options:
+            if choice == num:
+                selected = (name, journal)
+                break
+
+        if not selected:
+            print("  Неверный выбор.")
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        pub_name, journal = selected
+        print(f"\n  Журнал: {pub_name}")
+
+        # Select mode
+        print("\n  Режим проверки:")
+        print("  [Q] Quick   — быстрый (DOM-сканирование, ~30-60 сек)")
+        print("  [T] Thorough — полный (3 источника, может занять время)")
+        mode_choice = input("  Режим [Q/T]: ").strip().lower()
+        mode = VerifierMode.THOROUGH if mode_choice == "t" else VerifierMode.QUICK
+
+        # Get channel URL
+        from config_utils import get_channel_url_for_channel_key
+        channel_map = {
+            "GitHub": "max",
+            "PyPI": "pypi",
+            "Backuper": "backup",
+            "Media": "media",
+        }
+        channel_key = channel_map.get(pub_name, "max")
+        channel_url = get_channel_url_for_channel_key(channel_key)
+
+        if not channel_url:
+            print(f"\n  ⚠ URL канала для {pub_name} не настроен.")
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        # Init browser
+        print(f"\n  Подключение к браузеру...")
+        try:
+            browser = self.max_browser
+            if not browser or not browser.page:
+                from browser_init import BrowserInitMixin
+                mixin = BrowserInitMixin()
+                browser = mixin.init_browser(channel_url, self.config)
+            else:
+                browser.navigate(channel_url)
+                browser.wait_page_ready()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка подключения: {e}")
+            print("  Убедитесь, что Chrome запущен с --remote-debugging-port=9222")
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        # Create adapters
+        adapter_map = {
+            "GitHub": (GitHubChannelAdapter, GitHubJournalAdapter),
+            "PyPI": (PyPIChannelAdapter, PyPIJournalAdapter),
+            "Backuper": (BackuperChannelAdapter, BackuperJournalAdapter),
+            "Media": (MediaChannelAdapter, MediaJournalAdapter),
+        }
+        CA, JA = adapter_map[pub_name]
+        channel_adapter = CA(browser, channel_url)
+        journal_adapter = JA(journal)
+
+        # Run verification
+        verifier = JournalChannelVerifier(
+            channel_adapter, journal_adapter, pub_name
+        )
+        print(f"\n  Запуск проверки ({mode.value})...")
+        print("  Пожалуйста, не трогайте браузер\n")
+
+        diff = verifier.verify(mode)
+
+        # Show report
+        report = verifier.report(diff)
+        print(report)
+
+        # Offer fix
+        if diff.has_issues:
+            print("\n  Найдены расхождения. Исправить журнал?")
+            print("  [Y] Да — удалить записи, отсутствующие в канале")
+            print("  [N] Нет — только просмотр")
+            fix_choice = input("  Ваш выбор [Y/N]: ").strip().lower()
+            if fix_choice == "y":
+                removed = verifier.fix_journal(diff)
+                print(f"\n  ✓ Удалено {removed} записей из журнала")
+            else:
+                print("\n  Журнал не изменён.")
+
+        input("\n  Нажмите Enter для возврата в меню...")
 
     def run_pypi_libs_archiver(self):
         """Загрузить топ Python библиотек в MAX канал"""
