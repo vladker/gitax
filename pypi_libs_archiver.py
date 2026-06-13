@@ -23,6 +23,7 @@ from browser_max import BrowserMAX
 from browser_init import BrowserInitMixin
 from pypi_libs_journal import PyPILibsJournal
 from config_utils import get_split_mode
+from progressbar import LiveProgressBar
 from signal_handler import SignalHandler
 from utils import format_file_size
 
@@ -206,119 +207,121 @@ class PyPILibsArchiver(LogMixin, BrowserInitMixin):
         error_count = 0
         total = len(packages_to_process)
 
-        for i, pkg in enumerate(packages_to_process, 1):
-            if self._shutdown:
-                print(f"\n  ⚠ Прервано после {i - 1} пакетов")
-                break
+        with LiveProgressBar(total, "Загрузка PyPI пакетов") as bar:
+            for i, pkg in enumerate(packages_to_process, 1):
+                if self._shutdown:
+                    print(f"\n  ⚠ Прервано после {i - 1} пакетов")
+                    break
 
-            name = pkg.get('name', '')
-            version = pkg.get('latest_version', '')
-            downloads = int(pkg.get('downloads_last_365_days', 0))
+                name = pkg.get('name', '')
+                version = pkg.get('latest_version', '')
+                downloads = int(pkg.get('downloads_last_365_days', 0))
 
-            print(f"\n  {'═' * 56}")
-            print(f"  #{i}/{total} | {name} {version}")
-            print(f"  {'─' * 56}")
+                bar.update(i, item_name=f"{name} {version}")
+                print(f"\n  {'═' * 56}")
+                print(f"  #{i}/{total} | {name} {version}")
+                print(f"  {'─' * 56}")
 
-            # Получаем детальную информацию
-            try:
-                info = self.pypi.get_package_info(name)
-            except Exception as e:
-                print(f"  ✗ Ошибка получения информации: {e}")
-                self.journal.mark_failed(name, version, str(e))
-                error_count += 1
-                self._print_progress(i, total, sent_count, error_count, "✗")
-                continue
-
-            latest_version = info.get('latest_version', version)
-            summary = info.get('info', {}).get('summary', '')
-            license_str = info.get('info', {}).get('license', 'Unknown')
-
-            # Скачиваем файлы
-            print(f"  ↓ Скачиваю файлы...")
-            try:
-                file_paths = self.pypi.download_package(name)
-            except ValueError as e:
-                print(f"  ✗ Файлы не найдены: {e}")
-                self.journal.mark_failed(name, latest_version, summary, downloads)
-                error_count += 1
-                self._print_progress(i, total, sent_count, error_count, "✗")
-                continue
-            except Exception as e:
-                print(f"  ✗ Ошибка скачивания: {e}")
-                self.journal.mark_failed(name, latest_version, summary, downloads)
-                error_count += 1
-                self._print_progress(i, total, sent_count, error_count, "✗")
-                continue
-
-            if not file_paths:
-                print(f"  ⚠ Файлы не найдены для {name}")
-                self.journal.mark_failed(name, latest_version, summary, downloads)
-                error_count += 1
-                self._print_progress(i, total, sent_count, error_count, "✗")
-                continue
-
-            # Показываем размеры файлов
-            file_sizes = []
-            for fp in file_paths:
-                size = os.path.getsize(fp)
-                file_sizes.append(size)
-                print(f"    ✓ {os.path.basename(fp)} ({format_file_size(size)})")
-
-            # Формируем текст сообщения
-            pkg_data = {
-                "name": name,
-                "latest_version": latest_version,
-                "summary": summary,
-                "downloads": downloads,
-                "license": license_str,
-            }
-            text = self._build_message_text(pkg_data, file_sizes)
-
-            # Отправляем в MAX
-            print(f"  → Отправляю в MAX...")
-            try:
-                split_mode = get_split_mode(self.config, "pypi_libs_archiver", default="auto")
-                success, _ = browser.send_message_with_files(
-                    text=text,
-                    filepaths=file_paths,
-                    retries=retries,
-                    retry_delay=retry_delay,
-                    split_mode=split_mode,
-                    expected_extensions=['.tar.gz', '.whl']
-                )
-            except Exception as e:
-                print(f"  ✗ Ошибка отправки: {e}")
-                success = False
-
-            # Обновляем журнал
-            if success:
-                filenames = [os.path.basename(fp) for fp in file_paths]
-                self.journal.add(name, latest_version, summary, downloads, filenames)
-                sent_count += 1
-                print(f"  ✓ Отправлено")
-            else:
-                self.journal.mark_failed(name, latest_version, summary, downloads)
-                error_count += 1
-                print(f"  ✗ Ошибка загрузки в MAX")
-
-            # Удаляем временные файлы после отправки
-            for fp in file_paths:
+                # Получаем детальную информацию
                 try:
-                    if os.path.exists(fp):
-                        os.remove(fp)
+                    info = self.pypi.get_package_info(name)
                 except Exception as e:
-                    self.logger.warning(f"Failed to remove {fp}: {e}")
-            # Удаляем пустую директорию пакета
-            pkg_dir = os.path.dirname(file_paths[0]) if file_paths else ''
-            if pkg_dir and os.path.exists(pkg_dir):
-                try:
-                    if not os.listdir(pkg_dir):
-                        os.rmdir(pkg_dir)
-                except Exception:
-                    pass
+                    print(f"  ✗ Ошибка получения информации: {e}")
+                    self.journal.mark_failed(name, version, str(e))
+                    error_count += 1
+                    self._print_progress(i, total, sent_count, error_count, "✗")
+                    continue
 
-            self._print_progress(i, total, sent_count, error_count,
-                                 "✓" if success else "✗")
+                latest_version = info.get('latest_version', version)
+                summary = info.get('info', {}).get('summary', '')
+                license_str = info.get('info', {}).get('license', 'Unknown')
+
+                # Скачиваем файлы
+                print(f"  ↓ Скачиваю файлы...")
+                try:
+                    file_paths = self.pypi.download_package(name)
+                except ValueError as e:
+                    print(f"  ✗ Файлы не найдены: {e}")
+                    self.journal.mark_failed(name, latest_version, summary, downloads)
+                    error_count += 1
+                    self._print_progress(i, total, sent_count, error_count, "✗")
+                    continue
+                except Exception as e:
+                    print(f"  ✗ Ошибка скачивания: {e}")
+                    self.journal.mark_failed(name, latest_version, summary, downloads)
+                    error_count += 1
+                    self._print_progress(i, total, sent_count, error_count, "✗")
+                    continue
+
+                if not file_paths:
+                    print(f"  ⚠ Файлы не найдены для {name}")
+                    self.journal.mark_failed(name, latest_version, summary, downloads)
+                    error_count += 1
+                    self._print_progress(i, total, sent_count, error_count, "✗")
+                    continue
+
+                # Показываем размеры файлов
+                file_sizes = []
+                for fp in file_paths:
+                    size = os.path.getsize(fp)
+                    file_sizes.append(size)
+                    print(f"    ✓ {os.path.basename(fp)} ({format_file_size(size)})")
+
+                # Формируем текст сообщения
+                pkg_data = {
+                    "name": name,
+                    "latest_version": latest_version,
+                    "summary": summary,
+                    "downloads": downloads,
+                    "license": license_str,
+                }
+                text = self._build_message_text(pkg_data, file_sizes)
+
+                # Отправляем в MAX
+                print(f"  → Отправляю в MAX...")
+                try:
+                    split_mode = get_split_mode(self.config, "pypi_libs_archiver", default="auto")
+                    success, _ = browser.send_message_with_files(
+                        text=text,
+                        filepaths=file_paths,
+                        retries=retries,
+                        retry_delay=retry_delay,
+                        split_mode=split_mode,
+                        expected_extensions=['.tar.gz', '.whl']
+                    )
+                except Exception as e:
+                    print(f"  ✗ Ошибка отправки: {e}")
+                    success = False
+
+                # Обновляем журнал
+                if success:
+                    filenames = [os.path.basename(fp) for fp in file_paths]
+                    self.journal.add(name, latest_version, summary, downloads, filenames)
+                    sent_count += 1
+                    print(f"  ✓ Отправлено")
+                else:
+                    self.journal.mark_failed(name, latest_version, summary, downloads)
+                    error_count += 1
+                    print(f"  ✗ Ошибка загрузки в MAX")
+
+                # Удаляем временные файлы после отправки
+                for fp in file_paths:
+                    try:
+                        if os.path.exists(fp):
+                            os.remove(fp)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to remove {fp}: {e}")
+                # Удаляем пустую директорию пакета
+                pkg_dir = os.path.dirname(file_paths[0]) if file_paths else ''
+                if pkg_dir and os.path.exists(pkg_dir):
+                    try:
+                        if not os.listdir(pkg_dir):
+                            os.rmdir(pkg_dir)
+                    except Exception:
+                        pass
+
+                self._print_progress(i, total, sent_count, error_count,
+                                     "✓" if success else "✗")
 
         # Итог
         print()

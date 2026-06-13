@@ -25,6 +25,7 @@ from browser_max import (
 from browser_init import BrowserInitMixin
 from backuper_journal import BackuperJournal
 from config_utils import get_channel_url, get_config_value
+from progressbar import LiveProgressBar
 from utils import format_file_size
 
 
@@ -426,89 +427,90 @@ class Backuper(LogMixin, BrowserInitMixin):
 
         print(f"\n  Начинаю загрузку {total_files} файл(ов)...\n")
 
-        for idx, (filepath, size) in enumerate(files, 1):
-            filename = os.path.basename(filepath)
-            rel_path = os.path.relpath(filepath, source_path)
-            size_str = format_file_size(size)
+        with LiveProgressBar(total_files, "Загрузка файлов") as bar:
+            for idx, (filepath, size) in enumerate(files, 1):
+                filename = os.path.basename(filepath)
+                rel_path = os.path.relpath(filepath, source_path)
+                size_str = format_file_size(size)
+                bar.update(idx, item_name=rel_path)
+                print(f"  [{idx}/{total_files}] {rel_path} ({size_str})")
 
-            print(f"  [{idx}/{total_files}] {rel_path} ({size_str})")
+                # Check journal for deduplication
+                # Use a composite key: archive_name = folder_name + rel_path
+                folder_name = os.path.basename(source_path)
+                journal_key = f"{folder_name}/{rel_path}"
 
-            # Check journal for deduplication
-            # Use a composite key: archive_name = folder_name + rel_path
-            folder_name = os.path.basename(source_path)
-            journal_key = f"{folder_name}/{rel_path}"
+                if self.journal.is_file_uploaded(journal_key, size):
+                    print(f"    ✓ Уже загружен (журнал)")
+                    skipped_count += 1
+                    continue
 
-            if self.journal.is_file_uploaded(journal_key, size):
-                print(f"    ✓ Уже загружен (журнал)")
-                skipped_count += 1
-                continue
+                # Build message text
+                msg_parts = []
+                if description:
+                    msg_parts.append(f"📝 {description}")
+                msg_parts.append(f"📁 {folder_name}")
+                msg_parts.append(f"📄 {rel_path}")
+                msg_parts.append(f"📊 {size_str}")
+                msg_parts.append(f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+                msg_text = "\n\n".join(msg_parts)
 
-            # Build message text
-            msg_parts = []
-            if description:
-                msg_parts.append(f"📝 {description}")
-            msg_parts.append(f"📁 {folder_name}")
-            msg_parts.append(f"📄 {rel_path}")
-            msg_parts.append(f"📊 {size_str}")
-            msg_parts.append(f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-            msg_text = "\n\n".join(msg_parts)
+                # Handle .exe to .zip conversion
+                upload_filepath = filepath
+                upload_filename = filename
+                ext = os.path.splitext(filename)[1].lower()
 
-            # Handle .exe to .zip conversion
-            upload_filepath = filepath
-            upload_filename = filename
-            ext = os.path.splitext(filename)[1].lower()
+                if convert_exe and ext == ".exe":
+                    print(f"    → Конвертация .exe в .zip...")
+                    zip_path = self._convert_exe_to_zip(filepath)
+                    if zip_path and os.path.exists(zip_path):
+                        upload_filepath = zip_path
+                        upload_filename = os.path.basename(zip_path)
+                        ext = ".zip"
+                        size = os.path.getsize(zip_path)
+                        size_str = format_file_size(size)
+                        temp_files_to_cleanup.append(zip_path)
+                        print(f"    → Конвертировано: {upload_filename} ({size_str})")
+                    else:
+                        print(f"    ⚠ Конвертация не удалась, загружаю оригинал")
 
-            if convert_exe and ext == ".exe":
-                print(f"    → Конвертация .exe в .zip...")
-                zip_path = self._convert_exe_to_zip(filepath)
-                if zip_path and os.path.exists(zip_path):
-                    upload_filepath = zip_path
-                    upload_filename = os.path.basename(zip_path)
-                    ext = ".zip"
-                    size = os.path.getsize(zip_path)
-                    size_str = format_file_size(size)
-                    temp_files_to_cleanup.append(zip_path)
-                    print(f"    → Конвертировано: {upload_filename} ({size_str})")
-                else:
-                    print(f"    ⚠ Конвертация не удалась, загружаю оригинал")
+                # Upload
+                try:
+                    if size >= large_file_threshold:
+                        print(f"    → Большой файл, загрузка через локальный браузер...")
+                        success = browser._upload_large_file(
+                            upload_filepath, upload_filename, size,
+                            retries=retries,
+                            retry_delay=retry_delay,
+                            baseline_count=0,
+                            expected_extensions=[ext]
+                        )
+                    else:
+                        print(f"    → Отправка в MAX...")
+                        success, _ = browser.send_message_with_files(
+                            text=msg_text,
+                            filepaths=[upload_filepath],
+                            retries=retries,
+                            retry_delay=retry_delay,
+                            split_threshold_mb=9999,  # Don't split
+                            expected_extensions=[ext]
+                        )
 
-            # Upload
-            try:
-                if size >= large_file_threshold:
-                    print(f"    → Большой файл, загрузка через локальный браузер...")
-                    success = browser._upload_large_file(
-                        upload_filepath, upload_filename, size,
-                        retries=retries,
-                        retry_delay=retry_delay,
-                        baseline_count=0,
-                        expected_extensions=[ext]
-                    )
-                else:
-                    print(f"    → Отправка в MAX...")
-                    success, _ = browser.send_message_with_files(
-                        text=msg_text,
-                        filepaths=[upload_filepath],
-                        retries=retries,
-                        retry_delay=retry_delay,
-                        split_threshold_mb=9999,  # Don't split
-                        expected_extensions=[ext]
-                    )
+                    if success:
+                        print(f"    ✓ Загружен")
+                        self.journal.mark_file_uploaded(journal_key, size)
+                        sent_count += 1
+                    else:
+                        print(f"    ✗ Ошибка загрузки")
+                        self.journal.mark_file_failed(journal_key, size)
+                        failed_count += 1
+                        failed_files.append(rel_path)
 
-                if success:
-                    print(f"    ✓ Загружен")
-                    self.journal.mark_file_uploaded(journal_key, size)
-                    sent_count += 1
-                else:
-                    print(f"    ✗ Ошибка загрузки")
+                except Exception as e:
+                    print(f"    ✗ Ошибка: {e}")
                     self.journal.mark_file_failed(journal_key, size)
                     failed_count += 1
                     failed_files.append(rel_path)
-
-            except Exception as e:
-                print(f"    ✗ Ошибка: {e}")
-                self.journal.mark_file_failed(journal_key, size)
-                failed_count += 1
-                failed_files.append(rel_path)
 
         # Cleanup temp zip files
         for tf in temp_files_to_cleanup:

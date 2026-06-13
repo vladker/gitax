@@ -24,6 +24,7 @@ from scroll_registry import ScrollRegistry
 from pypi_libs_journal import PyPILibsJournal
 from config_utils import get_channel_url, is_setup_complete, ensure_channel_url, get_skipped_channels, get_split_mode, get_channels_for_function
 from parallel_uploader import ParallelGroupUploader
+from progressbar import LiveProgressBar
 from utils import format_file_size
 from channel_registry_ui import channel_registry_menu, select_channel
 
@@ -767,67 +768,72 @@ class GitHubArchiver(LogMixin):
             repo_delay = self.config.get('archiver', {}).get('repo_delay', 30)
             split_mode = get_split_mode(self.config, "archiver", default="auto")
 
-            for i, (repo, has_new, latest_version) in enumerate(repo_updates, 1):
-                if not has_new:
-                    skipped_count += 1
-                    continue
+            with LiveProgressBar(has_update_count, "Синхронизация репозиториев") as bar:
+                current = 0
+                for i, (repo, has_new, latest_version) in enumerate(repo_updates, 1):
+                    if not has_new:
+                        skipped_count += 1
+                        continue
 
-                full_name = repo.get('full_name', '')
-                display_name = repo.get('display_name', '')
-                saved_version = repo.get('version', '')
-                default_branch = repo.get('default_branch', 'main')
-                owner, repo_name = full_name.split('/', 1)
-                stars = repo.get('stars', 0)
-                forks = repo.get('forks', 0)
-                desc = repo.get('description', '') or 'Без описания'
+                    current += 1
+                    full_name = repo.get('full_name', '')
+                    display_name = repo.get('display_name', '')
+                    saved_version = repo.get('version', '')
+                    default_branch = repo.get('default_branch', 'main')
+                    owner, repo_name = full_name.split('/', 1)
+                    stars = repo.get('stars', 0)
+                    forks = repo.get('forks', 0)
+                    desc = repo.get('description', '') or 'Без описания'
 
-                repo_update = dict(repo)
-                repo_update['version'] = latest_version
-                repo_update['zip_size'] = None  # Will be set after download
+                    bar.update(current, item_name=display_name)
 
-                print(f"\n  📦 {display_name}")
-                print(f"  📝 {self._format_description(desc, 50)}")
-                print("    ↓ Скачиваю ZIP...")
+                    repo_update = dict(repo)
+                    repo_update['version'] = latest_version
+                    repo_update['zip_size'] = None  # Will be set after download
 
-                zip_path = self.github.download_zip(owner, repo_name, default_branch)
+                    print(f"\n  📦 {display_name}")
+                    print(f"  📝 {self._format_description(desc, 50)}")
+                    print("    ↓ Скачиваю ZIP...")
 
-                if not zip_path or not os.path.exists(zip_path):
-                    print("    ✗ Не удалось скачать ZIP")
-                    error_count += 1
-                    failed_names.append(full_name)
-                    continue
+                    zip_path = self.github.download_zip(owner, repo_name, default_branch)
 
-                zip_size = os.path.getsize(zip_path)
-                zip_size_str = format_file_size(zip_size)
-                print(f"    ✓ {zip_size_str}")
+                    if not zip_path or not os.path.exists(zip_path):
+                        print("    ✗ Не удалось скачать ZIP")
+                        error_count += 1
+                        failed_names.append(full_name)
+                        continue
 
-                text = self._build_message_text(repo_update, zip_size)
+                    zip_size = os.path.getsize(zip_path)
+                    zip_size_str = format_file_size(zip_size)
+                    print(f"    ✓ {zip_size_str}")
 
-                print(f"    → Отправляю в MAX...")
-                success, _ = browser.send_message_with_file(
-                    text=text,
-                    filepath=zip_path,
-                    retries=self.config.get('archiver', {}).get('retries', 3),
-                    retry_delay=self.config.get('archiver', {}).get('retry_delay', 10),
-                    split_mode=split_mode,
-                )
+                    text = self._build_message_text(repo_update, zip_size)
 
-                if success:
-                    self.journal.update_repository(full_name, {
-                        'version': latest_version,
-                        'status': 'sent',
-                        'archive_size': zip_size
-                    })
-                    updated_count += 1
-                else:
-                    self.journal.update_repository(full_name, {'status': 'failed', 'archive_size': zip_size})
-                    error_count += 1
-                    failed_names.append(full_name)
+                    print(f"    → Отправляю в MAX...")
+                    success, _ = browser.send_message_with_file(
+                        text=text,
+                        filepath=zip_path,
+                        retries=self.config.get('archiver', {}).get('retries', 3),
+                        retry_delay=self.config.get('archiver', {}).get('retry_delay', 10),
+                        split_mode=split_mode,
+                    )
 
-                if os.path.exists(zip_path):
-                    self._safe_remove_file(zip_path)
+                    if success:
+                        self.journal.update_repository(full_name, {
+                            'version': latest_version,
+                            'status': 'sent',
+                            'archive_size': zip_size
+                        })
+                        updated_count += 1
+                    else:
+                        self.journal.update_repository(full_name, {'status': 'failed', 'archive_size': zip_size})
+                        error_count += 1
+                        failed_names.append(full_name)
 
-                time.sleep(repo_delay)
+                    if os.path.exists(zip_path):
+                        self._safe_remove_file(zip_path)
+
+                    time.sleep(repo_delay)
 
         print()
         print("\n" + "═" * 60)
@@ -964,28 +970,26 @@ class GitHubArchiver(LogMixin):
             zip_paths = []
             file_to_repo = []
 
-            for i, repo_info in enumerate(repos_to_process, 1):
-                full_name = repo_info.get('full_name', '')
-                display_name = repo_info.get('name', '')
-                default_branch = repo_info.get('default_branch', 'main')
-                owner, repo_name = full_name.split('/', 1)
+            with LiveProgressBar(len(repos_to_process), "Скачивание ZIP") as bar:
+                for i, repo_info in enumerate(repos_to_process, 1):
+                    full_name = repo_info.get('full_name', '')
+                    display_name = repo_info.get('name', '')
+                    default_branch = repo_info.get('default_branch', 'main')
+                    owner, repo_name = full_name.split('/', 1)
 
-                print(f"  #{i}/{len(repos_to_process)} {display_name} — ↓ Скачиваю ZIP...")
-                zip_path = self.github.download_zip(owner, repo_name, default_branch)
+                    bar.update(i, item_name=display_name)
+                    zip_path = self.github.download_zip(owner, repo_name, default_branch)
 
-                if not zip_path or not os.path.exists(zip_path):
-                    print(f"    ✗ Не удалось скачать ZIP")
-                    error_count += 1
-                    failed_names.append(full_name)
-                    repo_data = self.github.build_repo_data(repo_info)
-                    repo_data['status'] = 'failed'
-                    self.journal.add_repository(repo_data)
-                    continue
+                    if not zip_path or not os.path.exists(zip_path):
+                        error_count += 1
+                        failed_names.append(full_name)
+                        repo_data = self.github.build_repo_data(repo_info)
+                        repo_data['status'] = 'failed'
+                        self.journal.add_repository(repo_data)
+                        continue
 
-                zip_size = os.path.getsize(zip_path)
-                zip_size_str = format_file_size(zip_size)
-                print(f"    ✓ {zip_size_str}")
-                zip_paths.append(zip_path)
+                    zip_size = os.path.getsize(zip_path)
+                    zip_paths.append(zip_path)
 
                 repo_data = self.github.build_repo_data(repo_info)
                 repo_data['zip_size'] = zip_size
@@ -1030,53 +1034,55 @@ class GitHubArchiver(LogMixin):
                 input("\n  Нажмите Enter для возврата в меню...")
                 return
 
-            for i, repo_info in enumerate(repos_to_process, 1):
-                full_name = repo_info.get('full_name', '')
-                display_name = repo_info.get('name', '')
-                stars = repo_info.get('stargazers_count', 0)
-                desc = repo_info.get('description', '') or 'Без описания'
+            with LiveProgressBar(len(repos_to_process), "Загрузка репозиториев") as bar:
+                for i, repo_info in enumerate(repos_to_process, 1):
+                    full_name = repo_info.get('full_name', '')
+                    display_name = repo_info.get('name', '')
+                    stars = repo_info.get('stargazers_count', 0)
+                    desc = repo_info.get('description', '') or 'Без описания'
 
-                print(f"\n  {'═' * 56}")
-                print(f"  #{i} из {len(repos_to_process)} | {display_name}")
-                print(f"  {'─' * 56}")
-                print(f"  ⭐ {self._format_stars(stars)} звёзд | 🍴 {self._format_stars(repo_info.get('forks_count', 0))} форков")
-                print(f"  📝 {self._format_description(desc, 50)}")
+                    bar.update(i, item_name=display_name)
+                    print(f"\n  {'═' * 56}")
+                    print(f"  #{i}/{len(repos_to_process)} | {display_name}")
+                    print(f"  {'─' * 56}")
+                    print(f"  ⭐ {self._format_stars(stars)} звёзд | 🍴 {self._format_stars(repo_info.get('forks_count', 0))} форков")
+                    print(f"  📝 {self._format_description(desc, 50)}")
 
-                if auto_load:
-                    choice = 'y'
-                else:
-                    print()
-                    choice = input("  [Enter] Загрузить | [S] Пропустить | [A] Все | [Q] Выход: ").strip().lower()
-
-                    if choice == 'a':
-                        auto_load = True
+                    if auto_load:
                         choice = 'y'
-
-                if choice == 's':
-                    print("  Пропускаю...")
-                    continue
-                elif choice == 'q':
-                    print("\n  Выход из загрузки...")
-                    break
-                elif choice in ['', 'y', 'enter']:
-                    success = self._download_and_send_repo_info_connected(browser, repo_info)
-
-                    if success:
-                        loaded_count += 1
-                        print(f"\n  ✓ Загружено ({loaded_count}/{len(repos_to_process)})")
                     else:
-                        error_count += 1
-                        failed_names.append(full_name)
-                        print(f"\n  ✗ Ошибка загрузки")
-                else:
-                    success = self._download_and_send_repo_info_connected(browser, repo_info)
-                    if success:
-                        loaded_count += 1
-                    else:
-                        error_count += 1
-                        failed_names.append(full_name)
+                        print()
+                        choice = input("  [Enter] Загрузить | [S] Пропустить | [A] Все | [Q] Выход: ").strip().lower()
 
-                time.sleep(0.5)
+                        if choice == 'a':
+                            auto_load = True
+                            choice = 'y'
+
+                    if choice == 's':
+                        print("  Пропускаю...")
+                        continue
+                    elif choice == 'q':
+                        print("\n  Выход из загрузки...")
+                        break
+                    elif choice in ['', 'y', 'enter']:
+                        success = self._download_and_send_repo_info_connected(browser, repo_info)
+
+                        if success:
+                            loaded_count += 1
+                            print(f"\n  ✓ Загружено ({loaded_count}/{len(repos_to_process)})")
+                        else:
+                            error_count += 1
+                            failed_names.append(full_name)
+                            print(f"\n  ✗ Ошибка загрузки")
+                    else:
+                        success = self._download_and_send_repo_info_connected(browser, repo_info)
+                        if success:
+                            loaded_count += 1
+                        else:
+                            error_count += 1
+                            failed_names.append(full_name)
+
+                    time.sleep(0.5)
 
         print("\n" + "═" * 60)
         print("Загрузка завершена")

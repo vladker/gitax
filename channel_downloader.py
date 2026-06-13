@@ -9,89 +9,32 @@ Channel Downloader — Скачивание всех файлов из MAX ка�
 
 import os
 import sys
-import json
 import time
 
 import atexit
 import signal
-import tempfile
-import shutil
 import requests
 from datetime import datetime
-from pathlib import Path
+
+from dotenv import load_dotenv
 
 from logging_config import setup_logging, LogMixin, SessionCapture
+from shared_journal import BaseJournal
 
 from browser_max import BrowserMAX
 from browser_init import BrowserInitMixin
 from signal_handler import SignalHandler
+from progressbar import LiveProgressBar
 from utils import format_file_size
 from retry import retry
 
 
 
-class DownloadJournal:
+class DownloadJournal(BaseJournal):
     """Журнал скачанных файлов — отслеживает какие файлы уже скачаны
 
-    Структура JSON:
-    {
-        "files": {
-            "filename.zip": {
-                "filename": "filename.zip",
-                "size_bytes": 1234567,
-                "downloaded_at": "2026-06-09T12:00:00",
-                "output_path": "./downloads/filename.zip",
-                "status": "downloaded"
-            }
-        },
-        "stats": {
-            "total": 50,
-            "downloaded": 45,
-            "failed": 3,
-            "skipped": 2
-        }
-    }
+    Inherits locking, atomic save, corruption recovery from BaseJournal.
     """
-
-    def __init__(self, file_path: str = "download_journal.json"):
-        self.file_path = file_path
-        self._lock_file = f"{file_path}.lock"
-        self.data = self._load()
-
-    def _acquire_lock(self) -> bool:
-        """Acquire exclusive lock for safe writes (5 min stale timeout)"""
-        try:
-            if os.path.exists(self._lock_file):
-                lock_age = time.time() - os.path.getmtime(self._lock_file)
-                if lock_age > 300:
-                    self._release_lock()
-                else:
-                    return False
-            Path(self._lock_file).touch()
-            return True
-        except Exception:
-            return False
-
-    def _release_lock(self):
-        """Release lock file"""
-        try:
-            if os.path.exists(self._lock_file):
-                os.remove(self._lock_file)
-        except Exception:
-            pass
-
-    def _load(self) -> dict:
-        """Загрузить журнал из файла"""
-        if os.path.exists(self.file_path):
-            try:
-                with open(self.file_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, IOError):
-                backup_path = f"{self.file_path}.backup"
-                if os.path.exists(self.file_path):
-                    os.rename(self.file_path, backup_path)
-                return self._create_empty()
-        return self._create_empty()
 
     def _create_empty(self) -> dict:
         """Создать пустой журнал"""
@@ -105,37 +48,8 @@ class DownloadJournal:
             }
         }
 
-    def clear(self):
-        """Очистить журнал — сбросить все данные"""
-        self.data = self._create_empty()
-        self.save()
-
-    def save(self):
-        """Сохранить журнал в файл (атомарная запись)"""
-        if not self._acquire_lock():
-            return
-        try:
-            self._update_stats()
-            temp_fd, temp_path = tempfile.mkstemp(
-                suffix='.json',
-                dir=os.path.dirname(self.file_path) or '.'
-            )
-            try:
-                with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
-                    json.dump(self.data, f, ensure_ascii=False, indent=2)
-                if os.path.exists(self.file_path):
-                    backup_path = f"{self.file_path}.bak"
-                    shutil.copy2(self.file_path, backup_path)
-                os.replace(temp_path, self.file_path)
-            except Exception:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-                raise
-        finally:
-            self._release_lock()
-
-    def _update_stats(self):
-        """Обновить статистику на основе текущих данных"""
+    def _pre_save(self):
+        """Update stats before every save (hook from BaseJournal)"""
         files = self.data.get("files", {})
         stats = self.data.setdefault("stats", {})
         downloaded = sum(1 for f in files.values() if f.get("status") == "downloaded")
@@ -377,86 +291,88 @@ class ChannelDownloader(BrowserInitMixin, LogMixin):
         skipped_count = 0
         error_count = 0
 
-        for i, file_info in enumerate(files, 1):
-            if self._shutdown:
-                print(f"\n  ⚠ Прерывание после {i - 1} файлов")
-                break
+        with LiveProgressBar(len(files), "Скачивание файлов") as bar:
+            for i, file_info in enumerate(files, 1):
+                if self._shutdown:
+                    print(f"\n  ⚠ Прерывание после {i - 1} файлов")
+                    break
 
-            filename = file_info.get("filename", f"file_{i}")
-            file_size = file_info.get("file_size", 0)
-            download_url = file_info.get("download_url", "")
-            has_direct_url = file_info.get("has_direct_url", False)
-            file_size_str = format_file_size(file_size)
+                filename = file_info.get("filename", f"file_{i}")
+                file_size = file_info.get("file_size", 0)
+                download_url = file_info.get("download_url", "")
+                has_direct_url = file_info.get("has_direct_url", False)
+                file_size_str = format_file_size(file_size)
+                bar.update(i, item_name=filename)
 
-            # Check journal for deduplication
-            if self.journal.is_downloaded(filename, file_size):
-                print(f"  [{i}/{len(files)}] {filename} — ✓ уже скачан (журнал)")
-                skipped_count += 1
-                continue
-
-            # Check if file exists on disk with matching size
-            output_path = os.path.join(output_dir, filename)
-            if os.path.exists(output_path):
-                existing_size = os.path.getsize(output_path)
-                if existing_size == file_size:
-                    print(f"  [{i}/{len(files)}] {filename} — ✓ уже существует на диске")
-                    self.journal.mark_downloaded(filename, file_size, output_path)
+                # Check journal for deduplication
+                if self.journal.is_downloaded(filename, file_size):
+                    print(f"  [{i}/{len(files)}] {filename} — ✓ уже скачан (журнал)")
                     skipped_count += 1
                     continue
-                else:
-                    # Size mismatch — add suffix to avoid overwrite
-                    base, ext = os.path.splitext(filename)
-                    suffix = 1
-                    while os.path.exists(os.path.join(output_dir, f"{base}_{suffix}{ext}")):
-                        suffix += 1
-                    output_path = os.path.join(output_dir, f"{base}_{suffix}{ext}")
 
-            print(f"\n  [{i}/{len(files)}] {filename} ({file_size_str})")
-
-            # Download with retry
-            success = False
-            for attempt in range(1, retries + 1):
-                if self._shutdown:
-                    break
-                try:
-                    if has_direct_url and download_url:
-                        self._download_with_requests(browser, download_url, output_path)
-                        success = True
-                        break
+                # Check if file exists on disk with matching size
+                output_path = os.path.join(output_dir, filename)
+                if os.path.exists(output_path):
+                    existing_size = os.path.getsize(output_path)
+                    if existing_size == file_size:
+                        print(f"  [{i}/{len(files)}] {filename} — ✓ уже существует на диске")
+                        self.journal.mark_downloaded(filename, file_size, output_path)
+                        skipped_count += 1
+                        continue
                     else:
-                        # No direct download URL available
-                        threshold_mb = large_file_threshold // (1024 * 1024)
-                        print(f"    ✗ Нет URL для скачивания (файл <{threshold_mb}MB, browser fallback N/A)")
+                        # Size mismatch — add suffix to avoid overwrite
+                        base, ext = os.path.splitext(filename)
+                        suffix = 1
+                        while os.path.exists(os.path.join(output_dir, f"{base}_{suffix}{ext}")):
+                            suffix += 1
+                        output_path = os.path.join(output_dir, f"{base}_{suffix}{ext}")
+
+                print(f"\n  [{i}/{len(files)}] {filename} ({file_size_str})")
+
+                # Download with retry
+                success = False
+                for attempt in range(1, retries + 1):
+                    if self._shutdown:
+                        break
+                    try:
+                        if has_direct_url and download_url:
+                            self._download_with_requests(browser, download_url, output_path)
+                            success = True
+                            break
+                        else:
+                            # No direct download URL available
+                            threshold_mb = large_file_threshold // (1024 * 1024)
+                            print(f"    ✗ Нет URL для скачивания (файл <{threshold_mb}MB, browser fallback N/A)")
+                            error_count += 1
+                            break
+
+                    except (ConnectionError, TimeoutError) as e:
+                        if attempt < retries:
+                            print(f"    ⚠ Ошибка: {e}, попытка {attempt + 1}/{retries}...")
+                            time.sleep(retry_delay)
+                            # _download_with_requests fetches fresh cookies on each call
+                        else:
+                            print(f"    ✗ Ошибка после {retries} попыток: {e}")
+                            error_count += 1
+                    except requests.HTTPError as e:
+                        if e.response.status_code == 403 or e.response.status_code == 401:
+                            print(f"    ✗ Ошибка авторизации (HTTP {e.response.status_code})")
+                        elif e.response.status_code == 404:
+                            print(f"    ✗ Файл не найден (HTTP 404)")
+                        else:
+                            print(f"    ✗ HTTP ошибка: {e}")
+                        error_count += 1
+                        break
+                    except Exception as e:
+                        print(f"    ✗ Ошибка: {e}")
+                        self.logger.error(f"Download error for {filename}: {e}", exc_info=True)
                         error_count += 1
                         break
 
-                except (ConnectionError, TimeoutError) as e:
-                    if attempt < retries:
-                        print(f"    ⚠ Ошибка: {e}, попытка {attempt + 1}/{retries}...")
-                        time.sleep(retry_delay)
-                        # _download_with_requests fetches fresh cookies on each call
-                    else:
-                        print(f"    ✗ Ошибка после {retries} попыток: {e}")
-                        error_count += 1
-                except requests.HTTPError as e:
-                    if e.response.status_code == 403 or e.response.status_code == 401:
-                        print(f"    ✗ Ошибка авторизации (HTTP {e.response.status_code})")
-                    elif e.response.status_code == 404:
-                        print(f"    ✗ Файл не найден (HTTP 404)")
-                    else:
-                        print(f"    ✗ HTTP ошибка: {e}")
-                    error_count += 1
-                    break
-                except Exception as e:
-                    print(f"    ✗ Ошибка: {e}")
-                    self.logger.error(f"Download error for {filename}: {e}", exc_info=True)
-                    error_count += 1
-                    break
-
-            if success:
-                self.journal.mark_downloaded(filename, file_size, output_path)
-                downloaded_count += 1
-                print(f"    ✓ Скачано")
+                if success:
+                    self.journal.mark_downloaded(filename, file_size, output_path)
+                    downloaded_count += 1
+                    print(f"    ✓ Скачано")
 
         # 7. Final summary
         print()

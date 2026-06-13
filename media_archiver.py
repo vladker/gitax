@@ -7,97 +7,29 @@ Media Archiver — Загрузка фото и видео из папки в MA
 
 import os
 import sys
-import json
-import time
 import atexit
 import signal
-import tempfile
-import shutil
 from datetime import datetime
-from pathlib import Path
 from dotenv import load_dotenv
 from logging_config import setup_logging, LogMixin, SessionCapture
+from shared_journal import BaseJournal
 
 from browser_max import BrowserMAX
 from browser_init import BrowserInitMixin
 from signal_handler import SignalHandler
+from progressbar import LiveProgressBar
 from utils import format_file_size
 
 
-class MediaJournal:
-    """Журнал отправленных медиафайлов"""
+class MediaJournal(BaseJournal):
+    """Журнал отправленных медиафайлов
 
-    def __init__(self, file_path: str = "media_journal.json"):
-        self.file_path = file_path
-        self._lock_file = f"{file_path}.lock"
-        self.data = self._load()
-
-    def _acquire_lock(self) -> bool:
-        """Acquire exclusive lock for safe writes"""
-        try:
-            if os.path.exists(self._lock_file):
-                lock_age = time.time() - os.path.getmtime(self._lock_file)
-                if lock_age > 300:
-                    self._release_lock()
-                else:
-                    return False
-            Path(self._lock_file).touch()
-            return True
-        except Exception:
-            return False
-
-    def _release_lock(self):
-        """Release lock file"""
-        try:
-            if os.path.exists(self._lock_file):
-                os.remove(self._lock_file)
-        except Exception:
-            pass
-
-    def _load(self) -> dict:
-        """Загрузить журнал из файла"""
-        if os.path.exists(self.file_path):
-            try:
-                with open(self.file_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, IOError):
-                backup_path = f"{self.file_path}.backup"
-                if os.path.exists(self.file_path):
-                    os.rename(self.file_path, backup_path)
-                return self._create_empty()
-        return self._create_empty()
+    Inherits locking, atomic save, corruption recovery from BaseJournal.
+    """
 
     def _create_empty(self) -> dict:
         """Создать пустой журнал"""
         return {"entries": []}
-
-    def clear(self):
-        """Очистить журнал — сбросить все данные"""
-        self.data = self._create_empty()
-        self.save()
-
-    def save(self):
-        """Сохранить журнал в файл (атомарная запись)"""
-        if not self._acquire_lock():
-            return
-        try:
-            temp_fd, temp_path = tempfile.mkstemp(
-                suffix='.json',
-                dir=os.path.dirname(self.file_path) or '.'
-            )
-            try:
-                with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
-                    json.dump(self.data, f, ensure_ascii=False, indent=2)
-                if os.path.exists(self.file_path):
-                    backup_path = f"{self.file_path}.bak"
-                    shutil.copy2(self.file_path, backup_path)
-                os.replace(temp_path, self.file_path)
-            except Exception:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-                raise
-        finally:
-            self._release_lock()
 
     def is_sent(self, filename: str, size_bytes: int) -> bool:
         """Проверить, отправлен ли файл (по имени + размеру)"""
@@ -253,62 +185,63 @@ class MediaArchiver(LogMixin, BrowserInitMixin):
         skipped_count = 0
         error_count = 0
 
-        for i, filepath in enumerate(files, 1):
-            if self._shutdown:
-                print(f"\n  ⚠ Прерывание после {i - 1} файлов")
-                break
+        with LiveProgressBar(len(files), "Загрузка медиа") as bar:
+            for i, filepath in enumerate(files, 1):
+                if self._shutdown:
+                    print(f"\n  ⚠ Прерывание после {i - 1} файлов")
+                    break
 
-            filename = os.path.basename(filepath)
-            try:
-                file_size = os.path.getsize(filepath)
-            except OSError:
-                file_size = 0
+                filename = os.path.basename(filepath)
+                try:
+                    file_size = os.path.getsize(filepath)
+                except OSError:
+                    file_size = 0
 
-            file_size_str = format_file_size(file_size)
-            ext = os.path.splitext(filename)[1].lower()
+                file_size_str = format_file_size(file_size)
+                ext = os.path.splitext(filename)[1].lower()
+                bar.update(i, item_name=filename)
+                print(f"\n  [{i}/{len(files)}] {filename} ({file_size_str}, {ext})")
 
-            print(f"\n  [{i}/{len(files)}] {filename} ({file_size_str}, {ext})")
+                # Check journal for deduplication
+                if self.journal.is_sent(filename, file_size):
+                    print(f"    ✓ Уже отправлено (журнал)")
+                    skipped_count += 1
+                    continue
 
-            # Check journal for deduplication
-            if self.journal.is_sent(filename, file_size):
-                print(f"    ✓ Уже отправлено (журнал)")
-                skipped_count += 1
-                continue
+                # Upload — route large files via local browser to bypass CDP 50MB limit
+                try:
+                    if file_size >= self.LARGE_FILE_THRESHOLD:
+                        print(f"    → Отправляю в MAX (большой файл)...")
+                        success = browser._upload_large_file(
+                            filepath, filename, file_size,
+                            retries=retries,
+                            retry_delay=retry_delay,
+                            baseline_count=0,
+                            expected_extensions=[ext]
+                        )
+                    else:
+                        print(f"    → Отправляю в MAX...")
+                        success, _ = browser.send_message_with_files(
+                            text="",
+                            filepaths=[filepath],
+                            retries=retries,
+                            retry_delay=retry_delay,
+                            split_mode="off",
+                            expected_extensions=[ext]
+                        )
 
-            # Upload — route large files via local browser to bypass CDP 50MB limit
-            try:
-                if file_size >= self.LARGE_FILE_THRESHOLD:
-                    print(f"    → Отправляю в MAX (большой файл)...")
-                    success = browser._upload_large_file(
-                        filepath, filename, file_size,
-                        retries=retries,
-                        retry_delay=retry_delay,
-                        baseline_count=0,
-                        expected_extensions=[ext]
-                    )
-                else:
-                    print(f"    → Отправляю в MAX...")
-                    success, _ = browser.send_message_with_files(
-                        text="",
-                        filepaths=[filepath],
-                        retries=retries,
-                        retry_delay=retry_delay,
-                        split_mode="off",
-                        expected_extensions=[ext]
-                    )
-
-                if success:
-                    self.journal.mark_sent(filename, file_size)
-                    sent_count += 1
-                    print(f"    ✓ Отправлено")
-                else:
+                    if success:
+                        self.journal.mark_sent(filename, file_size)
+                        sent_count += 1
+                        print(f"    ✓ Отправлено")
+                    else:
+                        self.journal.mark_failed(filename, file_size)
+                        error_count += 1
+                        print(f"    ✗ Ошибка загрузки")
+                except Exception as e:
                     self.journal.mark_failed(filename, file_size)
                     error_count += 1
-                    print(f"    ✗ Ошибка загрузки")
-            except Exception as e:
-                self.journal.mark_failed(filename, file_size)
-                error_count += 1
-                print(f"    ✗ Ошибка: {e}")
+                    print(f"    ✗ Ошибка: {e}")
 
         # Summary
         print()

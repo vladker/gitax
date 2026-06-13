@@ -19,6 +19,7 @@ from browser_max import BrowserMAX
 from browser_init import BrowserInitMixin
 from nuget_journal import NuGetJournal
 from config_utils import get_split_mode
+from progressbar import LiveProgressBar
 from signal_handler import SignalHandler
 from utils import format_file_size
 
@@ -139,73 +140,75 @@ class NuGetArchiver(LogMixin, BrowserInitMixin):
         skipped = 0
         failed = 0
 
-        for idx, pkg in enumerate(to_process, 1):
-            name = pkg["id"]
-            version = pkg["version"]
-            print(f"\n  [{idx}/{len(to_process)}] {name} {version}")
+        with LiveProgressBar(len(to_process), "Загрузка .NET пакетов") as bar:
+            for idx, pkg in enumerate(to_process, 1):
+                name = pkg["id"]
+                version = pkg["version"]
+                bar.update(idx, item_name=f"{name} {version}")
+                print(f"\n  [{idx}/{len(to_process)}] {name} {version}")
 
-            download_url = self.nuget.get_package_download_url(name, version)
-            filename = f"{name}.{version}.nupkg"
-            filepath = os.path.join(output_dir, filename)
+                download_url = self.nuget.get_package_download_url(name, version)
+                filename = f"{name}.{version}.nupkg"
+                filepath = os.path.join(output_dir, filename)
 
-            try:
-                resp = self.nuget.session.get(download_url, timeout=120, stream=True)
-                resp.raise_for_status()
-                with open(filepath, 'wb') as f:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                actual_size = os.path.getsize(filepath)
-                print(f"  ⬇ Скачано: {format_file_size(actual_size)}")
-
-            except Exception as e:
-                print(f"  ✗ Ошибка скачивания: {e}")
-                self.journal.mark_failed(name, version, pkg.get("description", ""),
-                                        pkg.get("total_downloads", 0))
-                failed += 1
-                self._print_progress(idx, len(to_process), sent, skipped + failed, "✗")
-                continue
-
-            file_sizes = [actual_size]
-            files_to_send = [filepath]
-
-            if split_mode and actual_size > self.config.get('archiver', {}).get('split_threshold_mb', 49) * 1024 * 1024:
-                base = filepath.replace('.nupkg', '')
-                volumes = self._split_to_volumes(base)
-                if volumes:
-                    files_to_send = volumes
-                    file_sizes = [os.path.getsize(v) for v in volumes]
-
-            msg_text = self._build_message_text(pkg, file_sizes)
-
-            success = False
-            for attempt in range(1, retries + 1):
                 try:
-                    browser.send_message(msg_text)
-                    for fp in files_to_send:
-                        browser.send_file_message(fp)
-                    success = True
-                    break
+                    resp = self.nuget.session.get(download_url, timeout=120, stream=True)
+                    resp.raise_for_status()
+                    with open(filepath, 'wb') as f:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                    actual_size = os.path.getsize(filepath)
+                    print(f"  ⬇ Скачано: {format_file_size(actual_size)}")
+
                 except Exception as e:
-                    print(f"  ⚠ Попытка {attempt}/{retries}: {e}")
-                    if attempt < retries:
-                        time.sleep(retry_delay)
+                    print(f"  ✗ Ошибка скачивания: {e}")
+                    self.journal.mark_failed(name, version, pkg.get("description", ""),
+                                            pkg.get("total_downloads", 0))
+                    failed += 1
+                    self._print_progress(idx, len(to_process), sent, skipped + failed, "✗")
+                    continue
 
-            if success:
-                self.journal.add(name, version, pkg.get("description", ""),
-                                 pkg.get("total_downloads", 0), [f for f in files_to_send])
-                sent += 1
-                print(f"  ✓ Отправлено")
-            else:
-                self.journal.mark_failed(name, version, pkg.get("description", ""),
-                                        pkg.get("total_downloads", 0))
-                failed += 1
-                print(f"  ✗ Ошибка отправки после {retries} попыток")
+                file_sizes = [actual_size]
+                files_to_send = [filepath]
 
-            self._cleanup_files(files_to_send)
-            self._print_progress(idx, len(to_process), sent, skipped + failed)
+                if split_mode and actual_size > self.config.get('archiver', {}).get('split_threshold_mb', 49) * 1024 * 1024:
+                    base = filepath.replace('.nupkg', '')
+                    volumes = self._split_to_volumes(base)
+                    if volumes:
+                        files_to_send = volumes
+                        file_sizes = [os.path.getsize(v) for v in volumes]
 
-            if idx < len(to_process):
-                time.sleep(repo_delay)
+                msg_text = self._build_message_text(pkg, file_sizes)
+
+                success = False
+                for attempt in range(1, retries + 1):
+                    try:
+                        browser.send_message(msg_text)
+                        for fp in files_to_send:
+                            browser.send_file_message(fp)
+                        success = True
+                        break
+                    except Exception as e:
+                        print(f"  ⚠ Попытка {attempt}/{retries}: {e}")
+                        if attempt < retries:
+                            time.sleep(retry_delay)
+
+                if success:
+                    self.journal.add(name, version, pkg.get("description", ""),
+                                     pkg.get("total_downloads", 0), [f for f in files_to_send])
+                    sent += 1
+                    print(f"  ✓ Отправлено")
+                else:
+                    self.journal.mark_failed(name, version, pkg.get("description", ""),
+                                            pkg.get("total_downloads", 0))
+                    failed += 1
+                    print(f"  ✗ Ошибка отправки после {retries} попыток")
+
+                self._cleanup_files(files_to_send)
+                self._print_progress(idx, len(to_process), sent, skipped + failed)
+
+                if idx < len(to_process):
+                    time.sleep(repo_delay)
 
         print(f"\n  Итого: ✓{sent} | ✗{failed}")
         self._close_browser()
