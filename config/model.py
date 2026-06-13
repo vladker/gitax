@@ -36,6 +36,9 @@ class ChannelsConfig(BaseModel):
     media: str = ""
     backup: str = ""
     npm: str = ""
+    cargo: str = ""
+    nuget: str = ""
+    rubygems: str = ""
 
 
 class BackuperConfig(BaseModel):
@@ -98,9 +101,45 @@ class NpmArchiverConfig(BaseModel):
     split_mode: Literal["auto", "on", "off", "prompt"] = "auto"
 
 
+class CargoArchiverConfig(BaseModel):
+    """Settings: config.yaml → cargo_archiver section."""
+    limit: int = 500
+    output_dir: str = "./temp_cargo"
+    retries: int = 3
+    retry_delay: int = 10
+    split_mode: Literal["auto", "on", "off", "prompt"] = "off"
+
+
+class NuGetArchiverConfig(BaseModel):
+    """Settings: config.yaml → nuget_archiver section."""
+    limit: int = 500
+    output_dir: str = "./temp_nuget"
+    retries: int = 3
+    retry_delay: int = 10
+    split_mode: Literal["auto", "on", "off", "prompt"] = "off"
+
+
+class RubyGemsArchiverConfig(BaseModel):
+    """Settings: config.yaml → rubygems_archiver section."""
+    limit: int = 500
+    output_dir: str = "./temp_rubygems"
+    retries: int = 3
+    retry_delay: int = 10
+    split_mode: Literal["auto", "on", "off", "prompt"] = "off"
+
+
 class SetupConfig(BaseModel):
     """Settings: config.yaml → setup section."""
     skipped_channels: list[str] = Field(default_factory=list)
+
+
+class BatchConfig(BaseModel):
+    """Settings: config.yaml → batch section.
+
+    Controls how multiple archivers run in parallel via multiprocessing.
+    """
+    max_concurrent: int = Field(default=1, ge=1, le=8)
+    timeout_seconds: int = Field(default=7200, ge=60)
 
 
 class GitHubConfig(BaseModel):
@@ -109,7 +148,7 @@ class GitHubConfig(BaseModel):
     token: str = ""
 
 
-VALID_CHANNEL_FUNCTIONS = ("github", "pypi", "media", "backup", "npm")
+VALID_CHANNEL_FUNCTIONS = ("github", "pypi", "media", "backup", "npm", "cargo", "nuget", "rubygems")
 
 
 class ChannelEntry(BaseModel):
@@ -133,6 +172,9 @@ class ChannelRegistry(BaseModel):
     media: list[ChannelEntry] = Field(default_factory=list)
     backup: list[ChannelEntry] = Field(default_factory=list)
     npm: list[ChannelEntry] = Field(default_factory=list)
+    cargo: list[ChannelEntry] = Field(default_factory=list)
+    nuget: list[ChannelEntry] = Field(default_factory=list)
+    rubygems: list[ChannelEntry] = Field(default_factory=list)
 
     def get_enabled(self, function: str) -> list[ChannelEntry]:
         """Return enabled channels for a function."""
@@ -175,7 +217,11 @@ class AppConfig(BaseModel):
     media_archiver: MediaArchiverConfig = MediaArchiverConfig()
     pypi_libs_archiver: PyPILibsArchiverConfig = PyPILibsArchiverConfig()
     npm_archiver: NpmArchiverConfig = NpmArchiverConfig()
+    cargo_archiver: CargoArchiverConfig = CargoArchiverConfig()
+    nuget_archiver: NuGetArchiverConfig = NuGetArchiverConfig()
+    rubygems_archiver: RubyGemsArchiverConfig = RubyGemsArchiverConfig()
     setup: SetupConfig = SetupConfig()
+    batch: BatchConfig = BatchConfig()
     github: GitHubConfig = GitHubConfig()
     channel_registry: ChannelRegistry = Field(default_factory=ChannelRegistry)
 
@@ -188,6 +234,9 @@ class AppConfig(BaseModel):
         self.channels.media = ""
         self.channels.backup = ""
         self.channels.npm = ""
+        self.channels.cargo = ""
+        self.channels.nuget = ""
+        self.channels.rubygems = ""
 
     def save(self) -> None:
         """Persist config to YAML file.

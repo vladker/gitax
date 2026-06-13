@@ -448,6 +448,7 @@ class GitHubArchiver(LogMixin):
         print(menu_item("6", "Cargo — Rust пакеты", "cargo"))
         print(menu_item("7", "NuGet — .NET пакеты", "nuget"))
         print(menu_item("8", "RubyGems — Ruby пакеты", "rubygems"))
+        print("  [9] Batch — параллельный запуск архиверов")
         print("  [5] Сервис — журналы, настройки")
 
         if not is_setup_complete(self.config):
@@ -2761,11 +2762,11 @@ class GitHubArchiver(LogMixin):
 
             needs_setup = not is_setup_complete(self.config)
             if needs_setup:
-                valid_opts = ["0", "x", "1", "2", "3", "4", "5", "6", "7", "8"]
-                prompt_text = "Выберите раздел [0/X,1-8]"
+                valid_opts = ["0", "x", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+                prompt_text = "Выберите раздел [0/X,1-9]"
             else:
-                valid_opts = ["0", "1", "2", "3", "4", "5", "6", "7", "8"]
-                prompt_text = "Выберите раздел [0-8]"
+                valid_opts = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+                prompt_text = "Выберите раздел [0-9]"
             choice = prompt_numeric_choice(prompt_text, valid_opts).lower()
 
             if not choice:
@@ -2814,6 +2815,8 @@ class GitHubArchiver(LogMixin):
                 self._run_nuget_menu()
             elif choice == '8':
                 self._run_rubygems_menu()
+            elif choice == '9':
+                self._run_batch_mode()
 
     def _run_github_menu(self):
         """Цикл подменю GitHub"""
@@ -3192,6 +3195,111 @@ class GitHubArchiver(LogMixin):
                 self.run_rubygems_archiver()
             elif choice == '2':
                 self.run_rubygems_sync()
+
+    # ── Batch Mode ────────────────────────────────────────────────
+
+    def _batch_menu(self):
+        """Подменю Batch Mode"""
+        print("\n" + "═" * 60)
+        print("  Batch Mode — параллельный запуск архиверов")
+        print("─" * 60)
+        print()
+        print("  Выберите архиверы для запуска (множественный выбор):")
+        print()
+        print("  [1] GitHub — загрузка репозиториев")
+        print("  [2] GitHub — синхронизация репозиториев")
+        print("  [3] PyPI — загрузка библиотек")
+        print("  [4] PyPI — синхронизация библиотек")
+        print("  [5] Cargo — загрузка пакетов")
+        print("  [6] Cargo — синхронизация пакетов")
+        print("  [7] NuGet — загрузка пакетов")
+        print("  [8] NuGet — синхронизация пакетов")
+        print("  [9] RubyGems — загрузка пакетов")
+        print("  [0] RubyGems — синхронизация пакетов")
+        print()
+        print("  Введите номера через пробел, например: 1 3 5")
+        print("  [A] Все архиверы (загрузка)")
+        print("  [S] Все архиверы (синхронизация)")
+        print("  [Q] Отмена")
+        print()
+
+    def _run_batch_mode(self):
+        """Запустить batch mode — параллельный запуск архиверов."""
+        from batch_runner import BatchRunner, BatchTask
+
+        while True:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            self._batch_menu()
+
+            try:
+                choice = input("  Ваш выбор: ").strip().upper()
+            except (EOFError, KeyboardInterrupt):
+                print("\n  Отмена.")
+                break
+
+            if not choice:
+                continue
+            if choice == 'Q':
+                break
+
+            # Build task list
+            tasks: list[BatchTask] = []
+
+            # Map of choice -> (module, cls, method, label)
+            task_map = {
+                "1": ("github_archiver", "GitHubArchiver", "load_repositories", "GitHub load"),
+                "2": ("github_archiver", "GitHubArchiver", "sync_repositories", "GitHub sync"),
+                "3": ("pypi_libs_archiver", "PyPILibsArchiver", "load_top_libraries", "PyPI load"),
+                "4": ("pypi_libs_archiver", "PyPILibsArchiver", "sync_libraries", "PyPI sync"),
+                "5": ("cargo_archiver", "CargoArchiver", "load_top_packages", "Cargo load"),
+                "6": ("cargo_archiver", "CargoArchiver", "sync_packages", "Cargo sync"),
+                "7": ("nuget_archiver", "NuGetArchiver", "load_top_packages", "NuGet load"),
+                "8": ("nuget_archiver", "NuGetArchiver", "sync_packages", "NuGet sync"),
+                "9": ("rubygems_archiver", "RubyGemsArchiver", "load_top_packages", "RubyGems load"),
+                "0": ("rubygems_archiver", "RubyGemsArchiver", "sync_packages", "RubyGems sync"),
+            }
+
+            if choice == 'A':
+                # All load tasks
+                for num in ("1", "3", "5", "7", "9"):
+                    mod, cls, method, label = task_map[num]
+                    tasks.append(BatchTask(module=mod, cls=cls, method=method, label=label))
+            elif choice == 'S':
+                # All sync tasks
+                for num in ("2", "4", "6", "8", "0"):
+                    mod, cls, method, label = task_map[num]
+                    tasks.append(BatchTask(module=mod, cls=cls, method=method, label=label))
+            else:
+                # Parse individual choices
+                parts = choice.split()
+                for part in parts:
+                    part = part.strip()
+                    if part in task_map:
+                        mod, cls, method, label = task_map[part]
+                        tasks.append(BatchTask(module=mod, cls=cls, method=method, label=label))
+
+            if not tasks:
+                print("\n  ⚠ Нет выбранных задач. Попробуйте снова.")
+                input("\n  Нажмите Enter...")
+                continue
+
+            # Get batch config
+            batch_cfg = self.config.get("batch", {})
+            max_concurrent = batch_cfg.get("max_concurrent", 1)
+            timeout = batch_cfg.get("timeout_seconds", 7200)
+
+            # Run
+            runner = BatchRunner(tasks, max_concurrent=max_concurrent, timeout_seconds=timeout)
+            try:
+                runner.run()
+            except KeyboardInterrupt:
+                print("\n  Batch прерван пользователем.")
+            except Exception as e:
+                print(f"\n  ✗ Ошибка batch: {e}")
+                self.logger.error(f"Batch mode error: {e}", exc_info=True)
+
+            input("\n  Нажмите Enter для возврата в меню...")
+            break
 
     def run_cargo_archiver(self):
         """Загрузить топ Rust пакеты в MAX канал"""
