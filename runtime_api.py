@@ -347,6 +347,61 @@ class GitRuntime(RuntimeAPI):
         ]
 
 
+class NodeJSRuntime(RuntimeAPI):
+    """Node.js runtime — version from GitHub releases, downloads from nodejs.org."""
+
+    name = "nodejs"
+    _github_releases = "https://api.github.com/repos/nodejs/node/releases/latest"
+
+    def get_latest_version(self) -> str:
+        """Get latest LTS Node.js version from GitHub releases."""
+        try:
+            resp = self.session.get(self._github_releases, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            tag = data.get("tag_name", "")
+            if tag.startswith("v"):
+                return tag[1:]
+            return tag
+        except Exception:
+            try:
+                resp = self.session.get(
+                    "https://nodejs.org/dist/index.json", timeout=30
+                )
+                resp.raise_for_status()
+                releases = resp.json()
+                for rel in releases:
+                    if rel.get("lts"):
+                        return rel.get("version", "").lstrip("v")
+            except Exception:
+                pass
+        return ""
+
+    def get_download_urls(self, version: str) -> list[dict[str, str]]:
+        """Get download URLs for Node.js installers."""
+        base = f"https://nodejs.org/dist/v{version}"
+        return [
+            {
+                "os": OSTarget.WINDOWS,
+                "url": f"{base}/node-v{version}-x64.msi",
+                "filename": f"node-v{version}-x64.msi",
+                "size_hint": "~30 MB",
+            },
+            {
+                "os": OSTarget.MACOS,
+                "url": f"{base}/node-v{version}.pkg",
+                "filename": f"node-v{version}.pkg",
+                "size_hint": "~30 MB",
+            },
+            {
+                "os": OSTarget.LINUX,
+                "url": f"{base}/node-v{version}-linux-x64.tar.xz",
+                "filename": f"node-v{version}-linux-x64.tar.xz",
+                "size_hint": "~25 MB",
+            },
+        ]
+
+
 # ── Factory ────────────────────────────────────────────────────────
 
 CHANNEL_TO_RUNTIME: dict[str, type[RuntimeAPI]] = {
@@ -354,7 +409,7 @@ CHANNEL_TO_RUNTIME: dict[str, type[RuntimeAPI]] = {
     "cargo": RustRuntime,
     "nuget": DotNetRuntime,
     "rubygems": RubyRuntime,
-    "github": GitRuntime,
+    "github": NodeJSRuntime,
     "max": GitRuntime,
 }
 
@@ -364,6 +419,7 @@ RUNTIME_ICON: dict[str, str] = {
     "dotnet": "⚡",
     "ruby": "💎",
     "git": "📦",
+    "nodejs": "🟢",
 }
 
 RUNTIME_DISPLAY: dict[str, str] = {
@@ -372,6 +428,7 @@ RUNTIME_DISPLAY: dict[str, str] = {
     "dotnet": ".NET",
     "ruby": "Ruby",
     "git": "Git",
+    "nodejs": "Node.js",
 }
 
 RUNTIME_DOWNLOAD_PAGE: dict[str, str] = {
@@ -380,6 +437,7 @@ RUNTIME_DOWNLOAD_PAGE: dict[str, str] = {
     "dotnet": "dotnet.microsoft.com/download",
     "ruby": "ruby-lang.org/en/downloads",
     "git": "git-scm.com/downloads",
+    "nodejs": "nodejs.org/en/download",
 }
 
 
@@ -418,6 +476,7 @@ class RuntimeFactory:
             "dotnet": DotNetRuntime,
             "ruby": RubyRuntime,
             "git": GitRuntime,
+            "nodejs": NodeJSRuntime,
         }
         runtime_cls = name_map.get(runtime_name)
         if runtime_cls is None:

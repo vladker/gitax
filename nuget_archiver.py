@@ -96,6 +96,52 @@ class NuGetArchiver(LogMixin, BrowserInitMixin):
         if current >= total:
             print()
 
+    # ── Runtime helpers ──
+
+    def _download_file(self, url: str, filename: str, output_dir: str) -> str | None:
+        """Download a file from URL to output_dir. Returns file path or None on error."""
+        import requests
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            file_path = os.path.join(output_dir, filename)
+            resp = requests.get(url, timeout=300, stream=True)
+            resp.raise_for_status()
+            with open(file_path, 'wb') as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            return file_path
+        except Exception as e:
+            self.logger.error(f"Download error {filename}: {e}")
+            return None
+
+    def _send_file_to_channel(self, file_path: str, message: str, browser) -> bool:
+        """Send a file to MAX channel. Returns True on success."""
+        retries = self.config.get('nuget_archiver', {}).get(
+            'retries', self.config.get('archiver', {}).get('retries', 3))
+        retry_delay = self.config.get('nuget_archiver', {}).get(
+            'retry_delay', self.config.get('archiver', {}).get('retry_delay', 10))
+        try:
+            success, _ = browser.send_message_with_files(
+                text=message,
+                filepaths=[file_path],
+                retries=retries,
+                retry_delay=retry_delay,
+                split_mode="auto",
+                expected_extensions=['.exe', '.msi', '.pkg', '.sh', '.tar.gz']
+            )
+            return success
+        except Exception as e:
+            self.logger.error(f"Send error {file_path}: {e}")
+            return False
+
+    def _cleanup_file(self, file_path: str):
+        """Remove a temporary file."""
+        try:
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception:
+            pass
+
     def load_top_packages(self, limit: int | None = None):
         """Загрузить топ N .NET пакетов в MAX канал."""
         if limit is None:
