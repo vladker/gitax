@@ -86,7 +86,7 @@ class TestBuildMessageText:
         assert "Python HTTP for Humans." in text
         assert "982.7M" in text  # formatted downloads
         assert "Apache-2.0" in text
-        assert "pypi.org/project/requests/" in text
+        assert "pypi.org" not in text  # URL removed to avoid Cloudflare issues
 
     def test_message_with_file_sizes(self):
         """Test message includes file sizes when provided"""
@@ -137,7 +137,7 @@ class TestBuildMessageText:
             "license": "BSD",
         }
         text = archiver._build_message_text(pkg_data, [])
-        assert "https://pypi.org/project/django/" in text
+        assert "https://pypi.org/project/django/" not in text  # URL removed to avoid Cloudflare issues
 
 
 class TestConfigValidation:

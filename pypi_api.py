@@ -32,6 +32,10 @@ class PyPIAPI(LogMixin):
     def __init__(self):
         self._base_url = "https://pypi.org"
         self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "PyPILibsArchiver/1.0 (https://github.com/vldkr/gitax; contact: archiver@local)",
+            "Accept": "application/json",
+        })
         self._cache: dict[str, dict] = {}
 
     def _request_with_backoff(self, url: str, timeout: int | None = None) -> requests.Response:
@@ -75,6 +79,13 @@ class PyPIAPI(LogMixin):
             if response.status_code >= 500:
                 self.logger.warning(f"Server error ({response.status_code}). Retrying...")
                 time.sleep(2 ** attempt)
+                continue
+
+            # Check for Cloudflare challenge page (HTML instead of JSON)
+            content_type = response.headers.get("Content-Type", "")
+            if "text/html" in content_type and "/json" in url:
+                self.logger.warning("PyPI returned HTML (likely Cloudflare challenge). Retrying...")
+                time.sleep(2 ** (attempt + 1))
                 continue
 
             response.raise_for_status()
@@ -168,6 +179,9 @@ class PyPIAPI(LogMixin):
         # Cache the raw data for download_package to reuse
         self._cache[package_name] = result
         self._cache[f"{package_name}__raw"] = data
+
+        # Small delay to avoid Cloudflare rate limiting
+        time.sleep(0.3)
 
         return result
 

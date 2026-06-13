@@ -94,14 +94,11 @@ class PyPILibsArchiver(LogMixin, BrowserInitMixin):
         summary = pkg_data.get('summary', '') or 'Без описания'
         downloads = pkg_data.get('downloads', 0)
         license_str = pkg_data.get('license', '') or 'Unknown'
-        pypi_url = f"https://pypi.org/project/{name}/"
-
         text = (
             f"🐍 {name} {version}\n\n"
             f"📝 {summary}\n\n"
             f"📥 Загрузки: {self._format_downloads(downloads)}\n"
-            f"📜 Лицензия: {license_str}\n"
-            f"🔗 PyPI: {pypi_url}"
+            f"📜 Лицензия: {license_str}"
         )
 
         if file_sizes:
