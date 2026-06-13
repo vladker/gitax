@@ -290,23 +290,39 @@ class GitHubAPI(LogMixin):
 
         return "unknown", "unknown"
 
-    def download_zip(self, owner: str, repo: str, ref: str = "main") -> Optional[str]:
+    def get_default_branch(self, owner: str, repo: str) -> str:
         """
-        Скачать репозиторий в ZIP
+        Получить имя дефолтной ветки репозитория через GitHub API.
 
         Args:
             owner: Владелец репозитория
             repo: Название репозитория
-            ref: Ветка или тег для скачивания
+
+        Returns:
+            Имя дефолтной ветки (обычно 'main' или 'master')
+        """
+        try:
+            resp = self._request("GET", f"/repos/{owner}/{repo}")
+            branch = resp.json().get("default_branch", "main")
+            self.logger.info(f"Default branch for {owner}/{repo}: {branch}")
+            return branch
+        except Exception:
+            self.logger.warning(f"Failed to detect default branch for {owner}/{repo}, using 'main'")
+            return "main"
+
+    def _try_download_zip(self, owner: str, repo: str, ref: str) -> Optional[str]:
+        """
+        Внутренний метод: скачать ZIP для конкретной ветки.
+
+        Args:
+            owner: Владелец репозитория
+            repo: Название репозитория
+            ref: Ветка для скачивания
 
         Returns:
             Путь к скачанному файлу или None
         """
         url = f"https://github.com/{owner}/{repo}/archive/refs/heads/{ref}.zip"
-
-        if ref not in ['main', 'master']:
-            url = f"https://github.com/{owner}/{repo}/archive/refs/heads/{ref}.zip"
-
         filename = f"{owner}-{repo}-{ref}.zip"
         filepath = os.path.join(self.output_dir, filename)
 
@@ -315,30 +331,28 @@ class GitHubAPI(LogMixin):
             response = self.session.get(url, stream=True, timeout=120)
 
             if response.status_code == 404:
-                alt_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/main.zip"
-                self.logger.warning(f"404 on {url}, trying {alt_url}")
-                response = self.session.get(alt_url, stream=True, timeout=120)
+                return None
 
-            if response.status_code == 200:
-                total = int(response.headers.get('content-length', 0))
-                desc = filename[:40]
-                with open(filepath, 'wb') as f:
-                    with tqdm(total=total, unit='B', unit_scale=True, desc=desc, leave=False) as pbar:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                            pbar.update(len(chunk))
-
-                file_size = os.path.getsize(filepath)
-                if file_size < 1000:
-                    self.logger.warning(f"Downloaded file too small ({file_size} bytes), likely error page")
-                    os.remove(filepath)
-                    return None
-
-                self.logger.info(f"Downloaded: {filename} ({file_size / 1024 / 1024:.1f} MB)")
-                return filepath
-            else:
+            if response.status_code != 200:
                 self.logger.error(f"Download error: {response.status_code}")
                 return None
+
+            total = int(response.headers.get('content-length', 0))
+            desc = filename[:40]
+            with open(filepath, 'wb') as f:
+                with tqdm(total=total, unit='B', unit_scale=True, desc=desc, leave=False) as pbar:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                        pbar.update(len(chunk))
+
+            file_size = os.path.getsize(filepath)
+            if file_size < 1000:
+                self.logger.warning(f"Downloaded file too small ({file_size} bytes), likely error page")
+                os.remove(filepath)
+                return None
+
+            self.logger.info(f"Downloaded: {filename} ({file_size / 1024 / 1024:.1f} MB)")
+            return filepath
 
         except requests.exceptions.Timeout:
             self.logger.error("Download timeout")
@@ -354,6 +368,47 @@ class GitHubAPI(LogMixin):
                 except Exception:
                     pass
             return None
+
+    def download_zip(self, owner: str, repo: str, ref: str = "main") -> Optional[str]:
+        """
+        Скачать репозиторий в ZIP.
+
+        При неудаче автоматически определяет дефолтную ветку через API
+        и повторяет попытку.
+
+        Args:
+            owner: Владелец репозитория
+            repo: Название репозитория
+            ref: Ветка или тег для скачивания
+
+        Returns:
+            Путь к скачанному файлу или None
+        """
+        # Первая попытка с переданной веткой
+        result = self._try_download_zip(owner, repo, ref)
+        if result:
+            return result
+
+        # Авто-детект дефолтной ветки через API
+        self.logger.warning(f"Initial download failed for {owner}/{repo}, detecting default branch...")
+        detected_branch = self.get_default_branch(owner, repo)
+
+        if detected_branch != ref:
+            self.logger.info(f"Detected branch '{detected_branch}' differs from '{ref}', retrying...")
+            result = self._try_download_zip(owner, repo, detected_branch)
+            if result:
+                return result
+
+        # Финальный fallback: попробовать main/master
+        for fallback in ["main", "master"]:
+            if fallback == ref or fallback == detected_branch:
+                continue
+            self.logger.info(f"Trying fallback branch: {fallback}")
+            result = self._try_download_zip(owner, repo, fallback)
+            if result:
+                return result
+
+        return None
 
     def build_repo_data(self, repo_info: dict) -> dict:
         """
