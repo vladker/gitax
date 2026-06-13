@@ -445,6 +445,9 @@ class GitHubArchiver(LogMixin):
         print(menu_item("2", "PyPI — Python библиотеки", "pypi"))
         print(menu_item("3", "Backuper — бэкап папок в канал", "backup"))
         print(menu_item("4", "Файлы — медиа, скачивание, экспорт", "media"))
+        print(menu_item("6", "Cargo — Rust пакеты", "cargo"))
+        print(menu_item("7", "NuGet — .NET пакеты", "nuget"))
+        print(menu_item("8", "RubyGems — Ruby пакеты", "rubygems"))
         print("  [5] Сервис — журналы, настройки")
 
         if not is_setup_complete(self.config):
@@ -477,6 +480,39 @@ class GitHubArchiver(LogMixin):
         print()
         print("  [1] Загрузить топ Python библиотек")
         print("  [2] Синхронизировать Python библиотеки")
+        print("  [0] Назад")
+        print()
+
+    def _cargo_menu(self):
+        """Подменю Cargo (Rust)"""
+        print("\n" + "═" * 60)
+        print("  Cargo — Rust пакеты (crates.io)")
+        print("─" * 60)
+        print()
+        print("  [1] Загрузить топ Rust пакеты")
+        print("  [2] Синхронизировать Rust пакеты")
+        print("  [0] Назад")
+        print()
+
+    def _nuget_menu(self):
+        """Подменю NuGet (.NET)"""
+        print("\n" + "═" * 60)
+        print("  NuGet — .NET пакеты (nuget.org)")
+        print("─" * 60)
+        print()
+        print("  [1] Загрузить топ .NET пакеты")
+        print("  [2] Синхронизировать .NET пакеты")
+        print("  [0] Назад")
+        print()
+
+    def _rubygems_menu(self):
+        """Подменю RubyGems"""
+        print("\n" + "═" * 60)
+        print("  RubyGems — Ruby пакеты (rubygems.org)")
+        print("─" * 60)
+        print()
+        print("  [1] Загрузить топ Ruby пакеты")
+        print("  [2] Синхронизировать Ruby пакеты")
         print("  [0] Назад")
         print()
 
@@ -1349,6 +1385,12 @@ class GitHubArchiver(LogMixin):
             pj_stats = pj.get_stats()
             bj = BackuperJournal("backuper_journal.json")
             bj_stats = bj.get_stats()
+            cj = _GenericJournal("cargo_journal.json")
+            cj_stats = cj.get_stats()
+            nj = _GenericJournal("nuget_journal.json")
+            nj_stats = nj.get_stats()
+            rj = _GenericJournal("rubygems_journal.json")
+            rj_stats = rj.get_stats()
 
             print(f"\n  Текущее состояние журналов:")
             print(f"  [1] journal.json — {j_stats['total']} репозиториев "
@@ -1361,6 +1403,12 @@ class GitHubArchiver(LogMixin):
                   f"({pj_stats['sent']} отправлено, {pj_stats['failed']} ошибок)")
             print(f"  [5] backuper_journal.json — {bj_stats['total_backups']} бэкапов "
                   f"({bj_stats['uploaded']} отправлено, {bj_stats['failed']} ошибок)")
+            print(f"  [6] cargo_journal.json — {cj_stats['total']} пакетов "
+                  f"({cj_stats['sent']} отправлено, {cj_stats['failed']} ошибок)")
+            print(f"  [7] nuget_journal.json — {nj_stats['total']} пакетов "
+                  f"({nj_stats['sent']} отправлено, {nj_stats['failed']} ошибок)")
+            print(f"  [8] rubygems_journal.json — {rj_stats['total']} пакетов "
+                  f"({rj_stats['sent']} отправлено, {rj_stats['failed']} ошибок)")
 
             print()
             print("  [1] Очистить journal.json")
@@ -1368,11 +1416,14 @@ class GitHubArchiver(LogMixin):
             print("  [3] Очистить download_journal.json")
             print("  [4] Очистить pypi_libs_journal.json")
             print("  [5] Очистить backuper_journal.json")
-            print("  [6] Очистить ВСЕ журналы")
+            print("  [6] Очистить cargo_journal.json")
+            print("  [7] Очистить nuget_journal.json")
+            print("  [8] Очистить rubygems_journal.json")
+            print("  [9] Очистить ВСЕ журналы")
             print("  [0] Назад")
             print()
 
-            choice = prompt_numeric_choice("Ваш выбор [0/1/2/3/4/5/6]", ["0", "1", "2", "3", "4", "5", "6"])
+            choice = prompt_numeric_choice("Ваш выбор [0-9]", ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"])
 
             if choice == '0':
                 break
@@ -1423,6 +1474,33 @@ class GitHubArchiver(LogMixin):
                 input("\n  Нажмите Enter для продолжения...")
 
             elif choice == '6':
+                confirm = input("\n  Очистить cargo_journal.json? [y/N]: ").strip().lower()
+                if confirm in ('y', 'yes', 'д', 'да'):
+                    _GenericJournal("cargo_journal.json").clear()
+                    print("  ✓ cargo_journal.json очищен")
+                else:
+                    print("  Отменено")
+                input("\n  Нажмите Enter для продолжения...")
+
+            elif choice == '7':
+                confirm = input("\n  Очистить nuget_journal.json? [y/N]: ").strip().lower()
+                if confirm in ('y', 'yes', 'д', 'да'):
+                    _GenericJournal("nuget_journal.json").clear()
+                    print("  ✓ nuget_journal.json очищен")
+                else:
+                    print("  Отменено")
+                input("\n  Нажмите Enter для продолжения...")
+
+            elif choice == '8':
+                confirm = input("\n  Очистить rubygems_journal.json? [y/N]: ").strip().lower()
+                if confirm in ('y', 'yes', 'д', 'да'):
+                    _GenericJournal("rubygems_journal.json").clear()
+                    print("  ✓ rubygems_journal.json очищен")
+                else:
+                    print("  Отменено")
+                input("\n  Нажмите Enter для продолжения...")
+
+            elif choice == '9':
                 print("\n  ⚠ ВНИМАНИЕ: Будут очищены ВСЕ журналы!")
                 confirm = input("  Введите 'ДА' для подтверждения: ").strip().lower()
                 if confirm in ('да', 'yes', 'дa'):
@@ -1431,6 +1509,9 @@ class GitHubArchiver(LogMixin):
                     DownloadJournal("download_journal.json").clear()
                     PyPILibsJournal("pypi_libs_journal.json").clear()
                     BackuperJournal("backuper_journal.json").clear()
+                    _GenericJournal("cargo_journal.json").clear()
+                    _GenericJournal("nuget_journal.json").clear()
+                    _GenericJournal("rubygems_journal.json").clear()
                     print("  ✓ Все журналы очищены")
                 else:
                     print("  Отменено")
@@ -2679,19 +2760,20 @@ class GitHubArchiver(LogMixin):
 
             needs_setup = not is_setup_complete(self.config)
             if needs_setup:
-                valid_opts = ["0", "x", "1", "2", "3", "4", "5"]
-                prompt_text = "Выберите раздел [0/X,1-5]"
+                valid_opts = ["0", "x", "1", "2", "3", "4", "5", "6", "7", "8"]
+                prompt_text = "Выберите раздел [0/X,1-8]"
             else:
-                valid_opts = ["0", "1", "2", "3", "4", "5"]
-                prompt_text = "Выберите раздел [0-5]"
+                valid_opts = ["0", "1", "2", "3", "4", "5", "6", "7", "8"]
+                prompt_text = "Выберите раздел [0-8]"
             choice = prompt_numeric_choice(prompt_text, valid_opts).lower()
 
             if not choice:
                 break
 
             # ── Check if selected module is disabled ──
-            if choice in ("1", "2", "3", "4") and not self._is_module_enabled(choice):
-                module_names = {"1": "GitHub", "2": "PyPI", "3": "Backuper", "4": "Файлы"}
+            if choice in ("1", "2", "3", "4", "6", "7", "8") and not self._is_module_enabled(choice):
+                module_names = {"1": "GitHub", "2": "PyPI", "3": "Backuper", "4": "Файлы",
+                            "6": "Cargo", "7": "NuGet", "8": "RubyGems"}
                 mod_name = module_names.get(choice, "")
                 print(f"\n  ⚠ Модуль \"{mod_name}\" отключён в настройках.")
                 print()
@@ -2725,6 +2807,12 @@ class GitHubArchiver(LogMixin):
                 self._run_files_menu()
             elif choice == '5':
                 self._run_service_menu()
+            elif choice == '6':
+                self._run_cargo_menu()
+            elif choice == '7':
+                self._run_nuget_menu()
+            elif choice == '8':
+                self._run_rubygems_menu()
 
     def _run_github_menu(self):
         """Цикл подменю GitHub"""
@@ -2908,6 +2996,220 @@ class GitHubArchiver(LogMixin):
             self.logger.error(f"Backuper restore error: {e}", exc_info=True)
 
         input("\n  Нажмите Enter для возврата в меню...")
+
+    # ──────────────────────────────────────────────
+    # Runner methods for new archivers
+    # ──────────────────────────────────────────────
+
+    def _run_cargo_menu(self):
+        """Цикл подменю Cargo (Rust)"""
+        while True:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            self._cargo_menu()
+            choice = prompt_numeric_choice("Выберите действие [0-2]", ["0", "1", "2"])
+
+            if choice == '0':
+                break
+            elif choice == '1':
+                self.run_cargo_archiver()
+            elif choice == '2':
+                self.run_cargo_sync()
+
+    def _run_nuget_menu(self):
+        """Цикл подменю NuGet (.NET)"""
+        while True:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            self._nuget_menu()
+            choice = prompt_numeric_choice("Выберите действие [0-2]", ["0", "1", "2"])
+
+            if choice == '0':
+                break
+            elif choice == '1':
+                self.run_nuget_archiver()
+            elif choice == '2':
+                self.run_nuget_sync()
+
+    def _run_rubygems_menu(self):
+        """Цикл подменю RubyGems"""
+        while True:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            self._rubygems_menu()
+            choice = prompt_numeric_choice("Выберите действие [0-2]", ["0", "1", "2"])
+
+            if choice == '0':
+                break
+            elif choice == '1':
+                self.run_rubygems_archiver()
+            elif choice == '2':
+                self.run_rubygems_sync()
+
+    def run_cargo_archiver(self):
+        """Загрузить топ Rust пакеты в MAX канал"""
+        from cargo_archiver import CargoArchiver
+
+        print("\n" + "═" * 60)
+        print("  Загрузка топ Rust пакетов")
+        print("═" * 60)
+
+        if not self._ensure_channel_ready("cargo", "Cargo канал", "cargo"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        try:
+            archiver = CargoArchiver("config.yaml")
+            archiver.load_top_packages()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"Cargo archiver error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def run_cargo_sync(self):
+        """Синхронизировать версии Rust пакетов"""
+        from cargo_archiver import CargoArchiver
+
+        print("\n" + "═" * 60)
+        print("  Синхронизация Rust пакетов")
+        print("═" * 60)
+
+        if not self._ensure_channel_ready("cargo", "Cargo канал", "cargo"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        try:
+            archiver = CargoArchiver("config.yaml")
+            archiver.sync_packages()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"Cargo sync error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def run_nuget_archiver(self):
+        """Загрузить топ .NET пакеты в MAX канал"""
+        from nuget_archiver import NuGetArchiver
+
+        print("\n" + "═" * 60)
+        print("  Загрузка топ .NET пакетов")
+        print("═" * 60)
+
+        if not self._ensure_channel_ready("nuget", "NuGet канал", "nuget"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        try:
+            archiver = NuGetArchiver("config.yaml")
+            archiver.load_top_packages()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"NuGet archiver error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def run_nuget_sync(self):
+        """Синхронизировать версии .NET пакетов"""
+        from nuget_archiver import NuGetArchiver
+
+        print("\n" + "═" * 60)
+        print("  Синхронизация .NET пакетов")
+        print("═" * 60)
+
+        if not self._ensure_channel_ready("nuget", "NuGet канал", "nuget"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        try:
+            archiver = NuGetArchiver("config.yaml")
+            archiver.sync_packages()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"NuGet sync error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def run_rubygems_archiver(self):
+        """Загрузить топ Ruby пакеты в MAX канал"""
+        from rubygems_archiver import RubyGemsArchiver
+
+        print("\n" + "═" * 60)
+        print("  Загрузка топ Ruby пакетов")
+        print("═" * 60)
+
+        if not self._ensure_channel_ready("rubygems", "RubyGems канал", "rubygems"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        try:
+            archiver = RubyGemsArchiver("config.yaml")
+            archiver.load_top_packages()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"RubyGems archiver error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def run_rubygems_sync(self):
+        """Синхронизировать версии Ruby пакетов"""
+        from rubygems_archiver import RubyGemsArchiver
+
+        print("\n" + "═" * 60)
+        print("  Синхронизация Ruby пакетов")
+        print("═" * 60)
+
+        if not self._ensure_channel_ready("rubygems", "RubyGems канал", "rubygems"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        try:
+            archiver = RubyGemsArchiver("config.yaml")
+            archiver.sync_packages()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"RubyGems sync error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+
+# ─────────────────────────────────────────────────
+# Lightweight generic journal for new archivers
+# (full journal classes created in executor phase)
+# ─────────────────────────────────────────────────
+
+class _GenericJournal:
+    """Minimal journal wrapper for Cargo, NuGet, RubyGems management menu."""
+
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self.data = self._load()
+
+    def _load(self) -> dict:
+        if os.path.exists(self.file_path):
+            try:
+                with open(self.file_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                return {"packages": []}
+        return {"packages": []}
+
+    def get_stats(self) -> dict:
+        entries = self.data.get("packages", [])
+        sent = len([e for e in entries if e.get("status") == "sent"])
+        failed = len([e for e in entries if e.get("status") == "failed"])
+        return {
+            "total": len(entries),
+            "sent": sent,
+            "failed": failed,
+        }
+
+    def clear(self):
+        with open(self.file_path, 'w', encoding='utf-8') as f:
+            json.dump({"packages": []}, f, ensure_ascii=False, indent=2)
+        try:
+            lock_path = f"{self.file_path}.lock"
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
+        except OSError:
+            pass
 
 
 def main():
