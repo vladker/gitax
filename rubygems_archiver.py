@@ -213,6 +213,76 @@ class RubyGemsArchiver(LogMixin, BrowserInitMixin):
         print(f"\n  Итого: ✓{sent} | ✗{failed}")
         self._close_browser()
 
+    def sync_runtimes(self):
+        """Check and sync Ruby runtime installer if a newer version is available."""
+        from datetime import datetime
+        from runtime_api import RuntimeFactory, OSTarget
+
+        runtime_cfg = self.config.get("runtime", {})
+        if not runtime_cfg.get("enabled", True):
+            self.logger.info("Runtime sync disabled in config")
+            return
+
+        runtime = RuntimeFactory.get_runtime("rubygems")
+        print(f"\n  {RuntimeFactory.get_icon('ruby')} Проверяю Ruby runtime...")
+
+        latest = runtime.get_latest_version()
+        if not latest:
+            print("  ⚠ Не удалось получить версию Ruby. Пропуск.")
+            return
+
+        if not self.journal.should_update_runtime(latest):
+            saved = self.journal.get_runtime_version()
+            print(f"  ✓ Ruby {saved} — актуален")
+            return
+
+        print(f"  🆕 Ruby {latest} доступен (текущий: {self.journal.get_runtime_version() or 'не установлен'})")
+        print("  Загрузка инсталляторов для всех ОС...")
+
+        urls = runtime.get_download_urls(latest)
+        os_targets = runtime_cfg.get("os_targets", ["windows", "macos", "linux"])
+        urls = [u for u in urls if u["os"] in os_targets]
+
+        browser = self._ensure_browser_connected()
+        entries = []
+        output_dir = runtime_cfg.get("output_dir", "./temp_runtime")
+
+        for url_info in urls:
+            filename = url_info["filename"]
+            download_url = url_info["url"]
+            os_name = url_info["os"]
+
+            print(f"  ⬇ Скачиваю {filename} ({url_info.get('size_hint', '')})...")
+            file_path = self._download_file(download_url, filename, output_dir)
+
+            if file_path and os.path.exists(file_path):
+                print(f"  📤 Отправляю {filename} в канал...")
+                sent = self._send_file_to_channel(
+                    file_path,
+                    message=f"Ruby {latest} — {os_name} installer\n\n{RuntimeFactory.get_download_page('ruby')}",
+                    browser=browser,
+                )
+                if sent:
+                    entries.append({
+                        "os": os_name,
+                        "filename": filename,
+                        "sent_at": datetime.now().isoformat(),
+                    })
+                    print(f"  ✓ {filename} отправлен")
+                else:
+                    print(f"  ✗ Ошибка отправки {filename}")
+                self._cleanup_file(file_path)
+            else:
+                print(f"  ✗ Ошибка скачивания {filename}")
+
+        if entries:
+            self.journal.set_runtime_version(latest, entries)
+            print(f"\n  ✓ Ruby runtime {latest} обновлён в журнале")
+        else:
+            print("\n  ✗ Не удалось обновить runtime")
+
+        self._close_browser()
+
     def sync_packages(self):
         """Синхронизировать версии Ruby гемов."""
         print("\n" + "═" * 60)

@@ -1,4 +1,5 @@
 import logging
+import logging.handlers
 import os
 import sys
 from datetime import datetime
@@ -70,8 +71,17 @@ class SessionCapture:
         self.stop()
 
 
-def setup_logging(log_file: str = "archiver.log", level: int = logging.DEBUG):
-    """Set up logging to both file and console"""
+def setup_logging(
+    log_file: str = "archiver.log",
+    level: int = logging.DEBUG,
+    max_bytes: int = 10 * 1024 * 1024,   # 10 MB
+    backup_count: int = 3,
+):
+    """Set up logging to both file and console.
+
+    Uses RotatingFileHandler so archiver.log never grows beyond max_bytes.
+    Old logs are kept as archiver.log.1, .2, .3 (up to backup_count).
+    """
     global _loggers_initialized
 
     logger = logging.getLogger("gitax")
@@ -83,7 +93,12 @@ def setup_logging(log_file: str = "archiver.log", level: int = logging.DEBUG):
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file,
+        maxBytes=max_bytes,
+        backupCount=backup_count,
+        encoding="utf-8",
+    )
     file_handler.setLevel(level)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
@@ -93,7 +108,7 @@ def setup_logging(log_file: str = "archiver.log", level: int = logging.DEBUG):
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    logger.info(f"Logging initialized: {log_file}")
+    logger.info(f"Logging initialized: {log_file} (rotation: {max_bytes / 1024 / 1024:.0f}MB x {backup_count})")
     return logger
 
 

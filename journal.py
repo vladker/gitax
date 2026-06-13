@@ -12,7 +12,7 @@ from pathlib import Path
 from enum import Enum
 from logging_config import setup_logging
 
-from shared_journal import BaseJournal
+from shared_journal import BaseJournal, RuntimeJournalMixin
 
 
 class RepoStatus(Enum):
@@ -25,7 +25,7 @@ class RepoStatus(Enum):
     CLEANED = "cleaned"
 
 
-class Journal(BaseJournal):
+class Journal(RuntimeJournalMixin, BaseJournal):
     """Класс для управления журналом загруженных репозиториев"""
 
     def __init__(self, file_path: str = "journal.json"):

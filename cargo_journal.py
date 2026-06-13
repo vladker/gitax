@@ -6,10 +6,10 @@
 """
 
 from datetime import datetime
-from shared_journal import BaseJournal
+from shared_journal import BaseJournal, RuntimeJournalMixin
 
 
-class CargoJournal(BaseJournal):
+class CargoJournal(RuntimeJournalMixin, BaseJournal):
     """Журнал отправленных Cargo пакетов"""
 
     def _create_empty(self) -> dict:

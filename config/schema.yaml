@@ -67,6 +67,27 @@ pypi_libs_archiver:
   retry_delay: 10
   split_mode: auto
 
+cargo_archiver:
+  limit: 500
+  output_dir: ./temp_cargo
+  retries: 3
+  retry_delay: 10
+  split_mode: off
+
+nuget_archiver:
+  limit: 500
+  output_dir: ./temp_nuget
+  retries: 3
+  retry_delay: 10
+  split_mode: off
+
+rubygems_archiver:
+  limit: 500
+  output_dir: ./temp_rubygems
+  retries: 3
+  retry_delay: 10
+  split_mode: off
+
 setup:
   skipped_channels: []       # Channels to skip: max, pypi, media, backup
 

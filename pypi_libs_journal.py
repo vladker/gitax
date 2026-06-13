@@ -7,10 +7,10 @@
 """
 
 from datetime import datetime
-from shared_journal import BaseJournal
+from shared_journal import BaseJournal, RuntimeJournalMixin
 
 
-class PyPILibsJournal(BaseJournal):
+class PyPILibsJournal(RuntimeJournalMixin, BaseJournal):
     """Журнал отправленных PyPI библиотек"""
 
     def _create_empty(self) -> dict:

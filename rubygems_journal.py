@@ -6,10 +6,10 @@
 """
 
 from datetime import datetime
-from shared_journal import BaseJournal
+from shared_journal import BaseJournal, RuntimeJournalMixin
 
 
-class RubyGemsJournal(BaseJournal):
+class RubyGemsJournal(RuntimeJournalMixin, BaseJournal):
     """Журнал отправленных RubyGems пакетов"""
 
     def _create_empty(self) -> dict:

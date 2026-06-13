@@ -6,10 +6,10 @@
 """
 
 from datetime import datetime
-from shared_journal import BaseJournal
+from shared_journal import BaseJournal, RuntimeJournalMixin
 
 
-class NuGetJournal(BaseJournal):
+class NuGetJournal(RuntimeJournalMixin, BaseJournal):
     """Журнал отправленных NuGet пакетов"""
 
     def _create_empty(self) -> dict:

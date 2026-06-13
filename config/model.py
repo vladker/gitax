@@ -128,6 +128,19 @@ class RubyGemsArchiverConfig(BaseModel):
     split_mode: Literal["auto", "on", "off", "prompt"] = "off"
 
 
+class RuntimeConfig(BaseModel):
+    """Settings: config.yaml → runtime section.
+
+    Controls runtime installer download and version sync for all archivers.
+    """
+    enabled: bool = True
+    os_targets: list[str] = Field(
+        default_factory=lambda: ["windows", "macos", "linux"]
+    )
+    check_on_sync: bool = True
+    output_dir: str = "./temp_runtime"
+
+
 class SetupConfig(BaseModel):
     """Settings: config.yaml → setup section."""
     skipped_channels: list[str] = Field(default_factory=list)
@@ -223,6 +236,7 @@ class AppConfig(BaseModel):
     setup: SetupConfig = SetupConfig()
     batch: BatchConfig = BatchConfig()
     github: GitHubConfig = GitHubConfig()
+    runtime: RuntimeConfig = RuntimeConfig()
     channel_registry: ChannelRegistry = Field(default_factory=ChannelRegistry)
 
     model_config = {"extra": "ignore"}  # Silently ignore unknown YAML keys

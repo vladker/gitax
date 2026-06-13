@@ -129,3 +129,55 @@ class BaseJournal(LogMixin):
     def _create_empty(self) -> dict:
         """Create empty journal structure. Must be overridden by subclasses."""
         pass
+
+
+class RuntimeJournalMixin:
+    """Mixin providing runtime version tracking for all journals.
+
+    Usage:
+        class MyJournal(RuntimeJournalMixin, BaseJournal):
+            ...
+
+    Stores runtime info under data["runtime"] key:
+    {
+        "version": "3.13.2",
+        "last_updated": "2026-06-13T10:00:00",
+        "entries": [
+            {"os": "windows", "filename": "python-3.13.2-amd64.exe", "sent_at": "..."},
+            ...
+        ]
+    }
+    """
+
+    def get_runtime_version(self) -> str | None:
+        """Get the saved runtime version, or None if not set."""
+        runtime = self.data.get("runtime")
+        if runtime and isinstance(runtime, dict):
+            return runtime.get("version")
+        return None
+
+    def set_runtime_version(self, version: str, entries: list[dict]) -> None:
+        """Save runtime version and per-OS entries."""
+        self.data["runtime"] = {
+            "version": version,
+            "last_updated": datetime.now().isoformat(),
+            "entries": entries,
+        }
+        self.save()
+
+    def should_update_runtime(self, latest_version: str) -> bool:
+        """Check if runtime needs updating by comparing with saved version.
+
+        Returns True if saved version differs from latest, or if no version saved.
+        """
+        saved = self.get_runtime_version()
+        if saved is None:
+            return True
+        return saved != latest_version
+
+    def get_runtime_entries(self) -> list[dict]:
+        """Get saved runtime entries for all OS targets."""
+        runtime = self.data.get("runtime")
+        if runtime and isinstance(runtime, dict):
+            return runtime.get("entries", [])
+        return []
