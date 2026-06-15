@@ -61,8 +61,9 @@ class TestLoadConfig:
         cfg = config.loader.load_config(cfg_file)
         assert cfg.archiver.limit == 50
         assert cfg.archiver.split_mode == "off"
-        # Legacy channel cleared after migration to registry
-        assert cfg.channels.max == ""
+        # Legacy channel kept for backward compatibility (see loader.py:59-61)
+        assert cfg.channels.max == "https://example.com/max"
+        # Also migrated to registry
         assert len(cfg.channel_registry.github) == 1
         assert cfg.channel_registry.github[0].url == "https://example.com/max"
         # Unset fields get defaults

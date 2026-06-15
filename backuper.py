@@ -17,11 +17,8 @@ from datetime import datetime
 
 from logging_config import LogMixin
 
-from browser_max import (
-    BrowserMAX,
-    archive_directory_to_volumes,
-    cleanup_volumes,
-)
+from browser_max import BrowserMAX
+from sevenzip import archive_directory_to_volumes, cleanup_volumes
 from browser_init import BrowserInitMixin
 from backuper_journal import BackuperJournal
 from config_utils import get_channel_url, get_config_value

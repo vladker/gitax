@@ -302,8 +302,11 @@ def is_setup_complete(config: dict) -> bool:
     skipped = get_skipped_channels(config)
     channels = config.get("channels", {}) or {}
 
+    # All channels defined in ChannelsConfig model
+    ALL_CHANNELS = ("max", "pypi", "media", "backup", "npm", "cargo", "nuget", "rubygems")
+
     has_configured = False
-    for ch_name in ("max", "pypi", "media", "backup", "npm"):
+    for ch_name in ALL_CHANNELS:
         if ch_name in skipped:
             continue
         env_var = f"CHANNEL_{ch_name.upper()}"
@@ -312,12 +315,11 @@ def is_setup_complete(config: dict) -> bool:
             val = str(channels.get(ch_name, "")).strip()
         if val:
             has_configured = True
-        else:
-            # Non-skipped channel missing URL = not fully configured
-            return False
+        # NOTE: intentionally NOT returning False here — we only need
+        # AT LEAST ONE channel configured (not all of them).
 
-    # Complete if at least one non-skipped channel configured, or all skipped
-    return has_configured or len(skipped) >= 5
+    # Complete if at least one non-skipped channel has a URL, or all skipped
+    return has_configured or (len(skipped) >= len(ALL_CHANNELS))
 
 
 # ── Thin wrapper over new config/ package ──

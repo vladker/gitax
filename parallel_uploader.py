@@ -92,7 +92,7 @@ class ParallelGroupUploader:
 
         return summary
 
-    @retry(max_retries=3, delay=5.0, backoff=1.0)
+    @retry(max_retries=3, delay=5.0, backoff=1.0, exceptions=(RuntimeError,))
     def _upload_single_file(
         self,
         browser,

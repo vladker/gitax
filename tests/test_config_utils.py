@@ -118,6 +118,10 @@ class TestIsSetupComplete:
         monkeypatch.setenv("CHANNEL_pypi", "https://max.example.com/pypi")
         monkeypatch.setenv("CHANNEL_media", "https://max.example.com/media")
         monkeypatch.setenv("CHANNEL_backup", "https://max.example.com/backup")
+        monkeypatch.setenv("CHANNEL_npm", "https://max.example.com/npm")
+        monkeypatch.setenv("CHANNEL_cargo", "https://max.example.com/cargo")
+        monkeypatch.setenv("CHANNEL_nuget", "https://max.example.com/nuget")
+        monkeypatch.setenv("CHANNEL_rubygems", "https://max.example.com/rubygems")
 
         from config_utils import is_setup_complete
         assert is_setup_complete({}) is True
@@ -129,6 +133,10 @@ class TestIsSetupComplete:
         monkeypatch.delenv("CHANNEL_pypi", raising=False)
         monkeypatch.delenv("CHANNEL_media", raising=False)
         monkeypatch.delenv("CHANNEL_backup", raising=False)
+        monkeypatch.delenv("CHANNEL_npm", raising=False)
+        monkeypatch.delenv("CHANNEL_cargo", raising=False)
+        monkeypatch.delenv("CHANNEL_nuget", raising=False)
+        monkeypatch.delenv("CHANNEL_rubygems", raising=False)
 
         config = {
             "channels": {
@@ -136,6 +144,10 @@ class TestIsSetupComplete:
                 "pypi": "https://max.example.com/pypi",
                 "media": "https://max.example.com/media",
                 "backup": "https://max.example.com/backup",
+                "npm": "https://max.example.com/npm",
+                "cargo": "https://max.example.com/cargo",
+                "nuget": "https://max.example.com/nuget",
+                "rubygems": "https://max.example.com/rubygems",
             }
         }
 
@@ -193,12 +205,20 @@ class TestIsSetupComplete:
         monkeypatch.delenv("CHANNEL_pypi", raising=False)
         monkeypatch.delenv("CHANNEL_media", raising=False)
         monkeypatch.delenv("CHANNEL_backup", raising=False)
+        monkeypatch.delenv("CHANNEL_npm", raising=False)
+        monkeypatch.delenv("CHANNEL_cargo", raising=False)
+        monkeypatch.delenv("CHANNEL_nuget", raising=False)
+        monkeypatch.delenv("CHANNEL_rubygems", raising=False)
 
         config = {
             "channels": {
                 "pypi": "url_from_config",
                 "media": "url_from_config",
                 "backup": "url_from_config",
+                "npm": "url_from_config",
+                "cargo": "url_from_config",
+                "nuget": "url_from_config",
+                "rubygems": "url_from_config",
             }
         }
 
@@ -212,10 +232,14 @@ class TestIsSetupComplete:
         monkeypatch.delenv("CHANNEL_pypi", raising=False)
         monkeypatch.delenv("CHANNEL_media", raising=False)
         monkeypatch.delenv("CHANNEL_backup", raising=False)
+        monkeypatch.delenv("CHANNEL_npm", raising=False)
+        monkeypatch.delenv("CHANNEL_cargo", raising=False)
+        monkeypatch.delenv("CHANNEL_nuget", raising=False)
+        monkeypatch.delenv("CHANNEL_rubygems", raising=False)
 
         config = {
             "setup": {
-                "skipped_channels": ["pypi", "media", "backup"]
+                "skipped_channels": ["pypi", "media", "backup", "npm", "cargo", "nuget", "rubygems"]
             }
         }
 
@@ -229,10 +253,14 @@ class TestIsSetupComplete:
         monkeypatch.delenv("CHANNEL_pypi", raising=False)
         monkeypatch.delenv("CHANNEL_media", raising=False)
         monkeypatch.delenv("CHANNEL_backup", raising=False)
+        monkeypatch.delenv("CHANNEL_npm", raising=False)
+        monkeypatch.delenv("CHANNEL_cargo", raising=False)
+        monkeypatch.delenv("CHANNEL_nuget", raising=False)
+        monkeypatch.delenv("CHANNEL_rubygems", raising=False)
 
         config = {
             "setup": {
-                "skipped_channels": ["max", "pypi", "media", "backup"]
+                "skipped_channels": ["max", "pypi", "media", "backup", "npm", "cargo", "nuget", "rubygems"]
             }
         }
 

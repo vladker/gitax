@@ -3,7 +3,6 @@
 MAX messenger automation using Playwright
 """
 
-import glob
 import os
 import re
 import time
@@ -11,295 +10,19 @@ import sys
 import csv
 import json
 import logging
-import subprocess
-import tempfile
-from dataclasses import dataclass
 from typing import Optional
-from dataclasses import dataclass
 from playwright.sync_api import sync_playwright, Page, Browser, TimeoutError as PlaywrightTimeout
 from logging_config import LogMixin, setup_logging
 
-
-# Module-level logger for standalone functions
-_logger = logging.getLogger("gitax")
-
-
-def _get_seven_zip_exe() -> str:
-    """Get 7z executable path from config."""
-    from config import get_config
-    return get_config().backuper.seven_zip_exe
-
-
-def _get_large_file_threshold() -> int:
-    """Get large file threshold in bytes from config (default 50 MB)."""
-    from config import get_config
-    return get_config().archiver.large_file_threshold_mb * 1024 * 1024
-
-
-@dataclass
-class ContentSnapshot:
-    """Content snapshot with hash for change detection."""
-    hash: str
-    file_count: int
-
-
-def split_file_with_7z(filepath: str, volume_size: str | None = None) -> list[str]:
-    """
-    Split a file into volumes using 7z.
-
-    Args:
-        filepath: Path to file to split
-        volume_size: Volume size (e.g., "49M", "100M"). Default: from config.
-
-    Returns:
-        List of volume file paths (e.g., ['file.7z.001', 'file.7z.002', ...])
-        Returns empty list if split failed or file is small enough.
-    """
-    if volume_size is None:
-        from config import get_config
-        volume_size = get_config().backuper.default_volume_size
-    seven_zip_exe = _get_seven_zip_exe()
-
-    if not os.path.exists(filepath):
-        return []
-
-    file_size = os.path.getsize(filepath)
-    volume_bytes = _parse_size(volume_size)
-
-    # No split needed if file is smaller than threshold
-    if file_size <= volume_bytes:
-        return []
-
-    filename = os.path.basename(filepath)
-    output_base = filepath + ".7z"
-
-    # Remove any existing volumes with same base
-    _cleanup_existing_volumes(output_base)
-
-    cmd = [
-        seven_zip_exe,
-        "a",
-        "-v" + volume_size,  # Volume size (e.g., -v49m)
-        "-mx=0",             # No compression (faster, raw split)
-        output_base,
-        filepath
-    ]
-
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=3600  # 1 hour max for large files
-        )
-
-        if result.returncode != 0:
-            _logger.warning(f"7z split failed: {result.stderr}")
-            _cleanup_existing_volumes(output_base)
-            return []
-
-        # Find created volumes
-        volumes = _find_volumes(output_base)
-
-        if volumes:
-            _logger.info(f"Split into {len(volumes)} volumes: {volumes[0]}...")
-            return volumes
-        else:
-            _logger.warning("7z succeeded but no volumes found")
-            return []
-
-    except subprocess.TimeoutExpired:
-        _logger.error("7z split timeout")
-        _cleanup_existing_volumes(output_base)
-        return []
-    except FileNotFoundError:
-        _logger.error(f"7z not found at {seven_zip_exe}")
-        return []
-    except Exception as e:
-        _logger.error(f"7z split error: {e}")
-        _cleanup_existing_volumes(output_base)
-        return []
-
-
-def _parse_size(size_str: str) -> int:
-    """Parse size string like '49M' or '1G' to bytes"""
-    size_str = size_str.upper().strip()
-    multipliers = {
-        'K': 1024,
-        'M': 1024 * 1024,
-        'G': 1024 * 1024 * 1024
-    }
-
-    for suffix, mult in multipliers.items():
-        if size_str.endswith(suffix):
-            try:
-                return int(float(size_str[:-1]) * mult)
-            except ValueError:
-                pass
-
-    # Plain number
-    try:
-        return int(size_str)
-    except ValueError:
-        return 0
-
-
-def _cleanup_existing_volumes(base_path: str):
-    """Remove any existing volume files matching base pattern"""
-    pattern = base_path + ".*"
-    for f in glob.glob(pattern):
-        try:
-            os.remove(f)
-        except Exception:
-            pass
-
-
-def _find_volumes(base_path: str) -> list[str]:
-    """Find all volume files matching base.7z.xxx pattern, sorted"""
-    pattern = base_path + ".*"
-    volumes = sorted(glob.glob(pattern))
-    return volumes
-
-
-def cleanup_volumes(volume_paths: list[str]):
-    """Remove volume files after successful upload"""
-    for vp in volume_paths:
-        try:
-            if os.path.exists(vp):
-                os.remove(vp)
-                _logger.debug(f"Removed: {vp}")
-        except Exception as e:
-            _logger.warning(f"Failed to remove {vp}: {e}")
-
-
-def group_volumes(filenames: list[str]) -> list[dict]:
-    """
-    Group 7z volume files by base archive name.
-
-    Groups:
-    - "documents.7z.001", "documents.7z.002" -> base "documents.7z"
-    - "photos.7z" -> base "photos.7z"
-
-    Args:
-        filenames: List of 7z-related filenames
-
-    Returns:
-        List of dicts: [{"base_name": "docs.7z", "volume_count": 3,
-                         "volumes": ["docs.7z.001", ...]}, ...]
-    """
-    import re
-    groups: dict[str, list[str]] = {}
-    for fn in filenames:
-        m = re.match(r'^(.+\.7z)(\.\d+)?$', fn)
-        if m:
-            base = m.group(1)
-            groups.setdefault(base, []).append(fn)
-    result = []
-    for base, volumes in groups.items():
-        result.append({
-            "base_name": base,
-            "volume_count": len(volumes),
-            "volumes": sorted(volumes),
-        })
-    return result
-
-
-def archive_directory_to_volumes(
-    source_dir: str,
-    output_base: str,
-    volume_size: str | None = None,
-    compression_level: int = 5,
-    password: str | None = None,
-    clean_existing: bool = True
-) -> list[str]:
-    """
-    Archive an entire directory into 7z volumes with compression and optional password.
-
-    Unlike split_file_with_7z() which does raw split (-mx=0), this creates
-    proper compressed 7z archives with encryption.
-
-    Args:
-        source_dir: Path to directory to archive
-        output_base: Base path for output (e.g., "./temp/name.7z")
-        volume_size: Volume size string (e.g., "49M"). None for single archive.
-        compression_level: 7z compression level 0-9 (default 5)
-        password: Optional encryption password
-        clean_existing: Remove existing volumes before archiving
-
-    Returns:
-        List of volume file paths, or empty list on failure.
-    """
-    if volume_size is None:
-        from config import get_config
-        volume_size = get_config().backuper.default_volume_size
-    seven_zip_exe = _get_seven_zip_exe()
-
-    if not os.path.isdir(source_dir):
-        _logger.error(f"Source directory not found: {source_dir}")
-        return []
-    if not os.path.exists(seven_zip_exe):
-        _logger.error(f"7z not found at {seven_zip_exe}")
-        return []
-    if clean_existing:
-        _cleanup_existing_volumes(output_base)
-    cmd = [seven_zip_exe, "a", f"-mx={compression_level}", output_base, source_dir + os.sep]
-    if volume_size:
-        cmd.insert(2, "-v" + volume_size)
-
-    # C2/C3: Use password file instead of CLI argument to avoid leaking in process list
-    password_tempfile = None
-    if password:
-        password_tempfile = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False, encoding="utf-8"
-        )
-        password_tempfile.write(password)
-        password_tempfile.close()
-        try:
-            os.chmod(password_tempfile.name, 0o600)
-        except OSError:
-            pass  # Windows may not support chmod; file is still private via temp dir
-        cmd.insert(2, f"-p@{password_tempfile.name}")
-        cmd.insert(2, "-mhe=on")
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
-        if result.returncode != 0:
-            _logger.warning(f"7z archive failed: {result.stderr}")
-            if clean_existing:
-                _cleanup_existing_volumes(output_base)
-            return []
-        volumes = _find_volumes(output_base)
-        if not volumes and not volume_size:
-            single = output_base if output_base.endswith('.7z') else output_base + '.7z'
-            if os.path.exists(single):
-                volumes = [single]
-        if volumes:
-            total_size = sum(os.path.getsize(v) for v in volumes if os.path.exists(v))
-            _logger.info(
-                f"Archived {source_dir} -> {len(volumes)} volume(s), "
-                f"total {total_size / 1024 / 1024:.1f} MB"
-            )
-            return volumes
-        else:
-            _logger.warning("7z succeeded but no output files found")
-            return []
-    except subprocess.TimeoutExpired:
-        _logger.error("7z archive timeout")
-        _cleanup_existing_volumes(output_base)
-        return []
-    except FileNotFoundError:
-        _logger.error(f"7z not found at {seven_zip_exe}")
-        return []
-    except Exception as e:
-        _logger.error(f"7z archive error: {e}")
-        _cleanup_existing_volumes(output_base)
-        return []
-    finally:
-        if password_tempfile is not None:
-            try:
-                os.unlink(password_tempfile.name)
-            except OSError:
-                pass
+# Re-export 7z utilities from sevenzip module for backward compatibility
+from sevenzip import (
+    split_file_with_7z,
+    cleanup_volumes,
+    group_volumes,
+    archive_directory_to_volumes,
+    ContentSnapshot,
+    _get_large_file_threshold,
+)
 
 
 class BrowserMAXError(Exception):
@@ -307,9 +30,13 @@ class BrowserMAXError(Exception):
     pass
 
 
-class ConnectionError(BrowserMAXError):
+class BrowserConnectionError(BrowserMAXError):
     """Failed to connect to Chrome"""
     pass
+
+
+# Keep alias for backward compatibility (ConnectionError shadows builtin)
+ConnectionError = BrowserConnectionError
 
 
 class UploadError(BrowserMAXError):
@@ -760,18 +487,58 @@ class BrowserMAX(LogMixin):
             self.__class__._active_playwright = self.playwright
 
             if self.use_local_browser:
-                # Launch local Chromium with user's profile (preserves cookies/session)
+                # When use_local_browser is True, prefer connecting to an existing
+                # Chrome via CDP (avoids profile lock conflicts), then fall back
+                # to launching locally only if Chrome isn't running with CDP.
                 user_data_dir = self._get_user_data_dir()
-                self.logger.info(f"Launching local Chromium with profile: {user_data_dir}")
-                self._context = self.playwright.chromium.launch_persistent_context(
-                    user_data_dir=user_data_dir,
-                    headless=False,
-                    args=['--disable-blink-features=Automation'],
-                    viewport={'width': 1200, 'height': 900}
-                )
-                self.page = self._context.new_page()
-                # For persistent context, self.browser is None — context IS the top-level object
-                self.browser = None
+                self.logger.info(f"Connecting (local={self.use_local_browser}), profile: {user_data_dir}")
+
+                # Step 1: Try CDP first — works if Chrome is running with --remote-debugging-port
+                cdp_failed = True
+                try:
+                    self.logger.info("Trying CDP connection to existing Chrome...")
+                    self.browser = self.playwright.chromium.connect_over_cdp(
+                        "http://127.0.0.1:9222",
+                        timeout=5000
+                    )
+                    context = (
+                        self.browser.contexts[0]
+                        if self.browser.contexts
+                        else self.browser.new_context()
+                    )
+                    self.page = context.pages[0] if context.pages else context.new_page()
+                    self._context = None
+                    cdp_failed = False
+                    self.logger.info("Connected via CDP to existing Chrome")
+                except Exception as cdp_error:
+                    self.logger.debug(f"CDP not available (Chrome may lack --remote-debugging-port): {cdp_error}")
+
+                # Step 2: If CDP failed, try launching locally
+                if cdp_failed:
+                    self.logger.info("CDP unavailable, launching local Chromium...")
+                    try:
+                        self._context = self.playwright.chromium.launch_persistent_context(
+                            user_data_dir=user_data_dir,
+                            headless=False,
+                            args=['--disable-blink-features=Automation'],
+                            viewport={'width': 1200, 'height': 900}
+                        )
+                        self.page = self._context.new_page()
+                        self.browser = None
+                        self.logger.info("Launched local Chromium successfully")
+                    except Exception as launch_error:
+                        # Both CDP and local launch failed — profile is locked by Chrome
+                        # that isn't running with --remote-debugging-port.
+                        self.logger.error(
+                            f"Cannot connect: Chrome profile '{user_data_dir}' is locked by "
+                            f"a running Chrome instance that is not using --remote-debugging-port=9222."
+                        )
+                        self.logger.error(
+                            f"Options: (1) Close Chrome and retry, or "
+                            f"(2) Restart Chrome with --remote-debugging-port=9222, or "
+                            f"(3) Set archiver.use_local_browser=false and launch Chrome with CDP manually."
+                        )
+                        raise launch_error from None
             else:
                 # Use CDP connection to existing Chrome (must be open at channel_url)
                 # This preserves existing browser state and cookies
@@ -1333,46 +1100,335 @@ class BrowserMAX(LogMixin):
             self.logger.debug(f"Failed to get message count: {e}")
             return 0
 
+    def _find_upload_button_js(self) -> dict:
+        """JavaScript-based scan for the upload/file button element.
+        Returns dict with {found, selector, tag, text, aria, classes} or {found: false}."""
+        return self.page.evaluate("""
+            () => {
+                const candidates = [];
+
+                // Collect all button-like elements
+                const buttons = document.querySelectorAll('button, [role="button"], a[role="button"]');
+                for (const el of buttons) {
+                    const text = (el.textContent || '').trim().toLowerCase();
+                    const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                    const cls = el.className || '';
+                    const title = (el.getAttribute('title') || '').toLowerCase();
+                    const inner = el.innerHTML.toLowerCase();
+                    const hasSvg = el.querySelector('svg') !== null;
+                    const hasIcon = el.querySelector('[class*="icon"]') !== null;
+
+                    // Score: higher = more likely to be the upload button
+                    let score = 0;
+                    const reasons = [];
+
+                    // aria-label matches
+                    if (/attach|upload|file|image|photo|video|media|clip|прикреп|файл|загруз/.test(aria)) {
+                        score += 50; reasons.push('aria');
+                    }
+                    // text matches
+                    if (/attach|upload|file|image|photo|video|clip|прикреп|файл|загруз/.test(text)) {
+                        score += 40; reasons.push('text');
+                    }
+                    // title matches
+                    if (/attach|upload|file|прикреп|файл/.test(title)) {
+                        score += 30; reasons.push('title');
+                    }
+                    // class matches
+                    if (/attach|upload|file|clip/.test(cls)) {
+                        score += 20; reasons.push('class');
+                    }
+                    // Has paperclip icon (typical for attach buttons)
+                    if (hasSvg) {
+                        const svgHtml = el.querySelector('svg').outerHTML.toLowerCase();
+                        if (/clip|attach|upload|paperclip|file|icon/.test(svgHtml)) {
+                            score += 25; reasons.push('svg_clip');
+                        }
+                    }
+                    // Has icon class
+                    if (hasIcon) {
+                        score += 10; reasons.push('icon');
+                    }
+
+                    if (score > 0) {
+                        candidates.push({
+                            score,
+                            tag: el.tagName,
+                            aria: el.getAttribute('aria-label') || '',
+                            text: text.slice(0, 60),
+                            classes: cls.slice(0, 100),
+                            reasons: reasons.join(','),
+                            rect: el.getBoundingClientRect()
+                        });
+                    }
+                }
+
+                // Also check for hidden file inputs near the composer
+                const fileInputs = document.querySelectorAll('input[type="file"]');
+                const fileInputInfo = Array.from(fileInputs).map(el => ({
+                    id: el.id,
+                    name: el.name,
+                    classes: (el.className || '').slice(0, 80),
+                    parentTag: el.parentElement ? el.parentElement.tagName : '',
+                    rect: el.getBoundingClientRect()
+                }));
+
+                // Find composer area
+                const composer = document.querySelector(
+                    '[class*="composer"], [role="textbox"], [contenteditable="true"], ' +
+                    '[class*="editor"], [class*="input-area"], [class*="message-input"]'
+                );
+                const composerInfo = composer ? {
+                    tag: composer.tagName,
+                    classes: (composer.className || '').slice(0, 150),
+                    rect: composer.getBoundingClientRect(),
+                    visible: composer.offsetHeight > 0 && composer.offsetParent !== null
+                } : null;
+
+                candidates.sort((a, b) => b.score - a.score);
+
+                return {
+                    found: candidates.length > 0,
+                    candidates: candidates.slice(0, 5),
+                    fileInputs: fileInputInfo,
+                    composer: composerInfo
+                };
+            }
+        """)
+
     def _click_upload_button(self):
-        """Find and click upload/file button - handles dropdown menu"""
+        """Find and click upload/file button - handles dropdown menu.
+        Uses multiple strategies in order of reliability:
+        1. Common selectors (EN/RU aria-labels, button text)
+        2. Role-based lookup with filters
+        3. JavaScript scanner for any upload-related element
+        """
         self._ensure_alive()
         self._check_connection()
         self.logger.info("Looking for upload button...")
 
-        for selector in ['[aria-label="Upload file"]', 'button:has-text("File")']:
+        # ── Strategy 1: Known selectors (try short timeout first) ──────────
+        known_selectors = [
+            # English
+            '[aria-label="Upload file"]',
+            '[aria-label="Attach file"]',
+            '[aria-label="Attach"]',
+            '[aria-label="File"]',
+            # Russian
+            '[aria-label="Прикрепить файл"]',
+            '[aria-label="Прикрепить"]',
+            '[aria-label="Файл"]',
+            '[aria-label="Загрузить файл"]',
+            # Partial aria-label matches
+            '[aria-label*="attach" i]',
+            '[aria-label*="upload" i]',
+            '[aria-label*="file" i]',
+            '[aria-label*="прикреп" i]',
+            '[aria-label*="файл" i]',
+            # Button text
+            'button:has-text("File")',
+            'button:has-text("Файл")',
+            'button:has-text("Прикрепить")',
+            # Title attribute
+            '[title*="attach" i]',
+            '[title*="upload" i]',
+            '[title*="file" i]',
+            '[title*="прикреп" i]',
+            # Data attributes
+            '[data-testid*="attach" i]',
+            '[data-testid*="upload" i]',
+            '[data-testid*="file" i]',
+        ]
+
+        for selector in known_selectors:
             try:
                 btn = self.page.locator(selector).first
-                if btn.is_visible(timeout=3000):
+                if btn.is_visible(timeout=1500):
                     btn.scroll_into_view_if_needed()
                     btn.click(timeout=5000)
                     self.logger.debug(f"Button clicked: {selector}")
                     time.sleep(0.5)
 
-                    menu_btn = self.page.locator('button:has-text("File")').first
-                    if menu_btn.is_visible(timeout=3000):
-                        menu_btn.click()
-                        self.logger.debug("File menu item clicked")
-                        time.sleep(0.3)
-                        return True
-            except PlaywrightTimeout:
-                self.logger.debug(f"Selector not found: {selector}")
-                continue
-            except Exception as e:
-                self.logger.warning(f"Error with selector {selector}: {e}")
+                    # Check for dropdown menu → click "File" sub-item
+                    for menu_sel in [
+                        'button:has-text("File")',
+                        'button:has-text("Файл")',
+                        '[role="menuitem"]:has-text("File")',
+                        '[role="menuitem"]:has-text("Файл")',
+                    ]:
+                        try:
+                            menu_btn = self.page.locator(menu_sel).first
+                            if menu_btn.is_visible(timeout=1500):
+                                menu_btn.click()
+                                self.logger.debug(f"Menu item clicked: {menu_sel}")
+                                time.sleep(0.3)
+                                return True
+                        except Exception:
+                            continue
+
+                    # If no dropdown menu appeared, the click itself was enough
+                    return True
+            except Exception:
                 continue
 
+        # ── Strategy 2: Role-based lookup ─────────────────────────────────
         try:
-            upload_btn = self.page.locator('[aria-label="Upload file"]').first
-            upload_btn.click()
-            time.sleep(0.5)
+            # Find all buttons with SVG children
+            buttons = self.page.get_by_role("button")
+            count = buttons.count()
+            self.logger.debug(f"Found {count} buttons via role")
 
-            self.logger.info("Looking for File menu item...")
-            file_btn = self.page.get_by_role("menuitem", name="File", exact=True).first
-            file_btn.click(timeout=5000)
-            self.logger.info("Upload > File clicked")
-            return True
+            upload_like = buttons.filter(
+                has=self.page.locator("svg")
+            ).or_(
+                buttons.filter(has_text=re.compile(r"(attach|upload|file|clip|прикреп|файл)", re.I))
+            )
+            upload_count = upload_like.count()
+            if upload_count > 0:
+                first_btn = upload_like.first
+                if first_btn.is_visible(timeout=2000):
+                    first_btn.click(timeout=5000)
+                    self.logger.debug("Upload button clicked via role filter")
+                    time.sleep(0.5)
+                    return True
         except Exception as e:
-            self.logger.warning(f"Menu click failed: {e}")
+            self.logger.debug(f"Role-based lookup failed: {e}")
+
+        # ── Strategy 3: JS scanner ────────────────────────────────────────
+        try:
+            scan = self._find_upload_button_js()
+            if scan.get('found') and scan.get('candidates'):
+                top = scan['candidates'][0]
+                tag = top['tag'].lower()
+
+                # Build selector from JS findings
+                if top['aria']:
+                    selector = f'[{tag}][aria-label="{top["aria"]}"]'
+                elif top.get('id'):
+                    selector = f'{tag}#{top["id"]}'
+                else:
+                    selector = tag
+
+                el = self.page.locator(selector).first
+                if el.is_visible(timeout=2000):
+                    el.scroll_into_view_if_needed()
+                    el.click(timeout=5000)
+                    self.logger.debug(f"Upload button clicked via JS scan: {selector}")
+                    time.sleep(0.5)
+                    return True
+        except Exception as e:
+            self.logger.debug(f"JS scanner click failed: {e}")
+
+        # ── Strategy 4: Programmatic file input trigger ───────────────────
+        try:
+            self.logger.info("Creating programmatic file input trigger...")
+            triggered = self.page.evaluate("""
+                () => {
+                    const input = document.createElement('input');
+                    input.type = 'file';
+                    input.style.position = 'fixed';
+                    input.style.top = '0';
+                    input.style.left = '0';
+                    input.style.width = '1px';
+                    input.style.height = '1px';
+                    input.style.opacity = '0.01';
+                    input.style.zIndex = '-1';
+                    input.setAttribute('data-gitax', 'trigger');
+                    document.body.appendChild(input);
+                    input.click();
+                    return true;
+                }
+            """)
+            if triggered:
+                self.logger.debug("Programmatic input created and clicked")
+                return True
+        except Exception as e:
+            self.logger.debug(f"Programmatic input failed: {e}")
+
+        self.logger.warning("All upload button strategies failed")
+        return False
+
+    def _upload_file_drop(self, filepath: str) -> bool:
+        """Upload file by dropping onto the composer area.
+        Uses JavaScript DataTransfer API to simulate drag-and-drop.
+        Reliable for modern web apps — doesn't depend on upload button selectors."""
+        self._check_connection()
+        valid, err = self._validate_file(filepath)
+        if not valid:
+            self.logger.error(f"File validation failed: {err}")
+            return False
+
+        abs_path = os.path.abspath(filepath)
+        filename = os.path.basename(filepath)
+        file_size_mb = os.path.getsize(abs_path) / 1024 / 1024
+        self.logger.info(f"Dropping file: {filename} ({file_size_mb:.1f} MB)")
+
+        # Read file content as base64 for injection via JS
+        import base64
+        with open(abs_path, "rb") as f:
+            file_b64 = base64.b64encode(f.read()).decode("ascii")
+
+        # Find composer element selector
+        target_selector = "body"
+        try:
+            for composer_sel in [
+                '[class*="composer"]',
+                '[role="textbox"]',
+                '[contenteditable="true"]',
+                '[class*="editor"]',
+                '[class*="input-area"]',
+                '[class*="message-input"]',
+            ]:
+                composer = self.page.locator(composer_sel).first
+                if composer.is_visible(timeout=1000):
+                    target_selector = composer_sel
+                    self.logger.debug(f"Found composer: {composer_sel}")
+                    break
+        except Exception:
+            pass
+
+        # Dispatch file drop via JavaScript DataTransfer
+        try:
+            success = self.page.evaluate("""
+                ({selector, fileB64, filename, mimeType}) => {
+                    const target = document.querySelector(selector) || document.body;
+                    if (!target) return false;
+
+                    // Convert base64 to ArrayBuffer → File
+                    const byteChars = atob(fileB64);
+                    const byteNums = new Array(byteChars.length);
+                    for (let i = 0; i < byteChars.length; i++) {
+                        byteNums[i] = byteChars.charCodeAt(i);
+                    }
+                    const byteArray = new Uint8Array(byteNums);
+                    const file = new File([byteArray], filename, { type: mimeType });
+
+                    // Create DataTransfer and dispatch drop events
+                    const dataTransfer = new DataTransfer();
+                    dataTransfer.items.add(file);
+
+                    target.dispatchEvent(new DragEvent('dragenter', {
+                        dataTransfer, bubbles: true, cancelable: true
+                    }));
+                    target.dispatchEvent(new DragEvent('dragover', {
+                        dataTransfer, bubbles: true, cancelable: true
+                    }));
+                    target.dispatchEvent(new DragEvent('drop', {
+                        dataTransfer, bubbles: true, cancelable: true
+                    }));
+                    return true;
+                }
+            """, {
+                "selector": target_selector,
+                "fileB64": file_b64,
+                "filename": filename,
+                "mimeType": "application/octet-stream",
+            })
+            if success:
+                self.logger.info(f"File dropped via JS DataTransfer on: {target_selector}")
+                return True
+        except Exception as e:
+            self.logger.warning(f"JS DataTransfer drop failed: {e}")
 
         return False
 
@@ -2351,12 +2407,16 @@ class BrowserMAX(LogMixin):
             return (True, f"substring:{search_name}")
 
         # Tier 3: Generic file indicator (archive OR media + download)
-        has_archive = bool(re.search(r'\.(zip|7z)', msg_text))
-        has_media = bool(re.search(r'\.(jpg|jpeg|png|gif|webp|mp4|mov|avi|mkv|webm)', msg_text))
-        has_download = 'download' in msg_text or 'скачать' in msg_text
-        if (has_archive or has_media) and has_download:
-            self.logger.warning(f"Tertiary match — no exact filename, but file+download found near '{search_name}'")
-            return (True, "tertiary_fallback")
+        # ONLY use when search_name is None (scanning for "any file").
+        # When we have a specific filename, tertiary is too loose — it matches
+        # old messages containing .zip + "download" from previous uploads.
+        if not search_name:
+            has_archive = bool(re.search(r'\.(zip|7z)', msg_text))
+            has_media = bool(re.search(r'\.(jpg|jpeg|png|gif|webp|mp4|mov|avi|mkv|webm)', msg_text))
+            has_download = 'download' in msg_text or 'скачать' in msg_text
+            if (has_archive or has_media) and has_download:
+                self.logger.debug(f"Generic file match in message (no search_name)")
+                return (True, "tertiary_fallback")
 
         return (False, "no_match")
 
@@ -3371,26 +3431,32 @@ class BrowserMAX(LogMixin):
                     self.logger.info(f"File selected: {filename}")
                     uploaded = True
                 except PlaywrightTimeout:
-                    self.logger.warning("File chooser timeout, trying input method...")
-                    try:
-                        file_input = self.page.locator('input[type="file"]').first
-                        file_input.set_input_files(filepath, timeout=upload_timeout)
-                        self.logger.info("File uploaded via input")
-                        uploaded = True
-                    except Exception as e2:
-                        self.logger.error(f"Input method also failed: {e2}")
+                    self.logger.warning("File chooser timeout, trying drag-drop...")
+                    uploaded = self._upload_file_drop(filepath)
+                    if not uploaded:
+                        self.logger.warning("Drag-drop failed, trying input method...")
+                        try:
+                            file_input = self.page.locator('input[type="file"]').first
+                            file_input.set_input_files(filepath, timeout=upload_timeout)
+                            self.logger.info("File uploaded via input")
+                            uploaded = True
+                        except Exception as e2:
+                            self.logger.error(f"Input method also failed: {e2}")
                 except Exception as e:
                     self.logger.warning(f"File chooser failed: {e}")
-                    try:
-                        file_input = self.page.locator('input[type="file"]').first
-                        file_input.set_input_files(filepath, timeout=upload_timeout)
-                        self.logger.info("File uploaded via input")
-                        uploaded = True
-                    except Exception as e2:
-                        self.logger.error(f"Input method also failed: {e2}")
+                    uploaded = self._upload_file_drop(filepath)
+                    if not uploaded:
+                        self.logger.warning("Drag-drop failed, trying input method...")
+                        try:
+                            file_input = self.page.locator('input[type="file"]').first
+                            file_input.set_input_files(filepath, timeout=upload_timeout)
+                            self.logger.info("File uploaded via input")
+                            uploaded = True
+                        except Exception as e2:
+                            self.logger.error(f"Input method also failed: {e2}")
 
                 if not uploaded:
-                    self.logger.error("Failed to upload file - both methods failed")
+                    self.logger.error("Failed to upload file - all methods failed")
                     if attempt < retries:
                         time.sleep(retry_delay)
                     continue
@@ -3438,12 +3504,53 @@ class BrowserMAX(LogMixin):
                     confirm_elapsed = time.time() - confirm_start
 
                     if confirmed:
-                        self.logger.info(
-                            f"File confirmed (delta check, {confirm_elapsed:.1f}s)"
+                        # Secondary check: verify the SPECIFIC filename appears in feed.
+                        # _confirm_file_sent only checks if content hash changed,
+                        # which can be a false positive when only the text message
+                        # was posted (e.g. when input[type="file"] fallback
+                        # "selected" the file but MAX didn't process it).
+                        self.logger.debug(
+                            f"Delta check passed, verifying filename in feed..."
                         )
-                        print(
-                            f"  [OK] File confirmed (delta check, {confirm_elapsed:.1f}s)"
-                        )
+                        self._scroll_to_bottom()
+                        self._force_rerender()
+                        self.page.wait_for_timeout(500)
+                        search_name = os.path.basename(filename).lower()
+                        search_name = search_name.replace('-master', '').replace('-main', '')
+                        escaped = search_name.replace("\\", "\\\\").replace("'", "\\'")
+                        filename_found = self.page.evaluate(
+                            f"""
+                            () => {{
+                                const searchName = '{escaped}';
+                                const msgs = document.querySelectorAll('[class*="message"]');
+                                // Only check the last 5 messages (recent window)
+                                const start = Math.max(0, msgs.length - 5);
+                                for (let i = msgs.length - 1; i >= start; i--) {{
+                                    const text = (msgs[i].textContent || '').toLowerCase();
+                                    if (text.includes(searchName)) {{
+                                        return {{ found: true, text: text.slice(0, 100) }};
+                                    }}
+                                }}
+                                return {{ found: false }};
+                            }}
+                            """
+                        ) or {{}}
+                        if filename_found.get('found'):
+                            self.logger.info(
+                                f"File confirmed (delta + filename check, {confirm_elapsed:.1f}s)"
+                            )
+                            print(
+                                f"  [OK] File confirmed (delta + filename check, {confirm_elapsed:.1f}s)"
+                            )
+                        else:
+                            self.logger.warning(
+                                f"Delta check passed but filename '{search_name}' not in feed — "
+                                "likely false positive (text-only post), falling through"
+                            )
+                            print(
+                                f"  [WARN] Delta check passed but filename not found — re-verifying..."
+                            )
+                            confirmed = False
 
                 if confirmed:
                     return True

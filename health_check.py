@@ -29,7 +29,13 @@ def check_chrome_cdp(cdp_port: int = 9222) -> bool:
 
 
 def check_github_token() -> bool:
-    """Check if GitHub token is configured."""
+    """Check if GitHub token is configured.
+
+    Checks environment variable first, then config as fallback.
+    """
+    env_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if env_token:
+        return True
     cfg = get_config()
     return bool(cfg.github.token)
 

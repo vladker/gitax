@@ -409,7 +409,7 @@ CHANNEL_TO_RUNTIME: dict[str, type[RuntimeAPI]] = {
     "cargo": RustRuntime,
     "nuget": DotNetRuntime,
     "rubygems": RubyRuntime,
-    "github": NodeJSRuntime,
+    "github": GitRuntime,
     "max": GitRuntime,
 }
 

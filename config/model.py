@@ -62,6 +62,7 @@ class ChannelDownloaderConfig(BaseModel):
     output_dir: str = "./downloads"
     retries: int = 3
     retry_delay: int = 5
+    large_file_threshold_mb: int = 50
 
 
 class MediaExtensionsConfig(BaseModel):
@@ -256,11 +257,15 @@ class AppConfig(BaseModel):
         """Persist config to YAML file.
 
         Uses _config_path_attr set by config/__init__.py during init_config().
+        NEVER writes github.token — tokens must only come from environment variables.
         """
         import yaml
         config_path = getattr(self, "_config_path_attr", None)
         if config_path is None:
             config_path = "config.yaml"
         data = self.model_dump()
+        # SECURITY: Never persist tokens to YAML. Always blank out before saving.
+        if "github" in data and isinstance(data["github"], dict):
+            data["github"]["token"] = ""
         with open(config_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)

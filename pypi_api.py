@@ -6,6 +6,7 @@ import os
 import time
 import requests
 from logging_config import LogMixin
+from retry import retry
 
 
 class PyPIAPIError(Exception):
@@ -61,7 +62,10 @@ class PyPIAPI(LogMixin):
             try:
                 response = self.session.get(url, timeout=timeout)
             except requests.exceptions.ConnectionError as e:
-                self.logger.error(f"Connection error: {e}")
+                self.logger.warning(f"Connection error (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
                 raise NetworkError(f"Cannot connect to PyPI: {e}")
             except requests.exceptions.Timeout:
                 self.logger.warning(f"Request timeout after {timeout}s (attempt {attempt + 1}/{max_retries})")
@@ -104,8 +108,22 @@ class PyPIAPI(LogMixin):
             Список словарей с данными пакетов
         """
         self.logger.info(f"Fetching top {limit} packages from Hugovk dataset...")
-        response = requests.get(self.HUGOVK_URL, timeout=self.DEFAULT_TIMEOUT)
-        response.raise_for_status()
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(self.HUGOVK_URL, timeout=self.DEFAULT_TIMEOUT)
+                response.raise_for_status()
+                break
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                if attempt < max_retries - 1:
+                    self.logger.warning(
+                        f"Hugovk fetch attempt {attempt + 1}/{max_retries} failed: {e}. "
+                        f"Retrying in {2 ** attempt}s..."
+                    )
+                    time.sleep(2 ** attempt)
+                    continue
+                raise
 
         data = response.json()
 
@@ -240,11 +258,7 @@ class PyPIAPI(LogMixin):
                 continue
 
             self.logger.info(f"Downloading: {filename}")
-            resp = self.session.get(file_url, timeout=120)
-            resp.raise_for_status()
-
-            with open(filepath, "wb") as f:
-                f.write(resp.content)
+            self._download_single_file(file_url, filepath)
 
             size_mb = _file_size_mb(filepath)
             self.logger.info(f"Downloaded: {filename} ({size_mb:.1f} MB)")
@@ -254,6 +268,15 @@ class PyPIAPI(LogMixin):
             raise ValueError("No files found")
 
         return downloaded_files
+
+    @retry(max_retries=3, delay=2.0, backoff=2.0,
+           exceptions=(requests.exceptions.ConnectionError, requests.exceptions.Timeout))
+    def _download_single_file(self, file_url: str, filepath: str) -> None:
+        """Download a single file with retry on transient network errors."""
+        resp = self.session.get(file_url, timeout=120)
+        resp.raise_for_status()
+        with open(filepath, "wb") as f:
+            f.write(resp.content)
 
     def clear_cache(self):
         """Clear the in-memory cache."""

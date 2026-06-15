@@ -29,7 +29,7 @@ class TestRetryDecorator:
             nonlocal call_count
             call_count += 1
             if call_count < 2:
-                raise ValueError("not yet")
+                raise OSError("transient failure")
             return "ok"
         result = fail_then_succeed()
         assert result == "ok"
@@ -39,8 +39,8 @@ class TestRetryDecorator:
         """Raises after max retries exhausted"""
         @retry(max_retries=2, delay=0.01)
         def always_fail():
-            raise RuntimeError("fail")
-        with pytest.raises(RuntimeError, match="fail"):
+            raise OSError("fail")
+        with pytest.raises(OSError, match="fail"):
             always_fail()
 
     def test_specific_exceptions(self):
@@ -51,16 +51,35 @@ class TestRetryDecorator:
         with pytest.raises(TypeError):
             raise_type_error()
 
+    def test_non_retryable_exception(self):
+        """Does NOT retry on exceptions not in default set (e.g. ValueError)"""
+        @retry(max_retries=2, delay=0.01)
+        def raise_value_error():
+            raise ValueError("not retryable by default")
+        with pytest.raises(ValueError):
+            raise_value_error()
+
+    def test_explicit_exceptions(self):
+        """Retries on explicitly specified exceptions"""
+        call_count = 0
+        @retry(max_retries=2, delay=0.01, exceptions=(ValueError,))
+        def fail_with_value_error():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                raise ValueError("retry me")
+            return "ok"
+        result = fail_with_value_error()
+        assert result == "ok"
+        assert call_count == 2
+
     def test_backoff_delays(self):
         """Delays increase with backoff"""
-        delays = []
         @retry(max_retries=2, delay=0.1, backoff=2.0)
         def fail_twice():
-            raise ValueError("fail")
-        try:
+            raise OSError("fail")
+        with pytest.raises(OSError):
             fail_twice()
-        except ValueError:
-            pass
         # Test runs but we can't easily measure delays without mocking time.sleep
 
     def test_preserves_function_name(self):

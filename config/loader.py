@@ -102,11 +102,11 @@ def _apply_env_overrides(config: AppConfig) -> AppConfig:
                 setattr(section_model, field, raw)
 
     # ── Generic SECTION_FIELD overrides ──
-    for section_name in config.model_fields:
+    for section_name in type(config).model_fields:
         section = getattr(config, section_name)
-        if not hasattr(section, "model_fields"):
+        if not hasattr(type(section), "model_fields"):
             continue
-        for field_name, field_info in section.model_fields.items():
+        for field_name, field_info in type(section).model_fields.items():
             env_key = f"{section_name.upper()}_{field_name.upper()}"
             raw = os.environ.get(env_key, "").strip()
             if raw:

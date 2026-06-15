@@ -342,7 +342,11 @@ class GitHubArchiver(LogMixin):
     def _init_github(self) -> GitHubAPI:
         """Инициализировать GitHub API"""
         if self.github is None:
-            token = self.config['github']['token']
+            # SECURITY: Always read token from environment, never from config dict
+            token = os.environ.get("GITHUB_TOKEN", "")
+            if not token:
+                # Fallback to config only if env is not set (loader maps env→config)
+                token = self.config.get('github', {}).get('token', '')
             output_dir = self.config.get('archiver', {}).get('output_dir', './temp')
             self.github = GitHubAPI(token, output_dir)
         return self.github
@@ -410,8 +414,8 @@ class GitHubArchiver(LogMixin):
         except Exception:
             pass
 
-    def sync_runtimes(self):
-        """Check and sync Node.js runtime installer if a newer version is available."""
+    def load_runtime(self):
+        """Загрузить Git runtime installer (первичная загрузка)."""
         from datetime import datetime
         from runtime_api import RuntimeFactory, OSTarget
 
@@ -421,19 +425,81 @@ class GitHubArchiver(LogMixin):
             return
 
         runtime = RuntimeFactory.get_runtime("github")
-        print(f"\n  {RuntimeFactory.get_icon('nodejs')} Проверяю Node.js runtime...")
+        print(f"\n  {RuntimeFactory.get_icon('git')} Загрузка Git runtime...")
 
         latest = runtime.get_latest_version()
         if not latest:
-            print("  ⚠ Не удалось получить версию Node.js. Пропуск.")
+            print("  ⚠ Не удалось получить версию Git. Пропуск.")
+            return
+
+        print(f"  📦 Git {latest} — загрузка инсталляторов для всех ОС...")
+
+        urls = runtime.get_download_urls(latest)
+        os_targets = runtime_cfg.get("os_targets", ["windows", "macos", "linux"])
+        urls = [u for u in urls if u["os"] in os_targets]
+
+        browser = self._ensure_max_connected()
+        entries = []
+        output_dir = runtime_cfg.get("output_dir", "./temp_runtime")
+
+        for url_info in urls:
+            filename = url_info["filename"]
+            download_url = url_info["url"]
+            os_name = url_info["os"]
+
+            print(f"  ⬇ Скачиваю {filename} ({url_info.get('size_hint', '')})...")
+            file_path = self._download_file(download_url, filename, output_dir)
+
+            if file_path and os.path.exists(file_path):
+                print(f"  📤 Отправляю {filename} в канал...")
+                sent = self._send_file_to_channel(
+                    file_path,
+                    message=f"Git {latest} — {os_name} installer\n\n{RuntimeFactory.get_download_page('git')}",
+                    browser=browser,
+                )
+                if sent:
+                    entries.append({
+                        "os": os_name,
+                        "filename": filename,
+                        "sent_at": datetime.now().isoformat(),
+                    })
+                    print(f"  ✓ {filename} отправлен")
+                else:
+                    print(f"  ✗ Ошибка отправки {filename}")
+                self._cleanup_file(file_path)
+            else:
+                print(f"  ✗ Ошибка скачивания {filename}")
+
+        if entries:
+            self.journal.set_runtime_version(latest, entries)
+            print(f"\n  ✓ Git runtime {latest} загружен в журнал")
+        else:
+            print("\n  ✗ Не удалось загрузить runtime")
+
+    def sync_runtimes(self):
+        """Check and sync Git runtime installer if a newer version is available."""
+        from datetime import datetime
+        from runtime_api import RuntimeFactory, OSTarget
+
+        runtime_cfg = self.config.get("runtime", {})
+        if not runtime_cfg.get("enabled", True):
+            self.logger.info("Runtime sync disabled in config")
+            return
+
+        runtime = RuntimeFactory.get_runtime("github")
+        print(f"\n  {RuntimeFactory.get_icon('git')} Проверяю Git runtime...")
+
+        latest = runtime.get_latest_version()
+        if not latest:
+            print("  ⚠ Не удалось получить версию Git. Пропуск.")
             return
 
         if not self.journal.should_update_runtime(latest):
             saved = self.journal.get_runtime_version()
-            print(f"  ✓ Node.js {saved} — актуален")
+            print(f"  ✓ Git {saved} — актуален")
             return
 
-        print(f"  🆕 Node.js {latest} доступен (текущий: {self.journal.get_runtime_version() or 'не установлен'})")
+        print(f"  🆕 Git {latest} доступен (текущий: {self.journal.get_runtime_version() or 'не установлен'})")
         print("  Загрузка инсталляторов для всех ОС...")
 
         urls = runtime.get_download_urls(latest)
@@ -456,7 +522,7 @@ class GitHubArchiver(LogMixin):
                 print(f"  📤 Отправляю {filename} в канал...")
                 sent = self._send_file_to_channel(
                     file_path,
-                    message=f"Node.js {latest} — {os_name} installer\n\n{RuntimeFactory.get_download_page('nodejs')}",
+                    message=f"Git {latest} — {os_name} installer\n\n{RuntimeFactory.get_download_page('git')}",
                     browser=browser,
                 )
                 if sent:
@@ -474,7 +540,7 @@ class GitHubArchiver(LogMixin):
 
         if entries:
             self.journal.set_runtime_version(latest, entries)
-            print(f"\n  ✓ Node.js runtime {latest} обновлён в журнале")
+            print(f"\n  ✓ Git runtime {latest} обновлён в журнале")
         else:
             print("\n  ✗ Не удалось обновить runtime")
 
@@ -581,9 +647,10 @@ class GitHubArchiver(LogMixin):
         print()
         print("  [1] Синхронизировать репозитории")
         print("  [2] Загрузить новые репозитории")
-        print("  [3] Синхронизировать Node.js runtime")
-        print(f"  [4] Список игнорирования{ignored_str}")
-        print("  [5] Аудит — очистка / восстановление публикаций")
+        print("  [3] Загрузить Git runtime (первичная)")
+        print("  [4] Синхронизировать Git runtime")
+        print(f"  [5] Список игнорирования{ignored_str}")
+        print("  [6] Аудит — очистка / восстановление публикаций")
         print("  [0] Назад")
         print()
 
@@ -595,7 +662,8 @@ class GitHubArchiver(LogMixin):
         print()
         print("  [1] Загрузить топ Python библиотек")
         print("  [2] Синхронизировать Python библиотеки")
-        print("  [3] Синхронизировать Python runtime")
+        print("  [3] Загрузить Python runtime (первичная)")
+        print("  [4] Синхронизировать Python runtime")
         print("  [0] Назад")
         print()
 
@@ -607,7 +675,8 @@ class GitHubArchiver(LogMixin):
         print()
         print("  [1] Загрузить топ Rust пакеты")
         print("  [2] Синхронизировать Rust пакеты")
-        print("  [3] Синхронизировать Rust runtime")
+        print("  [3] Загрузить Rust runtime (первичная)")
+        print("  [4] Синхронизировать Rust runtime")
         print("  [0] Назад")
         print()
 
@@ -619,7 +688,8 @@ class GitHubArchiver(LogMixin):
         print()
         print("  [1] Загрузить топ .NET пакеты")
         print("  [2] Синхронизировать .NET пакеты")
-        print("  [3] Синхронизировать .NET runtime")
+        print("  [3] Загрузить .NET runtime (первичная)")
+        print("  [4] Синхронизировать .NET runtime")
         print("  [0] Назад")
         print()
 
@@ -631,7 +701,8 @@ class GitHubArchiver(LogMixin):
         print()
         print("  [1] Загрузить топ Ruby пакеты")
         print("  [2] Синхронизировать Ruby пакеты")
-        print("  [3] Синхронизировать Ruby runtime")
+        print("  [3] Загрузить Ruby runtime (первичная)")
+        print("  [4] Синхронизировать Ruby runtime")
         print("  [0] Назад")
         print()
 
@@ -2946,7 +3017,7 @@ class GitHubArchiver(LogMixin):
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
             self._github_menu()
-            choice = prompt_numeric_choice("Выберите действие [0-5]", ["0", "1", "2", "3", "4", "5"])
+            choice = prompt_numeric_choice("Выберите действие [0-6]", ["0", "1", "2", "3", "4", "5", "6"])
 
             if choice == '0':
                 break
@@ -2955,10 +3026,12 @@ class GitHubArchiver(LogMixin):
             elif choice == '2':
                 self.load_new_repositories()
             elif choice == '3':
-                self.sync_runtimes()
+                self.load_runtime()
             elif choice == '4':
-                self._manage_ignore_list()
+                self.sync_runtimes()
             elif choice == '5':
+                self._manage_ignore_list()
+            elif choice == '6':
                 self.audit_and_restore_publications()
 
     def _run_pypi_menu(self):
@@ -2966,7 +3039,7 @@ class GitHubArchiver(LogMixin):
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
             self._pypi_menu()
-            choice = prompt_numeric_choice("Выберите действие [0-3]", ["0", "1", "2", "3"])
+            choice = prompt_numeric_choice("Выберите действие [0-4]", ["0", "1", "2", "3", "4"])
 
             if choice == '0':
                 break
@@ -2975,6 +3048,8 @@ class GitHubArchiver(LogMixin):
             elif choice == '2':
                 self.run_pypi_libs_sync()
             elif choice == '3':
+                self.run_pypi_libs_load_runtime()
+            elif choice == '4':
                 self.run_pypi_libs_sync_runtime()
 
     def _backuper_menu(self):
@@ -3235,6 +3310,27 @@ class GitHubArchiver(LogMixin):
 
         input("\n  Нажмите Enter для возврата в меню...")
 
+    def run_pypi_libs_load_runtime(self):
+        """Загрузить Python runtime (первичная загрузка)"""
+        from pypi_libs_archiver import PyPILibsArchiver
+
+        print("\n" + "═" * 60)
+        print("  Загрузка Python runtime")
+        print("═" * 60)
+
+        if not self._ensure_channel_ready("pypi", "PyPI канал", "pypi_libs"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        try:
+            archiver = PyPILibsArchiver("config.yaml")
+            archiver.load_runtime()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"PyPI runtime load error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
     def run_pypi_libs_sync_runtime(self):
         """Синхронизировать Python runtime"""
         from pypi_libs_archiver import PyPILibsArchiver
@@ -3307,7 +3403,7 @@ class GitHubArchiver(LogMixin):
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
             self._cargo_menu()
-            choice = prompt_numeric_choice("Выберите действие [0-3]", ["0", "1", "2", "3"])
+            choice = prompt_numeric_choice("Выберите действие [0-4]", ["0", "1", "2", "3", "4"])
 
             if choice == '0':
                 break
@@ -3316,6 +3412,8 @@ class GitHubArchiver(LogMixin):
             elif choice == '2':
                 self.run_cargo_sync()
             elif choice == '3':
+                self.run_cargo_load_runtime()
+            elif choice == '4':
                 self.run_cargo_sync_runtime()
 
     def _run_nuget_menu(self):
@@ -3323,7 +3421,7 @@ class GitHubArchiver(LogMixin):
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
             self._nuget_menu()
-            choice = prompt_numeric_choice("Выберите действие [0-3]", ["0", "1", "2", "3"])
+            choice = prompt_numeric_choice("Выберите действие [0-4]", ["0", "1", "2", "3", "4"])
 
             if choice == '0':
                 break
@@ -3332,6 +3430,8 @@ class GitHubArchiver(LogMixin):
             elif choice == '2':
                 self.run_nuget_sync()
             elif choice == '3':
+                self.run_nuget_load_runtime()
+            elif choice == '4':
                 self.run_nuget_sync_runtime()
 
     def _run_rubygems_menu(self):
@@ -3339,7 +3439,7 @@ class GitHubArchiver(LogMixin):
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
             self._rubygems_menu()
-            choice = prompt_numeric_choice("Выберите действие [0-3]", ["0", "1", "2", "3"])
+            choice = prompt_numeric_choice("Выберите действие [0-4]", ["0", "1", "2", "3", "4"])
 
             if choice == '0':
                 break
@@ -3348,6 +3448,8 @@ class GitHubArchiver(LogMixin):
             elif choice == '2':
                 self.run_rubygems_sync()
             elif choice == '3':
+                self.run_rubygems_load_runtime()
+            elif choice == '4':
                 self.run_rubygems_sync_runtime()
 
     # ── Batch Mode ────────────────────────────────────────────────
@@ -3371,12 +3473,20 @@ class GitHubArchiver(LogMixin):
         print("  [9] RubyGems — загрузка пакетов")
         print("  [0] RubyGems — синхронизация пакетов")
         print()
+        print("  Runtime загрузка (первичная):")
+        print("  [GL] GitHub — загрузка Git runtime")
+        print("  [PL] PyPI — загрузка Python runtime")
+        print("  [RL] Cargo — загрузка Rust runtime")
+        print("  [NL] NuGet — загрузка .NET runtime")
+        print("  [BL] RubyGems — загрузка Ruby runtime")
+        print()
         print("  Runtime синхронизация:")
-        print("  [P] PyPI — синхронизация Python runtime")
-        print("  [R] Cargo — синхронизация Rust runtime")
-        print("  [N] NuGet — синхронизация .NET runtime")
-        print("  [B] RubyGems — синхронизация Ruby runtime")
-        print("  [V] Все runtime")
+        print("  [GS] GitHub — синхронизация Git runtime")
+        print("  [PS] PyPI — синхронизация Python runtime")
+        print("  [RS] Cargo — синхронизация Rust runtime")
+        print("  [NS] NuGet — синхронизация .NET runtime")
+        print("  [BS] RubyGems — синхронизация Ruby runtime")
+        print("  [V]  Все runtime (синхронизация)")
         print()
         print("  Введите номера через пробел, например: 1 3 5")
         print("  [A] Все архиверы (загрузка)")
@@ -3418,11 +3528,18 @@ class GitHubArchiver(LogMixin):
                 "8": ("nuget_archiver", "NuGetArchiver", "sync_packages", "NuGet sync"),
                 "9": ("rubygems_archiver", "RubyGemsArchiver", "load_top_packages", "RubyGems load"),
                 "0": ("rubygems_archiver", "RubyGemsArchiver", "sync_packages", "RubyGems sync"),
+                # Runtime load tasks (primary)
+                "GL": ("github_archiver", "GitHubArchiver", "load_runtime", "GitHub runtime load"),
+                "PL": ("pypi_libs_archiver", "PyPILibsArchiver", "load_runtime", "PyPI runtime load"),
+                "RL": ("cargo_archiver", "CargoArchiver", "load_runtime", "Cargo runtime load"),
+                "NL": ("nuget_archiver", "NuGetArchiver", "load_runtime", "NuGet runtime load"),
+                "BL": ("rubygems_archiver", "RubyGemsArchiver", "load_runtime", "RubyGems runtime load"),
                 # Runtime sync tasks
-                "P": ("pypi_libs_archiver", "PyPILibsArchiver", "sync_runtimes", "PyPI runtime"),
-                "R": ("cargo_archiver", "CargoArchiver", "sync_runtimes", "Cargo runtime"),
-                "N": ("nuget_archiver", "NuGetArchiver", "sync_runtimes", "NuGet runtime"),
-                "B": ("rubygems_archiver", "RubyGemsArchiver", "sync_runtimes", "RubyGems runtime"),
+                "GS": ("github_archiver", "GitHubArchiver", "sync_runtimes", "GitHub runtime sync"),
+                "PS": ("pypi_libs_archiver", "PyPILibsArchiver", "sync_runtimes", "PyPI runtime sync"),
+                "RS": ("cargo_archiver", "CargoArchiver", "sync_runtimes", "Cargo runtime sync"),
+                "NS": ("nuget_archiver", "NuGetArchiver", "sync_runtimes", "NuGet runtime sync"),
+                "BS": ("rubygems_archiver", "RubyGemsArchiver", "sync_runtimes", "RubyGems runtime sync"),
             }
 
             if choice == 'A':
@@ -3437,7 +3554,7 @@ class GitHubArchiver(LogMixin):
                     tasks.append(BatchTask(module=mod, cls=cls, method=method, label=label))
             elif choice == 'V':
                 # All runtime sync tasks
-                for letter in ("P", "R", "N", "B"):
+                for letter in ("GS", "PS", "RS", "NS", "BS"):
                     mod, cls, method, label = task_map[letter]
                     tasks.append(BatchTask(module=mod, cls=cls, method=method, label=label))
             else:
@@ -3514,6 +3631,27 @@ class GitHubArchiver(LogMixin):
 
         input("\n  Нажмите Enter для возврата в меню...")
 
+    def run_cargo_load_runtime(self):
+        """Загрузить Rust runtime (первичная загрузка)"""
+        from cargo_archiver import CargoArchiver
+
+        print("\n" + "═" * 60)
+        print("  Загрузка Rust runtime")
+        print("═" * 60)
+
+        if not self._ensure_channel_ready("cargo", "Cargo канал", "cargo"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        try:
+            archiver = CargoArchiver("config.yaml")
+            archiver.load_runtime()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"Cargo runtime load error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
     def run_cargo_sync_runtime(self):
         """Синхронизировать Rust runtime"""
         from cargo_archiver import CargoArchiver
@@ -3577,6 +3715,27 @@ class GitHubArchiver(LogMixin):
 
         input("\n  Нажмите Enter для возврата в меню...")
 
+    def run_nuget_load_runtime(self):
+        """Загрузить .NET runtime (первичная загрузка)"""
+        from nuget_archiver import NuGetArchiver
+
+        print("\n" + "═" * 60)
+        print("  Загрузка .NET runtime")
+        print("═" * 60)
+
+        if not self._ensure_channel_ready("nuget", "NuGet канал", "nuget"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        try:
+            archiver = NuGetArchiver("config.yaml")
+            archiver.load_runtime()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"NuGet runtime load error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
     def run_nuget_sync_runtime(self):
         """Синхронизировать .NET runtime"""
         from nuget_archiver import NuGetArchiver
@@ -3637,6 +3796,27 @@ class GitHubArchiver(LogMixin):
         except Exception as e:
             print(f"\n  ✗ Ошибка: {e}")
             self.logger.error(f"RubyGems sync error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def run_rubygems_load_runtime(self):
+        """Загрузить Ruby runtime (первичная загрузка)"""
+        from rubygems_archiver import RubyGemsArchiver
+
+        print("\n" + "═" * 60)
+        print("  Загрузка Ruby runtime")
+        print("═" * 60)
+
+        if not self._ensure_channel_ready("rubygems", "RubyGems канал", "rubygems"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        try:
+            archiver = RubyGemsArchiver("config.yaml")
+            archiver.load_runtime()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"RubyGems runtime load error: {e}", exc_info=True)
 
         input("\n  Нажмите Enter для возврата в меню...")
 
