@@ -7,10 +7,7 @@ SoftPortal Archiver — Топ программ SoftPortal в MAX канал
 и их публикации в отдельный канал MAX (текстовые сообщения).
 """
 
-import os
-import sys
 import time
-from datetime import datetime
 from dotenv import load_dotenv
 from logging_config import setup_logging, LogMixin, SessionCapture
 
@@ -45,7 +42,7 @@ class SoftPortalArchiver(LogMixin, BrowserInitMixin):
                 self.journal.save()
                 self.browser.close()
             except Exception:
-                pass
+                self.logger.debug("Cleanup failed (ignored)")
 
     # ── Formatting helpers ──
 
@@ -119,7 +116,7 @@ class SoftPortalArchiver(LogMixin, BrowserInitMixin):
 
     # ── Category configuration ──
 
-    def _ensure_categories_configured(self) -> list[int]:
+    def ensure_categories_configured(self) -> list[int]:
         """
         Interactive category selection when config is empty.
 
@@ -227,7 +224,7 @@ class SoftPortalArchiver(LogMixin, BrowserInitMixin):
         print("═" * 60)
 
         # Ensure categories are configured
-        category_ids = self._ensure_categories_configured()
+        category_ids = self.ensure_categories_configured()
         if not category_ids:
             print("\n  ✗ Нет настроенных категорий")
             return

@@ -3930,7 +3930,7 @@ class GitHubArchiver(LogMixin):
 
         try:
             archiver = SoftPortalArchiver("config.yaml")
-            archiver._ensure_categories_configured()
+            archiver.ensure_categories_configured()
         except Exception as e:
             print(f"\n  ✗ Ошибка: {e}")
             self.logger.error(f"SoftPortal categories error: {e}", exc_info=True)
