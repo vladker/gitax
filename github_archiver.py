@@ -6,6 +6,7 @@ GitHub Archiver — Резервное копирование репозитор
 """
 
 import glob
+import json
 import os
 import re
 import sys
@@ -627,6 +628,7 @@ class GitHubArchiver(LogMixin):
         print(menu_item("6", "Cargo — Rust пакеты", "cargo"))
         print(menu_item("7", "NuGet — .NET пакеты", "nuget"))
         print(menu_item("8", "RubyGems — Ruby пакеты", "rubygems"))
+        print(menu_item("A", "SoftPortal — программы", "softportal"))
         print("  [9] Batch — параллельный запуск архиверов")
         print("  [5] Сервис — журналы, настройки")
 
@@ -703,6 +705,18 @@ class GitHubArchiver(LogMixin):
         print("  [2] Синхронизировать Ruby пакеты")
         print("  [3] Загрузить Ruby runtime (первичная)")
         print("  [4] Синхронизировать Ruby runtime")
+        print("  [0] Назад")
+        print()
+
+    def _softportal_menu(self):
+        """Подменю SoftPortal"""
+        print("\n" + "═" * 60)
+        print("  SoftPortal — программы (softportal.com)")
+        print("─" * 60)
+        print()
+        print("  [1] Загрузить топ программы")
+        print("  [2] Синхронизировать программы")
+        print("  [3] Обновить список категорий")
         print("  [0] Назад")
         print()
 
@@ -3009,6 +3023,8 @@ class GitHubArchiver(LogMixin):
                 self._run_nuget_menu()
             elif choice == '8':
                 self._run_rubygems_menu()
+            elif choice == 'A':
+                self._run_softportal_menu()
             elif choice == '9':
                 self._run_batch_mode()
 
@@ -3452,6 +3468,22 @@ class GitHubArchiver(LogMixin):
             elif choice == '4':
                 self.run_rubygems_sync_runtime()
 
+    def _run_softportal_menu(self):
+        """Цикл подменю SoftPortal"""
+        while True:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            self._softportal_menu()
+            choice = prompt_numeric_choice("Выберите действие [0-3]", ["0", "1", "2", "3"])
+
+            if choice == '0':
+                break
+            elif choice == '1':
+                self.run_softportal_archiver()
+            elif choice == '2':
+                self.run_softportal_sync()
+            elif choice == '3':
+                self.run_softportal_categories()
+
     # ── Batch Mode ────────────────────────────────────────────────
 
     def _batch_menu(self):
@@ -3472,6 +3504,8 @@ class GitHubArchiver(LogMixin):
         print("  [8] NuGet — синхронизация пакетов")
         print("  [9] RubyGems — загрузка пакетов")
         print("  [0] RubyGems — синхронизация пакетов")
+        print("  [SP] SoftPortal — загрузка программ")
+        print("  [SS] SoftPortal — синхронизация программ")
         print()
         print("  Runtime загрузка (первичная):")
         print("  [GL] GitHub — загрузка Git runtime")
@@ -3540,6 +3574,9 @@ class GitHubArchiver(LogMixin):
                 "RS": ("cargo_archiver", "CargoArchiver", "sync_runtimes", "Cargo runtime sync"),
                 "NS": ("nuget_archiver", "NuGetArchiver", "sync_runtimes", "NuGet runtime sync"),
                 "BS": ("rubygems_archiver", "RubyGemsArchiver", "sync_runtimes", "RubyGems runtime sync"),
+                # SoftPortal tasks
+                "SP": ("softportal_archiver", "SoftPortalArchiver", "load_top_programs", "SoftPortal load"),
+                "SS": ("softportal_archiver", "SoftPortalArchiver", "sync_programs", "SoftPortal sync"),
             }
 
             if choice == 'A':
@@ -3838,6 +3875,65 @@ class GitHubArchiver(LogMixin):
         except Exception as e:
             print(f"\n  ✗ Ошибка: {e}")
             self.logger.error(f"RubyGems runtime sync error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def run_softportal_archiver(self):
+        """Загрузить топ программы в MAX канал"""
+        from softportal_archiver import SoftPortalArchiver
+
+        print("\n" + "═" * 60)
+        print("  Загрузка топ программ")
+        print("═" * 60)
+
+        if not self._ensure_channel_ready("softportal", "SoftPortal канал", "softportal"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        try:
+            archiver = SoftPortalArchiver("config.yaml")
+            archiver.load_top_programs()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"SoftPortal archiver error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def run_softportal_sync(self):
+        """Синхронизировать версии программ"""
+        from softportal_archiver import SoftPortalArchiver
+
+        print("\n" + "═" * 60)
+        print("  Синхронизация программ")
+        print("═" * 60)
+
+        if not self._ensure_channel_ready("softportal", "SoftPortal канал", "softportal"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        try:
+            archiver = SoftPortalArchiver("config.yaml")
+            archiver.sync_programs()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"SoftPortal sync error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def run_softportal_categories(self):
+        """Обновить список категорий SoftPortal"""
+        from softportal_archiver import SoftPortalArchiver
+
+        print("\n" + "═" * 60)
+        print("  Обновление списка категорий")
+        print("═" * 60)
+
+        try:
+            archiver = SoftPortalArchiver("config.yaml")
+            archiver._ensure_categories_configured()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"SoftPortal categories error: {e}", exc_info=True)
 
         input("\n  Нажмите Enter для возврата в меню...")
 
