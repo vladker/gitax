@@ -11,7 +11,9 @@ from pydantic import BaseModel, Field, field_validator
 
 class ArchiverConfig(BaseModel):
     """Settings: config.yaml → archiver section."""
-    limit: int = 1000
+    limit: int = 5000
+    max_per_page: int = 100
+    use_search_api: bool = True
     split_mode: Literal["auto", "on", "off", "prompt"] = "auto"
     split_threshold_mb: int = Field(default=49, ge=1)
     large_file_threshold_mb: int = Field(default=50, ge=1)
@@ -109,6 +111,7 @@ class CargoArchiverConfig(BaseModel):
     retries: int = 3
     retry_delay: int = 10
     split_mode: Literal["auto", "on", "off", "prompt"] = "off"
+    batch_size: int = 20
 
 
 class NuGetArchiverConfig(BaseModel):

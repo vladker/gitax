@@ -350,6 +350,11 @@ class GitHubArchiver(LogMixin):
                 token = self.config.get('github', {}).get('token', '')
             output_dir = self.config.get('archiver', {}).get('output_dir', './temp')
             self.github = GitHubAPI(token, output_dir)
+        if not self.github.token:
+            self.logger.warning(
+                "⚠️ Работа без токена. Rate limit: 10 запросов/мин. "
+                "Для увеличения лимита: https://github.com/settings/tokens"
+            )
         return self.github
 
     def _init_max_browser(self) -> BrowserMAX:

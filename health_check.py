@@ -80,11 +80,10 @@ def run_health_checks(quiet: bool = False) -> bool:
     all_ok = True
     warnings: list[str] = []
 
-    # Critical checks
+    # GitHub token check (non-critical — tokenless mode supported)
     if not check_github_token():
-        msg = "  ✗ GITHUB_TOKEN не указан"
+        msg = "  ⚠ GITHUB_TOKEN не указан — работа без токена (rate limit: 10 req/min)"
         warnings.append(msg)
-        all_ok = False
 
     # 7-Zip check
     if not check_seven_zip():

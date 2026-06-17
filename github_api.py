@@ -34,13 +34,16 @@ class GitHubAPI(LogMixin):
     DEFAULT_TIMEOUT = 30  # seconds for API requests
 
     @staticmethod
-    def _mask_token(token: str) -> str:
+    def _mask_token(token: Optional[str]) -> str:
         """Return a safely masked version of the token for logging.
 
         Shows only the first 3 characters and last 2 characters,
         replacing everything in between with asterisks.
         For short tokens (< 6 chars), returns '[token:****]'.
+        For None tokens, returns '[no token]'.
         """
+        if not token:
+            return "[no token]"
         if len(token) < 6:
             return "[token:****]"
         return token[:3] + "*" * (len(token) - 5) + token[-2:]
@@ -49,10 +52,13 @@ class GitHubAPI(LogMixin):
         """Safe representation that never exposes the token."""
         return f"GitHubAPI(token={self._mask_token(self.token)!r}, output_dir={self.output_dir!r})"
 
-    def __init__(self, token: str, output_dir: str = "./temp"):
+    def __init__(self, token: Optional[str] = None, output_dir: str = "./temp"):
         self.token = token
         self.output_dir = output_dir
-        self.logger.info(f"GitHubAPI initialized with token {self._mask_token(token)}")
+        if token:
+            self.logger.info(f"GitHubAPI initialized with token {self._mask_token(token)}")
+        else:
+            self.logger.warning("Running without GitHub token. Rate limit: 60 requests/hour (anonymous) vs 5000 requests/hour (authenticated).")
         self.session = self._create_session()
         self._ensure_output_dir()
 
@@ -61,9 +67,10 @@ class GitHubAPI(LogMixin):
         session = requests.Session()
         session.headers = {
             "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {self.token}",
             "X-GitHub-Api-Version": "2022-11-28"
         }
+        if self.token:
+            session.headers["Authorization"] = f"Bearer {self.token}"
         return session
 
     def _ensure_output_dir(self):
@@ -147,45 +154,91 @@ class GitHubAPI(LogMixin):
             Список словарей с данными репозиториев
         """
         repos = []
-        per_page = min(100, limit)
-        pages = (limit + per_page - 1) // per_page
+        seen_names = set()
 
-        for page in range(1, pages + 1):
-            remaining = limit - len(repos)
-            if remaining <= 0:
-                break
-
-            current_per_page = min(per_page, remaining)
-
-            self.logger.info(f"Loading page {page}/{pages}...")
-            try:
-                response = self._request(
-                    "GET",
-                    "/search/repositories",
-                    params={
-                        "q": "stars:>1000",
-                        "sort": "stars",
-                        "order": "desc",
-                        "per_page": current_per_page,
-                        "page": page
-                    }
-                )
-            except GitHubAPIError as e:
-                self.logger.error(f"API request failed: {e}")
-                break
-
-            if response.status_code != 200:
-                self.logger.error(f"API error: {response.status_code}")
-                break
-
-            data = response.json()
-            repos.extend(data.get("items", []))
-
-            remaining_calls = response.headers.get('X-RateLimit-Remaining', 'N/A')
-            self.logger.info(f"Got {len(data.get('items', []))} repos (remaining: {remaining_calls})")
-
-            if len(data.get('items', [])) < current_per_page:
-                break
+        if limit > 1000:
+            # Use /repositories endpoint for large limits (search API caps at 1000)
+            self.logger.info(f"Limit {limit} > 1000, using /repositories endpoint")
+            per_page = 100
+            page = 1
+            while len(repos) < limit:
+                remaining = limit - len(repos)
+                current_per_page = min(per_page, remaining)
+                self.logger.info(f"Loading page {page}...")
+                try:
+                    response = self._request(
+                        "GET", "/repositories",
+                        params={
+                            "sort": "stars",
+                            "order": "desc",
+                            "per_page": current_per_page,
+                            "page": page
+                        }
+                    )
+                except GitHubAPIError as e:
+                    self.logger.error(f"API request failed: {e}")
+                    break
+                if response.status_code == 403:
+                    self.logger.error("Rate limit исчерпан. Получите токен: https://github.com/settings/tokens")
+                    break
+                if response.status_code != 200:
+                    self.logger.error(f"API error: {response.status_code}")
+                    break
+                data = response.json()
+                if not isinstance(data, list):
+                    self.logger.error("Unexpected response format")
+                    break
+                for repo in data:
+                    if repo.get("full_name") not in seen_names:
+                        seen_names.add(repo["full_name"])
+                        repos.append(repo)
+                remaining_calls = response.headers.get('X-RateLimit-Remaining', 'N/A')
+                self.logger.info(f"Got {len(data)} repos (remaining: {remaining_calls})")
+                if len(data) < current_per_page:
+                    break
+                if not self.token:
+                    time.sleep(0.5)
+                page += 1
+        else:
+            # Existing search API logic (keep as-is)
+            per_page = min(100, limit)
+            pages = (limit + per_page - 1) // per_page
+            for page in range(1, pages + 1):
+                remaining = limit - len(repos)
+                if remaining <= 0:
+                    break
+                current_per_page = min(per_page, remaining)
+                self.logger.info(f"Loading page {page}/{pages}...")
+                try:
+                    response = self._request(
+                        "GET",
+                        "/search/repositories",
+                        params={
+                            "q": "stars:>1000",
+                            "sort": "stars",
+                            "order": "desc",
+                            "per_page": current_per_page,
+                            "page": page
+                        }
+                    )
+                except GitHubAPIError as e:
+                    self.logger.error(f"API request failed: {e}")
+                    break
+                if response.status_code == 403:
+                    self.logger.error("Rate limit исчерпан. Получите токен: https://github.com/settings/tokens")
+                    break
+                if response.status_code != 200:
+                    self.logger.error(f"API error: {response.status_code}")
+                    break
+                data = response.json()
+                for repo in data.get("items", []):
+                    if repo.get("full_name") not in seen_names:
+                        seen_names.add(repo["full_name"])
+                        repos.append(repo)
+                remaining_calls = response.headers.get('X-RateLimit-Remaining', 'N/A')
+                self.logger.info(f"Got {len(data.get('items', []))} repos (remaining: {remaining_calls})")
+                if len(data.get('items', [])) < current_per_page:
+                    break
 
         self.logger.info(f"Total repositories loaded: {len(repos)}")
         return repos
