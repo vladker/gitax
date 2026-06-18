@@ -195,6 +195,17 @@ class GitHubConfig(BaseModel):
     token: str = ""
 
 
+class RepoCollectorConfig(BaseModel):
+    """Settings: config.yaml → repo_collector section.
+
+    Controls tiered repository collection to bypass the 1000-repo
+    GitHub Search API cap. Each tier is a separate search query.
+    """
+    enabled: bool = True
+    tiers_per_run: int = Field(default=2, ge=1, le=10)
+    per_page: int = Field(default=100, ge=1, le=100)
+
+
 VALID_CHANNEL_FUNCTIONS = ("github", "pypi", "media", "backup", "npm", "cargo", "nuget", "rubygems", "softportal")
 
 
@@ -272,6 +283,7 @@ class AppConfig(BaseModel):
     setup: SetupConfig = SetupConfig()
     batch: BatchConfig = BatchConfig()
     github: GitHubConfig = GitHubConfig()
+    repo_collector: RepoCollectorConfig = RepoCollectorConfig()
     runtime: RuntimeConfig = RuntimeConfig()
     channel_registry: ChannelRegistry = Field(default_factory=ChannelRegistry)
 

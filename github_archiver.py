@@ -21,6 +21,7 @@ from logging_config import setup_logging, LogMixin, SessionCapture
 from journal import Journal
 from github_api import GitHubAPI
 from browser_max import BrowserMAX
+from repo_collector import RepoCollector
 from scroll_registry import ScrollRegistry
 from pypi_libs_journal import PyPILibsJournal
 from config_utils import get_channel_url, is_setup_complete, ensure_channel_url, get_skipped_channels, get_split_mode, get_channels_for_function
@@ -289,6 +290,7 @@ class GitHubArchiver(LogMixin):
             "pypi": "pypi",
             "media": "media",
             "backup": "backup",
+            "softportal": "softportal",
         }
         function = _CHANNEL_TO_FUNCTION.get(channel_name, channel_name)
 
@@ -298,6 +300,10 @@ class GitHubArchiver(LogMixin):
             self._active_channel_url = selected.url
             self._active_channel_label = selected.label or selected.url
             print(f"  ✓ Канал: {self._active_channel_label}")
+            # Set env var so child archiver instances find the URL on config reload
+            env_var = f"CHANNEL_{channel_name.upper()}"
+            os.environ[env_var] = selected.url
+            self.config.setdefault("channels", {})[channel_name] = selected.url
         else:
             # Fall back to legacy config
             url = ensure_channel_url(self.config, channel_name, label)
@@ -633,8 +639,7 @@ class GitHubArchiver(LogMixin):
         print(menu_item("6", "Cargo — Rust пакеты", "cargo"))
         print(menu_item("7", "NuGet — .NET пакеты", "nuget"))
         print(menu_item("8", "RubyGems — Ruby пакеты", "rubygems"))
-        print(menu_item("A", "SoftPortal — программы", "softportal"))
-        print("  [9] Batch — параллельный запуск архиверов")
+        print(menu_item("9", "SoftPortal — программы", "softportal"))
         print("  [5] Сервис — журналы, настройки")
 
         if not is_setup_complete(self.config):
@@ -654,10 +659,12 @@ class GitHubArchiver(LogMixin):
         print()
         print("  [1] Синхронизировать репозитории")
         print("  [2] Загрузить новые репозитории")
-        print("  [3] Загрузить Git runtime (первичная)")
-        print("  [4] Синхронизировать Git runtime")
-        print(f"  [5] Список игнорирования{ignored_str}")
-        print("  [6] Аудит — очистка / восстановление публикаций")
+        print("  [3] Собрать базу репозиториев (tiered)")
+        print("  [4] Статус коллекции репозиториев")
+        print("  [5] Загрузить Git runtime (первичная)")
+        print("  [6] Синхронизировать Git runtime")
+        print(f"  [7] Список игнорирования{ignored_str}")
+        print("  [8] Аудит — очистка / восстановление публикаций")
         print("  [0] Назад")
         print()
 
@@ -749,6 +756,7 @@ class GitHubArchiver(LogMixin):
             print("  [2] ⚙ Настройки")
         print("  [3] Каналы — управление каналами")
         print("  [4] Верификация журналов")
+        print("  [5] Batch — параллельный запуск архиверов")
         print("  [0] Назад")
         print()
 
@@ -1085,8 +1093,6 @@ class GitHubArchiver(LogMixin):
             print("\n  ✗ Не удалось получить репозитории")
             input("\n  Нажмите Enter для возврата в меню...")
             return
-
-        print(f"  ✓ Получено {len(top_repos)} репозиториев")
 
         # Получить updated_at для фильтрации дублей (без доп. API запросов)
         repos_to_process = []
@@ -3028,17 +3034,15 @@ class GitHubArchiver(LogMixin):
                 self._run_nuget_menu()
             elif choice == '8':
                 self._run_rubygems_menu()
-            elif choice == 'A':
-                self._run_softportal_menu()
             elif choice == '9':
-                self._run_batch_mode()
+                self._run_softportal_menu()
 
     def _run_github_menu(self):
         """Цикл подменю GitHub"""
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
             self._github_menu()
-            choice = prompt_numeric_choice("Выберите действие [0-6]", ["0", "1", "2", "3", "4", "5", "6"])
+            choice = prompt_numeric_choice("Выберите действие [0-8]", ["0", "1", "2", "3", "4", "5", "6", "7", "8"])
 
             if choice == '0':
                 break
@@ -3047,13 +3051,56 @@ class GitHubArchiver(LogMixin):
             elif choice == '2':
                 self.load_new_repositories()
             elif choice == '3':
-                self.load_runtime()
+                self._collect_repos()
             elif choice == '4':
-                self.sync_runtimes()
+                self._show_collector_status()
             elif choice == '5':
-                self._manage_ignore_list()
+                self.load_runtime()
             elif choice == '6':
+                self.sync_runtimes()
+            elif choice == '7':
+                self._manage_ignore_list()
+            elif choice == '8':
                 self.audit_and_restore_publications()
+
+    def _collect_repos(self):
+        """Собрать базу репозиториев через tiered-коллектор"""
+        print("\n" + "═" * 60)
+        print("Сбор базы репозиториев (tiered)")
+        print("═" * 60)
+
+        self._init_github()
+
+        rc_config = self.config.get('repo_collector', {})
+        tiers_per_run = rc_config.get('tiers_per_run', 2)
+        per_page = rc_config.get('per_page', 100)
+
+        collector = RepoCollector(
+            github_api=self.github,
+            per_page=per_page,
+        )
+
+        print(f"\n  Настройки: {tiers_per_run} тир за запуск, {per_page} репо/страница")
+
+        try:
+            stats = collector.collect_next_tiers(count=tiers_per_run)
+        except Exception as e:
+            print(f"\n  ✗ Ошибка сбора: {e}")
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def _show_collector_status(self):
+        """Показать статус коллектора"""
+        from repo_collector import RepoDatabase, RepoCollectorState
+
+        self._init_github()
+
+        collector = RepoCollector(github_api=self.github)
+        collector.show_status()
+
+        input("\n  Нажмите Enter для возврата в меню...")
 
     def _run_pypi_menu(self):
         """Цикл подменю PyPI"""
@@ -3123,11 +3170,11 @@ class GitHubArchiver(LogMixin):
             self._service_menu()
             setup_done = is_setup_complete(self.config)
             if setup_done:
-                valid_opts = ["0", "1", "2", "3", "4"]
-                prompt_text = "Выберите действие [0-4]"
+                valid_opts = ["0", "1", "2", "3", "4", "5"]
+                prompt_text = "Выберите действие [0-5]"
             else:
-                valid_opts = ["0", "1", "3", "4"]
-                prompt_text = "Выберите действие [0-4]"
+                valid_opts = ["0", "1", "3", "4", "5"]
+                prompt_text = "Выберите действие [0-5]"
             choice = prompt_numeric_choice(prompt_text, valid_opts)
 
             if choice == '0':
@@ -3140,6 +3187,8 @@ class GitHubArchiver(LogMixin):
                 channel_registry_menu()
             elif choice == '4':
                 self._run_verifier()
+            elif choice == '5':
+                self._run_batch_mode()
 
 
     def _run_verifier(self):
