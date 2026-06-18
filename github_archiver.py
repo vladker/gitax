@@ -1067,7 +1067,12 @@ class GitHubArchiver(LogMixin):
         input("\n  Нажмите Enter для возврата в меню...")
 
     def load_new_repositories(self):
-        """Загрузка новых репозиториев"""
+        """Загрузка новых репозиториев
+
+        Источник репозиториев определяется автоматически:
+        1. Если repo_database.json существует и содержит данные — используется она
+        2. Иначе — fallback на GitHub Search API (как раньше)
+        """
         print("\n" + "═" * 60)
         print("Загрузка новых репозиториев")
         print("═" * 60)
@@ -1080,19 +1085,30 @@ class GitHubArchiver(LogMixin):
 
         self._init_github()
 
-        print(f"\n  Запрашиваю топ-{limit} репозиториев с GitHub...")
+        # ── Determine source ──────────────────────────────────
+        from repo_collector import RepoDatabase as _RepoDatabase
 
-        try:
-            top_repos = self.github.get_top_repositories(limit)
-        except Exception as e:
-            print(f"\n  ✗ Ошибка загрузки с GitHub: {e}")
-            input("\n  Нажмите Enter для возврата в меню...")
-            return
+        repo_db = _RepoDatabase()
+        db_count = repo_db.get_count()
 
-        if not top_repos:
-            print("\n  ✗ Не удалось получить репозитории")
-            input("\n  Нажмите Enter для возврата в меню...")
-            return
+        if db_count > 0:
+            # Use repo_database.json as source
+            print(f"\n  Источник: repo_database.json ({db_count} репозиториев)")
+            top_repos = repo_db.get_all_sorted(sort_by="stars", reverse=True)
+        else:
+            # Fallback to GitHub Search API
+            print(f"\n  Запрашиваю топ-{limit} репозиториев с GitHub...")
+            try:
+                top_repos = self.github.get_top_repositories(limit)
+            except Exception as e:
+                print(f"\n  ✗ Ошибка загрузки с GitHub: {e}")
+                input("\n  Нажмите Enter для возврата в меню...")
+                return
+
+            if not top_repos:
+                print("\n  ✗ Не удалось получить репозитории")
+                input("\n  Нажмите Enter для возврата в меню...")
+                return
 
         # Получить updated_at для фильтрации дублей (без доп. API запросов)
         repos_to_process = []
