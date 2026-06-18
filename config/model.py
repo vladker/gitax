@@ -8,12 +8,14 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+import logging
+
+_logger = logging.getLogger("gitax")
+
 
 class ArchiverConfig(BaseModel):
     """Settings: config.yaml → archiver section."""
-    limit: int = 5000
-    max_per_page: int = 100
-    use_search_api: bool = True
+    limit: int = 1000
     split_mode: Literal["auto", "on", "off", "prompt"] = "auto"
     split_threshold_mb: int = Field(default=49, ge=1)
     large_file_threshold_mb: int = Field(default=50, ge=1)
@@ -22,6 +24,23 @@ class ArchiverConfig(BaseModel):
     retries: int = 3
     retry_delay: int = 10
     repo_delay: int = 30
+
+    @field_validator("limit")
+    @classmethod
+    def cap_limit_at_1000(cls, v: int) -> int:
+        """Cap limit at 1000 — GitHub Search API hard limit.
+
+        The /repositories endpoint does NOT sort by stars
+        (valid sort values: created, updated, pushed, full_name).
+        Search API is the only way to get repos sorted by star count.
+        """
+        if v > 1000:
+            _logger.warning(
+                f"archiver.limit={v} exceeds GitHub Search API cap (1000). "
+                f"Capped to 1000. The /repositories endpoint does not sort by stars."
+            )
+            return 1000
+        return v
 
 
 class BrowserConfig(BaseModel):
@@ -41,6 +60,7 @@ class ChannelsConfig(BaseModel):
     cargo: str = ""
     nuget: str = ""
     rubygems: str = ""
+    softportal: str = ""
 
 
 class BackuperConfig(BaseModel):
@@ -84,6 +104,16 @@ class MediaArchiverConfig(BaseModel):
     use_local_browser: bool = False
     retries: int = 3
     retry_delay: int = 10
+
+
+class SoftPortalArchiverConfig(BaseModel):
+    """Settings: config.yaml → softportal_archiver section."""
+    limit: int = 50
+    output_dir: str = "./temp_softportal"
+    retries: int = 3
+    retry_delay: int = 10
+    download_files: bool = True
+    categories: list[int] = Field(default_factory=list)
 
 
 class PyPILibsArchiverConfig(BaseModel):
@@ -165,7 +195,7 @@ class GitHubConfig(BaseModel):
     token: str = ""
 
 
-VALID_CHANNEL_FUNCTIONS = ("github", "pypi", "media", "backup", "npm", "cargo", "nuget", "rubygems")
+VALID_CHANNEL_FUNCTIONS = ("github", "pypi", "media", "backup", "npm", "cargo", "nuget", "rubygems", "softportal")
 
 
 class ChannelEntry(BaseModel):
@@ -192,6 +222,7 @@ class ChannelRegistry(BaseModel):
     cargo: list[ChannelEntry] = Field(default_factory=list)
     nuget: list[ChannelEntry] = Field(default_factory=list)
     rubygems: list[ChannelEntry] = Field(default_factory=list)
+    softportal: list[ChannelEntry] = Field(default_factory=list)
 
     def get_enabled(self, function: str) -> list[ChannelEntry]:
         """Return enabled channels for a function."""
@@ -232,6 +263,7 @@ class AppConfig(BaseModel):
     backuper: BackuperConfig = BackuperConfig()
     channel_downloader: ChannelDownloaderConfig = ChannelDownloaderConfig()
     media_archiver: MediaArchiverConfig = MediaArchiverConfig()
+    softportal_archiver: SoftPortalArchiverConfig = SoftPortalArchiverConfig()
     pypi_libs_archiver: PyPILibsArchiverConfig = PyPILibsArchiverConfig()
     npm_archiver: NpmArchiverConfig = NpmArchiverConfig()
     cargo_archiver: CargoArchiverConfig = CargoArchiverConfig()
@@ -255,6 +287,7 @@ class AppConfig(BaseModel):
         self.channels.cargo = ""
         self.channels.nuget = ""
         self.channels.rubygems = ""
+        self.channels.softportal = ""
 
     def save(self) -> None:
         """Persist config to YAML file.
