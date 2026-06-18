@@ -1069,9 +1069,8 @@ class GitHubArchiver(LogMixin):
     def load_new_repositories(self):
         """Загрузка новых репозиториев
 
-        Источник репозиториев определяется автоматически:
-        1. Если repo_database.json существует и содержит данные — используется она
-        2. Иначе — fallback на GitHub Search API (как раньше)
+        Автоматический автосбор: если в базе меньше репо чем запрошено,
+        система сама собирает недостающие тира через tiered-коллектор.
         """
         print("\n" + "═" * 60)
         print("Загрузка новых репозиториев")
@@ -1085,30 +1084,32 @@ class GitHubArchiver(LogMixin):
 
         self._init_github()
 
-        # ── Determine source ──────────────────────────────────
-        from repo_collector import RepoDatabase as _RepoDatabase
+        # ── Auto-collect if needed ────────────────────────────
+        from repo_collector import RepoCollector as _RepoCollector
 
-        repo_db = _RepoDatabase()
-        db_count = repo_db.get_count()
+        collector = _RepoCollector(
+            self.github,
+            per_page=self.config.get('repo_collector', {}).get('per_page', 100),
+        )
 
-        if db_count > 0:
-            # Use repo_database.json as source
-            print(f"\n  Источник: repo_database.json ({db_count} репозиториев)")
-            top_repos = repo_db.get_all_sorted(sort_by="stars", reverse=True)
-        else:
-            # Fallback to GitHub Search API
-            print(f"\n  Запрашиваю топ-{limit} репозиториев с GitHub...")
-            try:
-                top_repos = self.github.get_top_repositories(limit)
-            except Exception as e:
-                print(f"\n  ✗ Ошибка загрузки с GitHub: {e}")
-                input("\n  Нажмите Enter для возврата в меню...")
-                return
+        db_count_before = collector.database.get_count()
+        print(f"\n  Целевое количество: {limit} репозиториев")
+        print(f"  Текущая база: {db_count_before} репозиториев")
 
-            if not top_repos:
-                print("\n  ✗ Не удалось получить репозитории")
-                input("\n  Нажмите Enter для возврата в меню...")
-                return
+        if db_count_before < limit:
+            collector.collect_until_count(limit)
+        elif db_count_before > 0:
+            print(f"\n  ✓ Базы достаточно ({db_count_before} >= {limit})")
+
+        # ── Get top N from database (sorted by stars) ─────────
+        top_repos = collector.database.get_all_sorted(
+            sort_by="stargazers_count", reverse=True
+        )
+
+        if not top_repos:
+            print("\n  ✗ Не удалось получить репозитории")
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
 
         # Получить updated_at для фильтрации дублей (без доп. API запросов)
         repos_to_process = []
@@ -1605,6 +1606,7 @@ class GitHubArchiver(LogMixin):
         from media_archiver import MediaJournal
         from channel_downloader import DownloadJournal
         from backuper_journal import BackuperJournal
+        from softportal_journal import SoftPortalJournal
 
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
@@ -1628,6 +1630,8 @@ class GitHubArchiver(LogMixin):
             nj_stats = nj.get_stats()
             rj = _GenericJournal("rubygems_journal.json")
             rj_stats = rj.get_stats()
+            spj = SoftPortalJournal("softportal_journal.json")
+            spj_stats = spj.get_stats()
 
             print(f"\n  Текущее состояние журналов:")
             print(f"  [1] journal.json — {j_stats['total']} репозиториев "
@@ -1646,6 +1650,8 @@ class GitHubArchiver(LogMixin):
                   f"({nj_stats['sent']} отправлено, {nj_stats['failed']} ошибок)")
             print(f"  [8] rubygems_journal.json — {rj_stats['total']} пакетов "
                   f"({rj_stats['sent']} отправлено, {rj_stats['failed']} ошибок)")
+            print(f"  [9] softportal_journal.json — {spj_stats['total']} программ "
+                  f"({spj_stats.get('failed_count', 0)} неудачных)")
 
             print()
             print("  [1] Очистить journal.json")
@@ -1656,14 +1662,34 @@ class GitHubArchiver(LogMixin):
             print("  [6] Очистить cargo_journal.json")
             print("  [7] Очистить nuget_journal.json")
             print("  [8] Очистить rubygems_journal.json")
-            print("  [9] Очистить ВСЕ журналы")
+            print("  [9] Очистить softportal_journal.json")
+            print("  [-] Очистить ВСЕ журналы")
             print("  [0] Назад")
             print()
 
-            choice = prompt_numeric_choice("Ваш выбор [0-9]", ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"])
+            choice = input("  Ваш выбор: ").strip()
 
             if choice == '0':
                 break
+
+            if choice == '-':
+                print("\n  ⚠ ВНИМАНИЕ: Будут очищены ВСЕ журналы!")
+                confirm = input("  Введите 'ДА' для подтверждения: ").strip().lower()
+                if confirm in ('да', 'yes', 'дa'):
+                    self.journal.clear()
+                    MediaJournal("media_journal.json").clear()
+                    DownloadJournal("download_journal.json").clear()
+                    PyPILibsJournal("pypi_libs_journal.json").clear()
+                    BackuperJournal("backuper_journal.json").clear()
+                    _GenericJournal("cargo_journal.json").clear()
+                    _GenericJournal("nuget_journal.json").clear()
+                    _GenericJournal("rubygems_journal.json").clear()
+                    SoftPortalJournal("softportal_journal.json").reset()
+                    print("  ✓ Все журналы очищены")
+                else:
+                    print("  Отменено")
+                input("\n  Нажмите Enter для продолжения...")
+                continue
 
             elif choice == '1':
                 confirm = input("\n  Очистить journal.json? [y/N]: ").strip().lower()
@@ -1738,18 +1764,10 @@ class GitHubArchiver(LogMixin):
                 input("\n  Нажмите Enter для продолжения...")
 
             elif choice == '9':
-                print("\n  ⚠ ВНИМАНИЕ: Будут очищены ВСЕ журналы!")
-                confirm = input("  Введите 'ДА' для подтверждения: ").strip().lower()
-                if confirm in ('да', 'yes', 'дa'):
-                    self.journal.clear()
-                    MediaJournal("media_journal.json").clear()
-                    DownloadJournal("download_journal.json").clear()
-                    PyPILibsJournal("pypi_libs_journal.json").clear()
-                    BackuperJournal("backuper_journal.json").clear()
-                    _GenericJournal("cargo_journal.json").clear()
-                    _GenericJournal("nuget_journal.json").clear()
-                    _GenericJournal("rubygems_journal.json").clear()
-                    print("  ✓ Все журналы очищены")
+                confirm = input("\n  Очистить softportal_journal.json? [y/N]: ").strip().lower()
+                if confirm in ('y', 'yes', 'д', 'да'):
+                    SoftPortalJournal("softportal_journal.json").reset()
+                    print("  ✓ softportal_journal.json очищен")
                 else:
                     print("  Отменено")
                 input("\n  Нажмите Enter для продолжения...")

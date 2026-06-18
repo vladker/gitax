@@ -88,7 +88,7 @@ class RepoDatabase(BaseJournal):
         return any(r.get("full_name") == full_name
                    for r in self.data.get("repositories", []))
 
-    def get_all_sorted(self, sort_by: str = "stars", reverse: bool = True) -> list[dict]:
+    def get_all_sorted(self, sort_by: str = "stargazers_count", reverse: bool = True) -> list[dict]:
         """Получить все репозитории, отсортированные."""
         repos = self.data.get("repositories", [])
         return sorted(repos, key=lambda r: r.get(sort_by, 0), reverse=reverse)
@@ -320,6 +320,75 @@ class RepoCollector(LogMixin):
         print(f"  Всего в базе: {after_count} репозиториев")
 
         return stats
+
+    def collect_until_count(self, target_count: int) -> dict:
+        """Собрать тира пока база не достигнет target_count репозиториев.
+
+        Args:
+            target_count: Желаемое количество репозиториев в базе
+
+        Returns:
+            Словарь со статистикой (tiers_collected, repos_before, repos_after)
+        """
+        tier_names = [t["name"] for t in self.tiers]
+        start_index = self.state.get_next_tier_index(tier_names)
+
+        if start_index >= len(self.tiers):
+            print("\n  ✓ Все тира уже собраны!")
+            print(f"     В базе: {self.database.get_count()} репозиториев")
+            return {
+                "status": "exhausted",
+                "tiers_collected": 0,
+                "repos_before": self.database.get_count(),
+                "repos_after": self.database.get_count(),
+            }
+
+        before_count = self.database.get_count()
+        if before_count >= target_count:
+            return {
+                "status": "satisfied",
+                "tiers_collected": 0,
+                "repos_before": before_count,
+                "repos_after": before_count,
+            }
+
+        original_count = before_count
+        deficit = target_count - before_count
+        print(f"\n  База: {before_count} репо, нужно: {target_count} (дефицит: {deficit})")
+        print(f"  Автосбор тиров...\n")
+
+        collected_tiers = []
+        for i in range(start_index, len(self.tiers)):
+            if self.database.get_count() >= target_count:
+                break
+
+            tier = self.tiers[i]
+            try:
+                self.collect_tier(tier)
+                tier_name = tier["name"]
+                self.state.mark_tier_done(
+                    tier_name,
+                    self.database.get_count() - before_count,
+                )
+                collected_tiers.append(tier_name)
+                before_count = self.database.get_count()
+                print(f"  Промежуточный итог: {before_count} репо / {target_count} целевых")
+            except Exception as e:
+                self.logger.error(f"Failed to collect tier '{tier['name']}': {e}")
+                print(f"     ✗ Ошибка тира '{tier['name']}': {e}")
+
+        after_count = self.database.get_count()
+        print(f"\n  === Результат автосбора ===")
+        print(f"  Собрано тиров: {len(collected_tiers)}")
+        print(f"  Всего в базе: {after_count} репозиториев")
+
+        return {
+            "status": "satisfied" if after_count >= target_count else "partial",
+            "tiers_collected": len(collected_tiers),
+            "tier_names": collected_tiers,
+            "repos_before": original_count,
+            "repos_after": after_count,
+        }
 
     def get_repos_for_archiver(self, journal) -> list[dict]:
         """Получить репозитории из базы, которых ещё нет в журнале.
