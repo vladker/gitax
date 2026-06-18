@@ -22,14 +22,24 @@ from shared_journal import BaseJournal
 # ── Tier definitions ────────────────────────────────────────────
 
 DEFAULT_TIERS = [
+    # ── Star-based tiers (top repos regardless of language) ──
     {"name": "legend",    "query": "stars:>50000",  "label": "Легенды (50k+)"},
     {"name": "popular",   "query": "stars:>10000",  "label": "Популярные (10k+)"},
     {"name": "well-known","query": "stars:>5000",   "label": "Известные (5k+)"},
-    {"name": "notable",   "query": "stars:>1000",   "label": "Заметные (1k+)"},
-    {"name": "active",    "query": "stars:>500",    "label": "Активные (500+)"},
-    {"name": "emerging",  "query": "stars:>100",    "label": "Растущие (100+)"},
-    {"name": "small",     "query": "stars:>10",     "label": "Маленькие (10+)"},
-    {"name": "tiny",      "query": "stars:>1",      "label": "Микро (1+)"},
+
+    # ── Language-specific tiers (diversifies beyond star overlap) ──
+    {"name": "lang-js",     "query": "language:JavaScript stars:>500",  "label": "JavaScript (500+)"},
+    {"name": "lang-py",     "query": "language:Python stars:>500",      "label": "Python (500+)"},
+    {"name": "lang-ts",     "query": "language:TypeScript stars:>500",  "label": "TypeScript (500+)"},
+    {"name": "lang-rust",   "query": "language:Rust stars:>500",        "label": "Rust (500+)"},
+    {"name": "lang-go",     "query": "language:Go stars:>500",          "label": "Go (500+)"},
+    {"name": "lang-java",   "query": "language:Java stars:>500",        "label": "Java (500+)"},
+    {"name": "lang-cpp",    "query": "language:C++ stars:>500",         "label": "C++ (500+)"},
+    {"name": "lang-rb",     "query": "language:Ruby stars:>500",        "label": "Ruby (500+)"},
+    {"name": "lang-php",    "query": "language:PHP stars:>500",         "label": "PHP (500+)"},
+    {"name": "lang-swift",  "query": "language:Swift stars:>500",       "label": "Swift (500+)"},
+    {"name": "lang-kotlin", "query": "language:Kotlin stars:>500",      "label": "Kotlin (500+)"},
+    {"name": "lang-cs",     "query": "language:C# stars:>500",          "label": "C# (500+)"},
 ]
 
 
