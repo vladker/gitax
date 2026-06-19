@@ -659,12 +659,12 @@ class GitHubArchiver(LogMixin):
         print()
         print("  [1] Синхронизировать репозитории")
         print("  [2] Загрузить новые репозитории")
-        print("  [3] Собрать базу репозиториев (tiered)")
+        print("  [3] Собрать базу репозиториев")
         print("  [4] Статус коллекции репозиториев")
-        print("  [5] Загрузить Git runtime (первичная)")
-        print("  [6] Синхронизировать Git runtime")
-        print(f"  [7] Список игнорирования{ignored_str}")
-        print("  [8] Аудит — очистка / восстановление публикаций")
+        print("  [6] Загрузить Git runtime (первичная)")
+        print("  [7] Синхронизировать Git runtime")
+        print(f"  [8] Список игнорирования{ignored_str}")
+        print("  [9] Аудит — очистка / восстановление публикаций")
         print("  [0] Назад")
         print()
 
@@ -1128,16 +1128,21 @@ class GitHubArchiver(LogMixin):
             existing = self.journal.get_repository(full_name)
             if existing:
                 # Репозиторий уже есть в журнале
-                existing_updated = existing.get('updated_at', '')
-                if not existing_updated:
-                    # Старая запись без updated_at — уже отправлен
-                    skipped_already_sent += 1
-                elif existing_updated == updated_at:
-                    # Та же дата — пропускаем
-                    skipped_already_sent += 1
+                existing_status = existing.get('status', '')
+                if existing_status in ('failed', 'incomplete'):
+                    # Неудачная загрузка — повторим
+                    repos_to_process.append(repo_info)
                 else:
-                    # Дата изменилась — это обновление для sync_repositories
-                    skipped_different_version += 1
+                    existing_updated = existing.get('updated_at', '')
+                    if not existing_updated:
+                        # Старая запись без updated_at — уже отправлен
+                        skipped_already_sent += 1
+                    elif existing_updated == updated_at:
+                        # Та же дата — пропускаем
+                        skipped_already_sent += 1
+                    else:
+                        # Дата изменилась — это обновление для sync_repositories
+                        skipped_different_version += 1
                 continue
 
             repos_to_process.append(repo_info)
@@ -3098,15 +3103,23 @@ class GitHubArchiver(LogMixin):
                 self.audit_and_restore_publications()
 
     def _collect_repos(self):
-        """Собрать базу репозиториев через tiered-коллектор"""
+        """Собрать базу репозиториев до указанного лимита через оркестратор.
+
+        Использует все доступные стратегии:
+          1. GraphQL (cursor pagination, bypass 1000 cap)
+          2. REST tiered search (stars + languages)
+          3. Crawler (trending)
+          4. Topic search
+
+        Работает как с токеном, так и без него (REST/crawler работают без токена).
+        """
         print("\n" + "═" * 60)
-        print("Сбор базы репозиториев (tiered)")
+        print("Сбор базы репозиториев")
         print("═" * 60)
 
         self._init_github()
 
         rc_config = self.config.get('repo_collector', {})
-        tiers_per_run = rc_config.get('tiers_per_run', 2)
         per_page = rc_config.get('per_page', 100)
 
         collector = RepoCollector(
@@ -3114,10 +3127,29 @@ class GitHubArchiver(LogMixin):
             per_page=per_page,
         )
 
-        print(f"\n  Настройки: {tiers_per_run} тир за запуск, {per_page} репо/страница")
+        # Show current status
+        db_count = collector.database.get_count()
+        print(f"\n  Текущая база: {db_count} репозиториев")
+
+        # Prompt for target count
+        default_target = self.config.get('archiver', {}).get('limit', 5000)
+        while True:
+            try:
+                target_input = input(
+                    f"\n  Целевой лимит репозиториев (по умолчанию {default_target}): "
+                ).strip()
+                if not target_input:
+                    target_count = default_target
+                else:
+                    target_count = int(target_input)
+                if target_count > 0:
+                    break
+                print("  Введите положительное число.")
+            except ValueError:
+                print("  Неверный формат. Введите число.")
 
         try:
-            stats = collector.collect_next_tiers(count=tiers_per_run)
+            stats = collector.collect_all_strategies(target_count)
         except Exception as e:
             print(f"\n  ✗ Ошибка сбора: {e}")
             input("\n  Нажмите Enter для возврата в меню...")

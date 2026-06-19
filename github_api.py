@@ -31,7 +31,7 @@ class GitHubAPI(LogMixin):
     """Класс для работы с GitHub API"""
 
     BASE_URL = "https://api.github.com"
-    DEFAULT_TIMEOUT = 30  # seconds for API requests
+    DEFAULT_TIMEOUT = 10  # seconds for API requests
 
     @staticmethod
     def _mask_token(token: Optional[str]) -> str:
@@ -347,7 +347,7 @@ class GitHubAPI(LogMixin):
 
         try:
             self.logger.info(f"Downloading: {url}")
-            response = self.session.get(url, stream=True, timeout=120)
+            response = self.session.get(url, stream=True, timeout=30)
 
             if response.status_code == 404:
                 return None
@@ -428,6 +428,163 @@ class GitHubAPI(LogMixin):
                 return result
 
         return None
+
+    GRAPHQL_URL = "https://api.github.com/graphql"
+
+    def graphql_query(self, query: str, variables: Optional[dict] = None) -> Optional[dict]:
+        """
+        Execute a GitHub GraphQL query.
+
+        GraphQL has higher rate limits (5000 points/hour vs 5000 REST req/hour)
+        and supports cursor pagination beyond the 1000-result REST search cap.
+
+        Args:
+            query: GraphQL query string
+            variables: Optional variables dict
+
+        Returns:
+            Parsed JSON response or None on error
+        """
+        payload = {"query": query}
+        if variables:
+            payload["variables"] = variables
+
+        while True:
+            try:
+                response = self.session.post(
+                    self.GRAPHQL_URL,
+                    json=payload,
+                    timeout=self.DEFAULT_TIMEOUT,
+                )
+            except requests.exceptions.ConnectionError as e:
+                self.logger.error(f"GraphQL connection error: {e}")
+                return None
+
+            if response.status_code == 403:
+                body_preview = response.text.lower()[:500]
+                if "rate limit" in body_preview:
+                    reset_time = response.headers.get("X-RateLimit-Reset")
+                    if reset_time:
+                        wait = int(reset_time) - int(time.time()) + 5
+                        if wait > 0:
+                            self.logger.warning(f"GraphQL rate limit. Waiting {min(wait, 60)}s...")
+                            time.sleep(min(wait, 60))
+                            continue
+                return None
+
+            if response.status_code >= 500:
+                self.logger.warning(f"GraphQL server error ({response.status_code}). Retrying...")
+                time.sleep(5)
+                continue
+
+            if response.status_code != 200:
+                self.logger.error(f"GraphQL error: {response.status_code} - {response.text[:200]}")
+                return None
+
+            data = response.json()
+            if "errors" in data:
+                self.logger.error(f"GraphQL errors: {data['errors']}")
+                return None
+            return data.get("data")
+
+    def search_repos_graphql(
+        self,
+        star_threshold: int = 100,
+        max_repos: int = 1000,
+        per_page: int = 100,
+    ) -> list[dict]:
+        """
+        Search repositories via GraphQL with cursor pagination.
+
+        Bypasses the REST 1000-result limit by paginating through results.
+
+        Args:
+            star_threshold: Minimum stars filter
+            max_repos: Maximum repos to fetch
+            per_page: Results per page (max 100)
+
+        Returns:
+            List of repo dicts (same shape as REST search items)
+        """
+        query = """
+            query SearchRepos($query: String!, $first: Int, $after: String) {
+                search(query: $query, type: REPOSITORY, first: $first, after: $after) {
+                    pageInfo {
+                        hasNextPage
+                        endCursor
+                    }
+                    repositoryCount
+                    nodes {
+                        ... on Repository {
+                            name
+                            nameWithOwner
+                            url
+                            description
+                            stargazers { totalCount }
+                            forkCount
+                            defaultBranchRef { name }
+                            primaryLanguage { name }
+                            updatedAt
+                            pushedAt
+                        }
+                    }
+                }
+            }
+        """
+
+        repos = []
+        seen = set()
+        search_query = f"stars:>{star_threshold} sort:stars-desc"
+        cursor = None
+
+        self.logger.info(
+            f"GraphQL search: stars>{star_threshold}, max={max_repos}, per_page={per_page}"
+        )
+
+        while len(repos) < max_repos:
+            variables = {
+                "query": search_query,
+                "first": min(per_page, max_repos - len(repos)),
+            }
+            if cursor:
+                variables["after"] = cursor
+
+            data = self.graphql_query(query, variables)
+            if not data:
+                break
+
+            search = data.get("search", {})
+            nodes = search.get("nodes", [])
+            page_info = search.get("pageInfo", {})
+
+            for node in nodes:
+                full_name = node.get("nameWithOwner", "")
+                if full_name in seen:
+                    continue
+                seen.add(full_name)
+
+                repos.append({
+                    "name": node.get("name", ""),
+                    "full_name": full_name,
+                    "html_url": node.get("url", ""),
+                    "description": node.get("description") or "",
+                    "stargazers_count": node.get("stargazers", {}).get("totalCount", 0),
+                    "forks_count": node.get("forkCount", 0),
+                    "default_branch": node.get("defaultBranchRef", {}).get("name", "main"),
+                    "language": node.get("primaryLanguage", {}).get("name"),
+                    "updated_at": node.get("updatedAt", ""),
+                    "pushed_at": node.get("pushedAt", ""),
+                })
+
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info.get("endCursor")
+
+            self.logger.info(
+                f"GraphQL page: {len(repos)} total, hasNext={page_info.get('hasNextPage', False)}"
+            )
+
+        return repos
 
     def build_repo_data(self, repo_info: dict) -> dict:
         """
