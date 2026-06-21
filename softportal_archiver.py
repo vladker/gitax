@@ -7,6 +7,7 @@ SoftPortal Archiver — Топ программ SoftPortal в MAX канал
 и их публикации в отдельный канал MAX (текстовые сообщения).
 """
 
+import os
 import time
 from dotenv import load_dotenv
 from logging_config import setup_logging, LogMixin, SessionCapture
@@ -79,16 +80,19 @@ class SoftPortalArchiver(LogMixin, BrowserInitMixin):
         return text
 
     @staticmethod
-    def _print_progress(current: int, total: int, sent: int, skipped: int,
-                        status: str = ""):
+    def _print_progress(current: int, total: int, sent: int, failed: int,
+                        debt: int = 0, status: str = ""):
         """Print progress bar for load operations"""
         if total == 0:
             return
         pct = int(current / total * 100)
         filled = int(pct // 10)
         bar = "█" * filled + "░" * (10 - filled)
+        parts = f"✓{sent} | ✗{failed}"
+        if debt:
+            parts += f" | ⏸{debt}"
         print(f"\r  Прогресс: {current}/{total} | {bar} {pct}% | "
-              f"✓{sent} | –{skipped} {status}",
+              f"{parts} {status}",
               end="", flush=True)
         if current >= total:
             print()
@@ -113,6 +117,154 @@ class SoftPortalArchiver(LogMixin, BrowserInitMixin):
         except Exception as e:
             self.logger.error(f"Send text error: {e}")
             return False
+
+    # ── File download and upload helpers ──
+
+    def _download_file(self, url: str, filename: str, output_dir: str,
+                       browser: BrowserMAX) -> str | None:
+        """
+        Скачать файл по URL через Playwright браузер.
+
+        SoftPortal использует страницы с обратным отсчётом и редиректами
+        перед началом реальной загрузки. requests.get() получает HTML вместо файла,
+        поэтому используем браузер для прохождения редиректов.
+
+        Для SoftPortal-hosted вариантов:
+        1. Переходим на getsoft URL
+        2. Ждём редиректа на страницу программы
+        3. Кликаем кнопку скачивания
+        4. Ждём начала загрузки
+
+        Args:
+            url: URL для скачивания (getsoft страница или прямой URL)
+            filename: Имя сохраняемого файла
+            output_dir: Директория для сохранения
+            browser: Подключённый экземпляр BrowserMAX
+
+        Returns:
+            Полный путь к файлу или None при ошибке
+        """
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            file_path = os.path.join(output_dir, filename)
+            self.logger.info(f"Downloading via browser: {url}")
+
+            ctx = browser._get_context()
+            if ctx is None:
+                self.logger.error("No browser context available for download")
+                return None
+
+            dl_page = ctx.new_page()
+            try:
+                # Navigate to getsoft URL
+                dl_page.goto(url, wait_until="commit", timeout=60000)
+
+                # Wait for page to stabilize after redirect
+                dl_page.wait_for_load_state("networkidle", timeout=10000)
+
+                # Try clicking the download button
+                btn = dl_page.query_selector('a.btn-download[href]')
+                if btn:
+                    btn_href = btn.get_attribute('href')
+                    self.logger.info(f"Found download button: {btn_href}")
+
+                    # Click button and wait for download
+                    with dl_page.expect_download(timeout=60000) as dl_info:
+                        btn.click()
+
+                    download = dl_info.value
+                    download.save_as(file_path)
+                else:
+                    # No button found, try direct download (for non-SoftPortal URLs)
+                    with dl_page.expect_download(timeout=60000) as dl_info:
+                        dl_page.goto(url, wait_until="commit", timeout=60000)
+
+                    download = dl_info.value
+                    download.save_as(file_path)
+
+                if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                    self.logger.info(f"Downloaded: {file_path}")
+                    return file_path
+                self.logger.warning(f"Download produced empty file: {file_path}")
+                return None
+            except Exception as e:
+                self.logger.error(f"Download failed {filename}: {e}")
+                return None
+            finally:
+                try:
+                    dl_page.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            self.logger.error(f"Download error {filename}: {e}")
+            return None
+
+    def _wrap_in_zip(self, file_path: str) -> str | None:
+        """
+        Оборачивает .exe/.msi в .zip архив.
+
+        Args:
+            file_path: Путь к исходному файлу
+
+        Returns:
+            Путь к .zip архиву или None при ошибке
+        """
+        import zipfile
+        lower = file_path.lower()
+        if not (lower.endswith('.exe') or lower.endswith('.msi')):
+            return file_path  # Не нужно оборачивать
+
+        zip_path = file_path + '.zip'
+        try:
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                zf.write(file_path, os.path.basename(file_path))
+            self.logger.info(f"Wrapped in zip: {os.path.basename(zip_path)}")
+            return zip_path
+        except Exception as e:
+            self.logger.error(f"Zip error {file_path}: {e}")
+            return None
+
+    def _send_file_to_channel(self, browser: BrowserMAX, file_path: str,
+                              message: str) -> bool:
+        """
+        Отправить файл в MAX канал.
+
+        Args:
+            browser: Экземпляр BrowserMAX
+            file_path: Путь к файлу
+            message: Текст сообщения к файлу
+
+        Returns:
+            True при успехе
+        """
+        try:
+            retries = self.config.get('archiver', {}).get('retries', 3)
+            retry_delay = self.config.get('archiver', {}).get('retry_delay', 10)
+            success, _ = browser.send_message_with_files(
+                text=message,
+                filepaths=[file_path],
+                retries=retries,
+                retry_delay=retry_delay,
+                expected_extensions=['.exe', '.msi', '.zip', '.7z', '.rar'],
+            )
+            return success
+        except Exception as e:
+            self.logger.error(f"Send file error {file_path}: {e}")
+            return False
+
+    def _cleanup_file(self, file_path: str):
+        """Удалить временный файл."""
+        try:
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+                self.logger.debug(f"Cleaned up: {file_path}")
+        except Exception:
+            pass
+
+    def _cleanup_files(self, *paths: str | None):
+        """Удалить несколько временных файлов."""
+        for p in paths:
+            self._cleanup_file(p)
 
     # ── Category configuration ──
 
@@ -149,18 +301,19 @@ class SoftPortalArchiver(LogMixin, BrowserInitMixin):
         print("  ── Платформы ──")
         for i, p in enumerate(platforms, 1):
             print(f"  [{i}] {p['name']} (id={p['id']})")
+        print("  [0] Выбрать все")
         print()
 
         try:
             choice = input(
                 "  Выберите платформы (номера через запятую, "
-                "или Enter для всех): "
+                "или Enter / 0 для всех): "
             ).strip()
         except (EOFError, KeyboardInterrupt):
             print("\n  Отменено.")
             return []
 
-        if choice == '':
+        if choice == '' or choice == '0':
             selected_ids = [p['id'] for p in platforms]
         else:
             try:
@@ -172,30 +325,38 @@ class SoftPortalArchiver(LogMixin, BrowserInitMixin):
                 selected_ids = [p['id'] for p in platforms]
 
         # Step 2: Show subcategories (optional)
+        # NOTE: SoftPortal TOP pages only work for platforms (Windows, Android, etc.)
+        # Subcategories return 0 programs — they are skipped automatically but waste time.
         if subcategories:
             print()
             print("  ── Подкатегории (опционально) ──")
+            print("  ⚠ TOP-страницы есть только для платформ. Подкатегории")
+            print("    вернут 0 программ и будут пропущены.")
             for i, sc in enumerate(subcategories, 1):
                 print(f"  [{i}] {sc['name']} (id={sc['id']})")
+            print("  [0] Выбрать все (не рекомендуется)")
+            print("  [Enter] Пропустить (рекомендуется)")
             print()
 
             try:
                 sub_choice = input(
                     "  Добавить подкатегории (номера через запятую, "
-                    "или Enter для пропуска): "
+                    "или Enter / 0 для всех): "
                 ).strip()
             except (EOFError, KeyboardInterrupt):
                 sub_choice = ''
 
-            if sub_choice:
-                try:
-                    sub_indices = [int(x.strip()) for x in sub_choice.split(',')]
-                    sub_ids = [subcategories[i - 1]['id']
-                              for i in sub_indices
-                              if 1 <= i <= len(subcategories)]
-                    selected_ids.extend(sub_ids)
-                except (ValueError, IndexError):
-                    pass
+            if sub_choice == '' or sub_choice == '0':
+                selected_ids.extend(sc['id'] for sc in subcategories)
+            elif sub_choice:
+                    try:
+                        sub_indices = [int(x.strip()) for x in sub_choice.split(',')]
+                        sub_ids = [subcategories[i - 1]['id']
+                                  for i in sub_indices
+                                  if 1 <= i <= len(subcategories)]
+                        selected_ids.extend(sub_ids)
+                    except (ValueError, IndexError):
+                        pass
 
         # Update config in memory
         sp_cfg['categories'] = selected_ids
@@ -232,10 +393,15 @@ class SoftPortalArchiver(LogMixin, BrowserInitMixin):
         print(f"\n  Категории: {len(category_ids)} | Лимит: {limit}")
 
         # Fetch top programs for each category
+        # SoftPortal only has TOP pages for platforms, subcategories return 0 programs.
         all_programs = []
+        empty_cats = 0
         for cat_id in category_ids:
             try:
                 programs = self.sp.get_top_programs(cat_id, f"cat-{cat_id}", limit)
+                if not programs:
+                    empty_cats += 1
+                    continue
                 for p in programs:
                     p['_platform_id'] = cat_id
                 all_programs.extend(programs)
@@ -243,11 +409,14 @@ class SoftPortalArchiver(LogMixin, BrowserInitMixin):
             except SoftPortalAPIError as e:
                 print(f"  ✗ cat-{cat_id}: {e}")
 
+        if empty_cats:
+            print(f"  (пропущено {empty_cats} пустых категорий — TOP только для платформ)")
+
         if not all_programs:
             print("\n  ✗ Не удалось получить программы")
             return
 
-        # Dedup by journal: (id, platform_id)
+        # Dedup by journal: (id, platform_id) — skip processed, include failed for retry
         to_process = []
         skipped = 0
         for prog in all_programs:
@@ -273,9 +442,16 @@ class SoftPortalArchiver(LogMixin, BrowserInitMixin):
             print(f"\n  ✗ Не удалось подключиться к MAX: {e}")
             return
 
+        # Config
+        output_dir = self.config.get('softportal_archiver', {}).get(
+            'output_dir', './temp_softportal')
+        download_enabled = self.config.get('softportal_archiver', {}).get(
+            'download_files', True)
+
         # Process each program
         sent = 0
         failed = 0
+        debt = 0
 
         for i, prog in enumerate(to_process, 1):
             if self._shutdown:
@@ -284,51 +460,301 @@ class SoftPortalArchiver(LogMixin, BrowserInitMixin):
 
             name = prog.get('name', '')
             version = prog.get('version', '')
+            prog_id = prog.get('id')
+            slug = prog.get('slug', '')
             print(f"\n  [{i}/{total}] {name} {version}")
 
             # Get detail for breadcrumb path
             try:
-                detail = self.sp.get_program_detail(
-                    prog['id'], prog.get('slug', ''))
+                detail = self.sp.get_program_detail(prog_id, slug)
             except SoftPortalAPIError as e:
                 print(f"  ✗ Детали: {e}")
                 failed += 1
-                self._print_progress(i, total, sent, failed, "✗")
+                self._print_progress(i, total, sent, failed, debt, "✗")
                 continue
 
             # Platform ID from breadcrumb (first element = platform)
             breadcrumb = detail.get('full_category_path', [])
             platform_id = str(breadcrumb[0][0]) if breadcrumb else str(prog.get('_platform_id', ''))
 
-            # Build and send message
+            # ── Download file FIRST (before publishing anything) ──
+            file_path = None
+            zip_path = None
+            file_ok = True
+
+            if download_enabled:
+                try:
+                    dl_urls = self.sp.get_download_urls(prog_id, slug)
+                except SoftPortalAPIError as e:
+                    dl_urls = []
+                    self.logger.warning(f"Download URLs error: {e}")
+
+                if dl_urls:
+                    # Prefer internal variant 3 (64-bit) > variant 1 (32-bit) > variant 2 (official)
+                    candidates = sorted(dl_urls,
+                        key=lambda v: (0 if not v['is_official'] else 1, -v['variant']))
+                    best = candidates[0]
+                    dl_url = best['url']
+                    dl_filename = best['filename']
+
+                    print(f"  ⬇ Скачиваю: {dl_filename}")
+                    file_path = self._download_file(dl_url, dl_filename, output_dir, browser)
+
+                    if file_path and os.path.exists(file_path):
+                        zip_path = self._wrap_in_zip(file_path)
+                        final_path = zip_path or file_path
+
+                        # Verify the file is actually a real file (not HTML error page)
+                        final_size = os.path.getsize(final_path)
+                        if final_size < 1024:
+                            # Too small — likely an HTML error page, not a real file
+                            file_ok = False
+                            self.logger.warning(f"File too small ({final_size}B), likely error page: {dl_filename}")
+                            print(f"  ⚠ Файл подозрительно мал ({final_size} Б)")
+                            self._cleanup_files(file_path, zip_path)
+                            file_path = None
+                            zip_path = None
+                    else:
+                        file_ok = False
+                        print(f"  ⚠ Не удалось скачать файл")
+                else:
+                    file_ok = False
+                    print(f"  ⚠ Нет ссылок для скачивания")
+            else:
+                print(f"  (скачивание файлов отключено)")
+
+            # ── If download failed → mark as debt, don't publish anything ──
+            if not file_ok or (download_enabled and file_path is None):
+                self.journal.mark_failed(str(prog_id), platform_id, {
+                    'name': name,
+                    'version': version,
+                    'detail': detail,
+                })
+                debt += 1
+                print(f"  ⏸ Записано в долги (не будет опубликовано)")
+                self._cleanup_files(file_path, zip_path)
+                self._print_progress(i, total, sent, failed, debt, "⏸")
+                continue
+
+            # ── Download succeeded → publish text + file ──
             text = self._build_message_text({
                 **detail,
                 'program_url': prog.get('program_url', ''),
             })
 
-            success = self._send_text_message(browser, text)
-
-            if success:
-                self.journal.mark_processed(
-                    str(prog['id']), platform_id,
-                    {'name': name, 'version': version, 'detail': detail})
-                sent += 1
-                print(f"  ✓ Отправлено")
-            else:
+            text_ok = self._send_text_message(browser, text)
+            if not text_ok:
+                print(f"  ✗ Ошибка отправки текста")
                 failed += 1
-                print(f"  ✗ Ошибка отправки")
+                self._print_progress(i, total, sent, failed, debt, "✗")
+                self._cleanup_files(file_path, zip_path)
+                continue
 
-            self._print_progress(i, total, sent, failed,
-                                "✓" if success else "✗")
+            print(f"  ✓ Текст отправлен")
+
+            # Send file (zip already created during download validation)
+            file_sent = False
+            final_path = zip_path or file_path
+            if final_path:
+                file_sent = self._send_file_to_channel(browser, final_path, "")
+
+                if file_sent:
+                    print(f"  📤 Файл отправлен")
+                else:
+                    print(f"  ⚠ Файл не отправлен в канал")
+
+            # Cleanup
+            self._cleanup_files(file_path, zip_path)
+
+            if not file_sent and download_enabled:
+                self.journal.mark_failed(str(prog_id), platform_id, {
+                    'name': name,
+                    'version': version,
+                    'detail': detail,
+                })
+                debt += 1
+                print(f"  ⏸ Записано в долги (файл не отправлен)")
+            else:
+                self.journal.mark_processed(str(prog_id), platform_id, {
+                    'name': name,
+                    'version': version,
+                    'detail': detail,
+                    'file_sent': file_sent,
+                })
+                sent += 1
+                print(f"  ✓ Записано в журнал")
+
+            self._print_progress(i, total, sent, failed, debt, "✓")
 
         # Summary
         print()
         print("\n" + "═" * 60)
         print("Загрузка завершена")
-        print(f"  Всего: {sent + failed}")
+        print(f"  Обработано: {sent + failed + debt}")
         print(f"  Отправлено: {sent}")
         if failed:
             print(f"  Ошибок: {failed}")
+        if debt:
+            print(f"  В долгах: {debt} (перезагрузите позже)")
+        print("═" * 60)
+
+        self._close_browser()
+
+    def retry_failed(self):
+        """
+        Перезагрузить программы из списка неудач.
+
+        Flow:
+        1. Load failed entries from journal
+        2. For each: get detail → download file → send text + file
+        3. On success: remove from failed, mark as processed
+        4. On failure: keep in failed list
+        """
+        print("\n" + "═" * 60)
+        print("          Дозагрузка неудачных программ")
+        print("═" * 60)
+
+        failed = self.journal.get_failed()
+        if not failed:
+            print("\n  ✓ Нет неудачных программ")
+            return
+
+        print(f"\n  Неудачных программ: {len(failed)}")
+        print()
+
+        # Show list
+        for i, entry in enumerate(failed, 1):
+            prog_data = entry.get('program_data', {})
+            name = prog_data.get('name', 'Unknown')
+            version = prog_data.get('version', '')
+            print(f"  [{i}] {name} {version}")
+
+        print()
+        try:
+            confirm = input("  Продолжить? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Отменено.")
+            return
+
+        if confirm not in ('y', 'yes', 'д', 'да'):
+            print("\n  Отменено.")
+            return
+
+        # Connect browser
+        try:
+            browser = self._ensure_browser_connected()
+        except Exception as e:
+            print(f"\n  ✗ Не удалось подключиться к MAX: {e}")
+            return
+
+        output_dir = self.config.get('softportal_archiver', {}).get(
+            'output_dir', './temp_softportal')
+
+        total = len(failed)
+        sent = 0
+        still_failed = 0
+
+        for i, entry in enumerate(failed, 1):
+            if self._shutdown:
+                print(f"\n  ⚠ Прервано после {i - 1}")
+                break
+
+            prog_data = entry.get('program_data', {})
+            name = prog_data.get('name', 'Unknown')
+            version = prog_data.get('version', '')
+            prog_id = entry.get('id')
+            platform_id = entry.get('platform_id', '')
+            detail = prog_data.get('detail', {})
+
+            print(f"\n  [{i}/{total}] {name} {version}")
+
+            # Get fresh detail
+            try:
+                fresh_detail = self.sp.get_program_detail(prog_id, '')
+            except SoftPortalAPIError as e:
+                print(f"  ✗ Детали: {e}")
+                still_failed += 1
+                continue
+
+            # Get platform from breadcrumb
+            breadcrumb = fresh_detail.get('full_category_path', [])
+            platform_id = str(breadcrumb[0][0]) if breadcrumb else str(platform_id)
+
+            # Download file
+            file_path = None
+            try:
+                dl_urls = self.sp.get_download_urls(prog_id, '')
+            except SoftPortalAPIError:
+                dl_urls = []
+
+            if dl_urls:
+                candidates = sorted(dl_urls,
+                    key=lambda v: (0 if not v['is_official'] else 1, -v['variant']))
+                best = candidates[0]
+                print(f"  ⬇ Скачиваю: {best['filename']}")
+                file_path = self._download_file(best['url'], best['filename'],
+                                               output_dir, browser)
+
+                if file_path and os.path.exists(file_path):
+                    final_size = os.path.getsize(file_path)
+                    if final_size < 1024:
+                        self.logger.warning(f"File too small: {final_size}B")
+                        print(f"  ⚠ Файл подозрительно мал")
+                        self._cleanup_file(file_path)
+                        file_path = None
+
+            if not file_path:
+                print(f"  ⚠ Не удалось скачать, остаётся в долгах")
+                still_failed += 1
+                continue
+
+            # Send text + file
+            text = self._build_message_text({
+                **fresh_detail,
+                'program_url': f"/software-{prog_id}.html",
+            })
+
+            if not self._send_text_message(browser, text):
+                print(f"  ✗ Ошибка отправки текста")
+                self._cleanup_file(file_path)
+                still_failed += 1
+                continue
+
+            print(f"  ✓ Текст отправлен")
+
+            zip_path = self._wrap_in_zip(file_path)
+            final_path = zip_path or file_path
+
+            file_sent = self._send_file_to_channel(browser, final_path, "")
+            if file_sent:
+                print(f"  📤 Файл отправлен")
+            else:
+                print(f"  ⚠ Файл не отправлен")
+                self._cleanup_files(file_path, zip_path)
+                still_failed += 1
+                continue
+
+            # Cleanup
+            self._cleanup_files(file_path, zip_path)
+
+            # Remove from failed, mark as processed
+            self.journal.remove_failed(str(prog_id), str(platform_id))
+            self.journal.mark_processed(str(prog_id), str(platform_id), {
+                'name': name,
+                'version': version,
+                'detail': fresh_detail,
+                'file_sent': True,
+            })
+            sent += 1
+            print(f"  ✓ Успешно дозагружено")
+
+        # Summary
+        print()
+        print("\n" + "═" * 60)
+        print("Дозагрузка завершена")
+        print(f"  Успешно: {sent}")
+        if still_failed:
+            print(f"  Остаётся в долгах: {still_failed}")
         print("═" * 60)
 
         self._close_browser()
@@ -475,19 +901,26 @@ class SoftPortalArchiver(LogMixin, BrowserInitMixin):
         print("           Загрузка программ в MAX")
         print("=" * 60)
         print(f"  Журнал: {stats['total']} программ")
+        failed_count = stats.get('failed_count', 0)
+        if failed_count:
+            print(f"  Неудачные: {failed_count}")
         print("-" * 60)
 
         print("\n  [1] Загрузить топ программ")
         print("  [2] Синхронизировать программы")
-        print("  [3] Выход")
+        if failed_count:
+            print("  [3] Дозагрузить неудачные")
+        print("  [0] Выход")
         print()
 
-        choice = input("  Ваш выбор [1/2/3]: ").strip()
+        choice = input(f"  Ваш выбор [1/2{'/3' if failed_count else ''}/0]: ").strip()
 
         if choice == '1':
             self.load_top_programs()
         elif choice == '2':
             self.sync_programs()
+        elif choice == '3' and failed_count:
+            self.retry_failed()
         else:
             print("  Выход.")
 
