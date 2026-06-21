@@ -783,6 +783,8 @@ class PyPILibsArchiver(LogMixin, BrowserInitMixin):
             print(f"  Ошибок: {error_count}")
         print("═" * 60)
 
+        # Сохраняем журнал перед закрытием
+        self.journal.save()
         if self.browser:
             try:
                 self.browser.close()
