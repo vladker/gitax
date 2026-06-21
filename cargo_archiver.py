@@ -11,6 +11,7 @@ import os
 import sys
 import time
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from logging_config import setup_logging, LogMixin, SessionCapture
 
@@ -101,18 +102,44 @@ class CargoArchiver(LogMixin, BrowserInitMixin):
     def _download_file(self, url: str, filename: str, output_dir: str) -> str | None:
         """Download a file from URL to output_dir. Returns file path or None on error."""
         import requests
-        try:
-            os.makedirs(output_dir, exist_ok=True)
-            file_path = os.path.join(output_dir, filename)
-            resp = requests.get(url, timeout=300, stream=True)
-            resp.raise_for_status()
-            with open(file_path, 'wb') as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            return file_path
-        except Exception as e:
-            self.logger.error(f"Download error {filename}: {e}")
-            return None
+        import time as _time
+        from tqdm import tqdm
+        os.makedirs(output_dir, exist_ok=True)
+        file_path = os.path.join(output_dir, filename)
+        max_retries = 5
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "*/*",
+        }
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = requests.get(url, timeout=300, stream=True, headers=headers)
+                resp.raise_for_status()
+                total = int(resp.headers.get('Content-Length', 0))
+                desc = f"  ⬇ {filename}"
+                with tqdm(total=total, unit='B', unit_scale=True, desc=desc, leave=False) as pbar:
+                    with open(file_path, 'wb') as f:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                            pbar.update(len(chunk))
+                return file_path
+            except Exception as e:
+                self.logger.warning(
+                    f"Download error {filename} (attempt {attempt}/{max_retries}): {e}"
+                )
+                if attempt < max_retries:
+                    delay = 5 * (2 ** (attempt - 1))  # 5, 10, 20, 40, 80
+                    self.logger.info(f"Retrying in {delay}s...")
+                    _time.sleep(delay)
+                else:
+                    self.logger.error(f"Download failed {filename} after {max_retries} attempts")
+                    # Clean up partial download
+                    if os.path.exists(file_path):
+                        try:
+                            os.remove(file_path)
+                        except Exception:
+                            pass
+        return None
 
     def _send_file_to_channel(self, file_path: str, message: str, browser) -> bool:
         """Send a file to MAX channel. Returns True on success."""
@@ -127,7 +154,8 @@ class CargoArchiver(LogMixin, BrowserInitMixin):
                 retries=retries,
                 retry_delay=retry_delay,
                 split_mode="auto",
-                expected_extensions=['.exe', '.sh', '.pkg', '.tar.xz', '.tar.gz']
+                expected_extensions=['.exe', '.sh', '.pkg', '.tar.xz', '.tar.gz'],
+                fast_mode=True,
             )
             return success
         except Exception as e:
@@ -150,10 +178,8 @@ class CargoArchiver(LogMixin, BrowserInitMixin):
             'retries', self.config.get('archiver', {}).get('retries', 3))
         retry_delay = self.config.get('cargo_archiver', {}).get(
             'retry_delay', self.config.get('archiver', {}).get('retry_delay', 10))
-        repo_delay = self.config.get('cargo_archiver', {}).get(
-            'repo_delay', self.config.get('archiver', {}).get('repo_delay', 30))
         output_dir = self.config.get('cargo_archiver', {}).get('output_dir', './temp_cargo')
-        split_mode = get_split_mode(self.config)
+        split_mode = get_split_mode(self.config, "cargo_archiver", default="off")
 
         print("\n" + "═" * 60)
         print("          Загрузка топ Rust пакетов")
@@ -177,97 +203,123 @@ class CargoArchiver(LogMixin, BrowserInitMixin):
             if not self.journal.exists_by_name(crate["name"]):
                 to_process.append(crate)
 
-        print(f"\n  К обработке: {len(to_process)} (пропущено: {len(crates) - len(to_process)})")
+        total = len(to_process)
+        print(f"\n  К обработке: {total} (пропущено: {len(crates) - total})")
 
         if not to_process:
             print("\n  Все пакеты уже в журнале")
             self._close_browser()
             return
 
-        # Process each crate
+        # ─────────────────────────────────────────────────────
+        # Phase 1: Параллельное скачивание ВСЕХ кратов
+        # ─────────────────────────────────────────────────────
+        print(f"\n  ⬇ Параллельное скачивание {total} кратов...")
+
+        def _dl_crate(crate: dict) -> dict | None:
+            name = crate["name"]
+            version = crate["version"]
+            real_url = self.cargo.get_real_crate_url(name, version)
+            if not real_url:
+                return None
+            filename = f"{name}-{version}.crate"
+            filepath = os.path.join(output_dir, filename)
+            try:
+                resp = self.cargo.session.get(real_url, timeout=120, stream=True)
+                resp.raise_for_status()
+                with open(filepath, 'wb') as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                return {
+                    "crate": crate,
+                    "filepath": filepath,
+                    "size": os.path.getsize(filepath),
+                }
+            except Exception as e:
+                self.logger.error(f"Download error {name} {version}: {e}")
+                return None
+
+        downloaded = []
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = {pool.submit(_dl_crate, c): c for c in to_process}
+            with LiveProgressBar(total, "Скачивание") as bar:
+                done_count = 0
+                for future in as_completed(futures):
+                    done_count += 1
+                    result = future.result()
+                    if result:
+                        downloaded.append(result)
+                    else:
+                        crate = futures[future]
+                        self.journal.mark_failed(
+                            crate["name"], crate["version"],
+                            crate.get("description", ""), crate.get("downloads", 0)
+                        )
+                    bar.update(done_count)
+
+        print(f"\n  Скачано: {len(downloaded)}/{total}")
+
+        if not downloaded:
+            print("\n  ✗ Не удалось скачать ни одного крата")
+            self._close_browser()
+            return
+
+        # ─────────────────────────────────────────────────────
+        # Phase 2: Индивидуальная отправка каждого крата
+        # ─────────────────────────────────────────────────────
         sent = 0
-        skipped = 0
         failed = 0
 
-        with LiveProgressBar(len(to_process), "Загрузка Rust пакетов") as bar:
-            for idx, crate in enumerate(to_process, 1):
+        print(f"\n  📤 Отправка {len(downloaded)} кратов...\n")
+
+        with LiveProgressBar(len(downloaded), "Отправка") as bar:
+            for idx, d in enumerate(downloaded, 1):
+                crate = d["crate"]
                 name = crate["name"]
                 version = crate["version"]
-                bar.update(idx, item_name=f"{name} {version}")
-                print(f"\n  [{idx}/{len(to_process)}] {name} {version}")
 
-                download_url = self.cargo.get_crate_download_url(name, version)
-                filename = f"{name}-{version}.crate"
-                filepath = os.path.join(output_dir, filename)
+                msg_text = self._build_message_text(crate, [d["size"]])
 
-                # Download
-                try:
-                    resp = self.cargo.session.get(download_url, timeout=120, stream=True)
-                    resp.raise_for_status()
-                    file_size = int(resp.headers.get('Content-Length', 0))
-
-                    with open(filepath, 'wb') as f:
-                        for chunk in resp.iter_content(chunk_size=8192):
-                            f.write(chunk)
-
-                    actual_size = os.path.getsize(filepath)
-                    print(f"  ⬇ Скачано: {format_file_size(actual_size)}")
-
-                except Exception as e:
-                    print(f"  ✗ Ошибка скачивания: {e}")
-                    self.journal.mark_failed(name, version, crate.get("description", ""),
-                                            crate.get("downloads", 0))
-                    failed += 1
-                    self._print_progress(idx, len(to_process), sent, skipped + failed, "✗")
-                    continue
-
-                # Handle large files
-                file_sizes = [actual_size]
-                files_to_send = [filepath]
-
-                if split_mode and actual_size > self.config.get('archiver', {}).get('split_threshold_mb', 49) * 1024 * 1024:
-                    base = filepath.replace('.crate', '')
-                    volumes = self._split_to_volumes(base)
-                    if volumes:
-                        files_to_send = volumes
-                        file_sizes = [os.path.getsize(v) for v in volumes]
-
-                # Build message
-                msg_text = self._build_message_text(crate, file_sizes)
-
-                # Send with retries
                 success = False
                 for attempt in range(1, retries + 1):
                     try:
-                        browser.send_message(msg_text)
-                        for fp in files_to_send:
-                            browser.send_file_message(fp)
-                        success = True
+                        success, _ = browser.send_message_with_files(
+                            text=msg_text,
+                            filepaths=[d["filepath"]],
+                            retries=1,
+                            retry_delay=0,
+                            split_mode=split_mode,
+                            expected_extensions=['.crate'],
+                            fast_mode=True,
+                        )
                         break
                     except Exception as e:
-                        print(f"  ⚠ Попытка {attempt}/{retries}: {e}")
                         if attempt < retries:
                             time.sleep(retry_delay)
 
                 if success:
                     self.journal.add(name, version, crate.get("description", ""),
-                                     crate.get("downloads", 0), [f for f in files_to_send])
+                                     crate.get("downloads", 0), [d["filepath"]])
                     sent += 1
-                    print(f"  ✓ Отправлено")
                 else:
                     self.journal.mark_failed(name, version, crate.get("description", ""),
-                                            crate.get("downloads", 0))
+                                             crate.get("downloads", 0))
                     failed += 1
-                    print(f"  ✗ Ошибка отправки после {retries} попыток")
 
-                # Cleanup
-                self._cleanup_files(files_to_send)
-                self._print_progress(idx, len(to_process), sent, skipped + failed)
+                # Cleanup immediately
+                try:
+                    if os.path.exists(d["filepath"]):
+                        os.remove(d["filepath"])
+                except Exception:
+                    pass
 
-                if idx < len(to_process):
-                    time.sleep(repo_delay)
+                bar.update(idx, item_name=f"{name} {'✓' if success else '✗'}")
+                # NO delay between crates!
 
         print(f"\n  Итого: ✓{sent} | ✗{failed}")
+        if total > 0:
+            pct = int(sent / total * 100)
+            print(f"  Эффективность: {pct}% ({sent}/{total})")
         self._close_browser()
 
     def load_runtime(self):
@@ -422,9 +474,7 @@ class CargoArchiver(LogMixin, BrowserInitMixin):
             'retries', self.config.get('archiver', {}).get('retries', 3))
         retry_delay = self.config.get('cargo_archiver', {}).get(
             'retry_delay', self.config.get('archiver', {}).get('retry_delay', 10))
-        repo_delay = self.config.get('cargo_archiver', {}).get(
-            'repo_delay', self.config.get('archiver', {}).get('repo_delay', 30))
-        split_mode = get_split_mode(self.config)
+        split_mode = get_split_mode(self.config, "cargo_archiver", default="off")
 
         updated = 0
         unchanged = 0
@@ -443,12 +493,18 @@ class CargoArchiver(LogMixin, BrowserInitMixin):
 
             print(f"  ⬆ Обновление: {old_version} → {latest}")
 
-            download_url = self.cargo.get_crate_download_url(name, latest)
+            # Получаем реальный URL .crate файла (API возвращает JSON с URL, не редирект)
+            real_url = self.cargo.get_real_crate_url(name, latest)
+            if not real_url:
+                print(f"  ✗ Не удалось получить URL скачивания для {name} {latest}")
+                failed += 1
+                continue
+
             filename = f"{name}-{latest}.crate"
             filepath = os.path.join(output_dir, filename)
 
             try:
-                resp = self.cargo.cargo.session.get(download_url, timeout=120, stream=True)
+                resp = self.cargo.session.get(real_url, timeout=120, stream=True)
                 resp.raise_for_status()
                 with open(filepath, 'wb') as f:
                     for chunk in resp.iter_content(chunk_size=8192):
@@ -480,10 +536,15 @@ class CargoArchiver(LogMixin, BrowserInitMixin):
             success = False
             for attempt in range(1, retries + 1):
                 try:
-                    browser.send_message(msg_text)
-                    for fp in files_to_send:
-                        browser.send_file_message(fp)
-                    success = True
+                    success, _ = browser.send_message_with_files(
+                        text=msg_text,
+                        filepaths=files_to_send,
+                        retries=1,
+                        retry_delay=0,
+                        split_mode=split_mode,
+                        expected_extensions=['.crate', '.7z', '.7z.001'],
+                        fast_mode=True,
+                    )
                     break
                 except Exception as e:
                     if attempt < retries:
@@ -499,9 +560,6 @@ class CargoArchiver(LogMixin, BrowserInitMixin):
                 print(f"  ✗ Ошибка отправки")
 
             self._cleanup_files(files_to_send)
-
-            if idx < len(entries):
-                time.sleep(repo_delay)
 
         print(f"\n  Итого: ⬆{updated} | ={unchanged} | ✗{failed}")
         self._close_browser()

@@ -103,6 +103,38 @@ class CratesIOAPI(LogMixin):
         """Получить URL для скачивания .crate файла."""
         return f"{self.BASE_URL}/crates/{name}/{version}/download"
 
+    def get_real_crate_url(self, name: str, version: str) -> str | None:
+        """
+        Получить реальный URL .crate файла через JSON-ответ API.
+
+        crates.io API больше не делает 302 редирект на .crate файл,
+        а возвращает JSON: {"url": "https://static.crates.io/crates/..."}
+        Этот метод извлекает реальный URL для скачивания.
+
+        Args:
+            name: Имя пакета
+            version: Версия
+
+        Returns:
+            Реальный URL .crate файла или None при ошибке
+        """
+        url = self.get_crate_download_url(name, version)
+        try:
+            resp = self.session.get(url, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            real_url = data.get("url", "")
+            if real_url:
+                return real_url
+            self.logger.error(f"No 'url' field in JSON response for {name} {version}: {data}")
+            return None
+        except requests.RequestException as e:
+            self.logger.error(f"Failed to get real download URL for {name} {version}: {e}")
+            return None
+        except ValueError as e:
+            self.logger.error(f"Invalid JSON response for {name} {version}: {e}")
+            return None
+
     def get_latest_version(self, name: str) -> str | None:
         """Получить последнюю версию пакета."""
         url = f"{self.BASE_URL}/crates/{name}"
