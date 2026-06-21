@@ -70,11 +70,18 @@ class GracefulShutdown:
         self.cleanup()
 
     def cleanup(self):
-        """Clean up resources on shutdown"""
+        """Clean up resources on shutdown.
+
+        Marks currently processing repo as 'failed' in journal BEFORE
+        deleting temp files so interrupted repos are recoverable on restart.
+        """
         if self.interrupted:
             return
 
         self.interrupted = True
+
+        # Mark interrupted repo as failed BEFORE cleanup
+        self._mark_interrupted_repo_as_failed()
 
         # Clean up temp files before closing browsers
         self._cleanup_temp_files()
@@ -86,8 +93,65 @@ class GracefulShutdown:
                 except Exception:
                     pass
 
+    def _mark_interrupted_repo_as_failed(self):
+        """Mark the currently processing repo as 'failed' for crash recovery.
+
+        Checks journal for a repo being processed when shutdown occurred.
+        If found, updates its status to 'failed' so retry will pick it up.
+        """
+        import logging
+        logger = logging.getLogger("gitax")
+
+        journal = getattr(self.archiver, 'journal', None)
+        if not journal:
+            return
+
+        cp = journal.get_currently_processing()
+        if not cp:
+            return
+
+        full_name = cp.get('full_name')
+        filename = cp.get('filename', '')
+        logger.info(f"Shutdown during processing: {full_name} ({filename})")
+
+        # Check if repo already in journal
+        existing = journal.get_repository(full_name)
+        if existing and existing.get('status') == 'sent':
+            # Already sent — don't downgrade status
+            logger.info(f"  {full_name} already marked as 'sent', skipping")
+            return
+
+        # Mark as failed (or update existing failed/incomplete entry)
+        journal.update_repository(full_name, {
+            'status': 'failed',
+            'interrupted': True,
+            'interrupted_filename': filename,
+        })
+
+        # If not in journal yet, add it
+        if not journal.get_repository(full_name):
+            # Parse owner/repo from full_name for minimal journal entry
+            parts = full_name.split('/', 1)
+            if len(parts) == 2:
+                journal.add_repository({
+                    'full_name': full_name,
+                    'display_name': parts[1],
+                    'status': 'failed',
+                    'interrupted': True,
+                    'interrupted_filename': filename,
+                    'version': 'unknown',
+                })
+                logger.info(f"  Added {full_name} to journal as 'failed'")
+
+        # Clear the currently_processing marker
+        journal.clear_currently_processing()
+
     def _cleanup_temp_files(self):
-        """Remove any remaining files in the temp directory"""
+        """Remove any remaining files in the temp directory.
+
+        Skips the file associated with a currently processing repo if it
+        was just marked as failed — the file is needed for recovery.
+        """
         import logging
         logger = logging.getLogger("gitax")
 
@@ -150,6 +214,10 @@ class GitHubArchiver(LogMixin):
         self.github = None
         self.max_browser = None
 
+        # Orphaned repos recovered from filenames — set by _check_orphaned_files
+        # when user chooses to retry. Processed first in load_new_repositories.
+        self._orphaned_repos_to_retry = []
+
         # Проверить и создать временную папку
         output_dir = self.config.get('archiver', {}).get('output_dir', './temp')
         if not os.path.exists(output_dir):
@@ -197,12 +265,13 @@ class GitHubArchiver(LogMixin):
         """
         Check for orphaned files from interrupted sessions.
         Includes 7z volumes, ZIP archives, and locked files.
-        Offer to clean them up.
+        Recovers repos from filenames and offers to retry failed uploads.
 
         Args:
             output_dir: Directory to check for orphaned files
         """
         import logging
+        import re
         logger = logging.getLogger("gitax")
 
         # Find all orphaned file types
@@ -245,9 +314,32 @@ class GitHubArchiver(LogMixin):
         if len(orphaned) > 5:
             print(f"      ... and {len(orphaned) - 5} more")
 
+        # Parse repo names from orphaned filenames
+        # Pattern: owner-repo-branch.zip or owner-repo-branch.7z.NNN
+        recovered_repos = self._parse_repos_from_filenames(orphaned)
+
+        if recovered_repos:
+            print(f"\n  Recovered {len(recovered_repos)} repo(s) from filenames:")
+            for repo in recovered_repos[:5]:
+                print(f"    - {repo['full_name']}")
+            if len(recovered_repos) > 5:
+                print(f"      ... and {len(recovered_repos) - 5} more")
+
+            # Add recovered repos to journal as 'failed' if not already there
+            added = 0
+            for repo in recovered_repos:
+                existing = self.journal.get_repository(repo['full_name'])
+                if not existing or existing.get('status') != 'sent':
+                    self.journal.add_repository(repo)
+                    added += 1
+                    logger.info(f"Added recovered repo to journal: {repo['full_name']}")
+
+            if added:
+                print(f"\n  ✓ {added} repo(s) marked as 'failed' in journal for retry")
+
         print("\n  These files are from interrupted upload sessions.")
         print("  [1] Delete all orphaned files")
-        print("  [2] Keep for manual recovery")
+        print("  [2] Retry uploading recovered repos")
         print("  [3] Don't ask again this session")
 
         try:
@@ -261,12 +353,141 @@ class GitHubArchiver(LogMixin):
                     else:
                         logger.warning(f"Failed to delete orphaned file: {f}")
                 print(f"  ✓ Deleted {deleted}/{len(orphaned)} orphaned file(s)")
+            elif choice == '2' and recovered_repos:
+                print(f"\n  Starting retry for {len(recovered_repos)} recovered repo(s)...")
+                # Return the recovered repos for the caller to process
+                self._orphaned_repos_to_retry = recovered_repos
             elif choice == '3':
                 print("  Will not ask again this session")
         except KeyboardInterrupt:
             logger.info("Orphaned file cleanup cancelled by user")
         except Exception as e:
             logger.warning(f"Orphaned file check error: {e}")
+
+    def _parse_repos_from_filenames(self, filenames: list) -> list:
+        """
+        Parse repository names from orphaned filenames.
+
+        Filename patterns:
+        - owner-repo-branch.zip
+        - owner-repo-branch.7z.001
+        - owner-repo-branch.7z.002
+
+        Args:
+            filenames: List of orphaned file paths
+
+        Returns:
+            List of repo dicts ready for journal insertion
+        """
+        import re
+
+        repos = []
+        seen = set()
+
+        for fpath in filenames:
+            basename = os.path.basename(fpath)
+
+            # Try to match owner-repo-branch pattern
+            # Remove .zip or .7z.NNN extensions
+            name_part = re.sub(r'\.(zip|7z\.\d+)$', '', basename)
+
+            # Split by '-' but handle repos with hyphens in name
+            # Common branch names: main, master, dev, etc.
+            parts = name_part.rsplit('-', 1)
+            if len(parts) == 2:
+                owner_repo = parts[0]
+                branch = parts[1]
+                # owner_repo might still have hyphens, so split on first hyphen
+                owner_repo_parts = owner_repo.split('-', 1)
+                if len(owner_repo_parts) == 2:
+                    owner, repo_name = owner_repo_parts
+                    full_name = f"{owner}/{repo_name}"
+                    if full_name not in seen:
+                        seen.add(full_name)
+                        repos.append({
+                            'full_name': full_name,
+                            'display_name': repo_name,
+                            'status': 'failed',
+                            'interrupted': True,
+                            'interrupted_filename': basename,
+                            'version': 'unknown',
+                        })
+
+        return repos
+
+    def _process_orphaned_retries(self):
+        """Process orphaned repos recovered from filenames.
+
+        Fetches full info from GitHub, connects browser, and retries uploads.
+        Called from load_new_repositories before the normal flow.
+        """
+        import logging
+        logger = logging.getLogger("gitax")
+
+        if not self._orphaned_repos_to_retry:
+            return
+
+        orphaned = self._orphaned_repos_to_retry
+        print(f"\n  {'─' * 58}")
+        print(f"  Повторная загрузка {len(orphaned)} прерванного репозитория(ев):")
+        print(f"  {'─' * 58}")
+
+        # Connect browser
+        if not self.max_browser:
+            self.max_browser = BrowserMAX(self.config)
+        if not self.max_browser.is_connected:
+            self.max_browser.connect()
+            if not self.max_browser.is_connected:
+                print("  ✗ Не удалось подключиться к браузеру")
+                return
+
+        # Navigate to channel
+        channel_url = getattr(self, '_active_channel_url', None)
+        if channel_url:
+            self.max_browser.navigate_to_channel(channel_url)
+
+        success_count = 0
+        fail_count = 0
+
+        for i, orphaned_repo in enumerate(orphaned, 1):
+            full_name = orphaned_repo.get('full_name', '')
+            display_name = orphaned_repo.get('display_name', full_name)
+            logger.info(f"Orphaned retry {i}/{len(orphaned)}: {full_name}")
+            print(f"\n  [{i}/{len(orphaned)}] {display_name}")
+
+            # Fetch full repo info from GitHub
+            try:
+                parts = full_name.split('/', 1)
+                if len(parts) != 2:
+                    print(f"    ✗ Неверное имя репозитория")
+                    fail_count += 1
+                    continue
+                owner, repo_name = parts
+                repo_info = self.github.get_repo(owner, repo_name)
+                if not repo_info:
+                    print(f"    ✗ Не удалось получить информацию о репозитории")
+                    fail_count += 1
+                    continue
+            except Exception as e:
+                logger.warning(f"Failed to fetch {full_name}: {e}")
+                print(f"    ✗ Ошибка API: {e}")
+                fail_count += 1
+                continue
+
+            # Download and send
+            try:
+                if self._download_and_send_repo_info_connected(self.max_browser, repo_info):
+                    success_count += 1
+                else:
+                    fail_count += 1
+            except Exception as e:
+                logger.error(f"Failed to process {full_name}: {e}")
+                print(f"    ✗ Ошибка: {e}")
+                fail_count += 1
+
+        print(f"\n  {'─' * 58}")
+        print(f"  ✓ Успешно: {success_count}, ✗ Ошибок: {fail_count}")
+        print(f"  {'─' * 58}")
 
     def _ensure_channel_ready(self, channel_name: str, label: str,
                               config_section: str = None) -> bool:
@@ -653,18 +874,25 @@ class GitHubArchiver(LogMixin):
         """Подменю GitHub"""
         ignored_count = self.journal.get_ignored_count()
         ignored_str = f" ({ignored_count} в игноре)" if ignored_count else ""
+        failed_count = len(self.journal.get_repositories_by_status('failed'))
+        failed_str = f" ({failed_count} неудачных)" if failed_count else ""
         print("\n" + "═" * 60)
         print("  GitHub — репозитории")
         print("─" * 60)
         print()
-        print("  [1] Синхронизировать репозитории")
-        print("  [2] Загрузить новые репозитории")
-        print("  [3] Собрать базу репозиториев")
-        print("  [4] Статус коллекции репозиториев")
-        print("  [6] Загрузить Git runtime (первичная)")
-        print("  [7] Синхронизировать Git runtime")
-        print(f"  [8] Список игнорирования{ignored_str}")
-        print("  [9] Аудит — очистка / восстановление публикаций")
+        print("  [1] Синхронизировать репозитории (пошагово)")
+        print("  [2] Синхронизировать репозитории (авто)")
+        print("  [3] Синхронизировать репозитории (параллельно)")
+        print("  [4] Загрузить новые репозитории (пошагово)")
+        print("  [5] Загрузить новые репозитории (авто)")
+        print("  [6] Загрузить новые репозитории (параллельно)")
+        print(f"  [7] Повторить неудачные загрузки{failed_str}")
+        print("  [8] Собрать базу репозиториев")
+        print("  [9] Статус коллекции репозиториев")
+        print("  [a] Загрузить Git runtime (первичная)")
+        print("  [b] Синхронизировать Git runtime")
+        print(f"  [c] Список игнорирования{ignored_str}")
+        print("  [d] Аудит — очистка / восстановление публикаций")
         print("  [0] Назад")
         print()
 
@@ -768,8 +996,12 @@ class GitHubArchiver(LogMixin):
                 return choice
             print(f"  Неверный выбор. Доступно: {', '.join(options)}")
 
-    def sync_repositories(self):
-        """Синхронизация репозиториев - проверка обновлений"""
+    def sync_repositories(self, mode: str = "step"):
+        """Синхронизация репозиториев - проверка обновлений
+
+        Args:
+            mode: 'step' (пошаговая) или 'parallel' (параллельная)
+        """
         print("\n" + "═" * 60)
         print("Синхронизация репозиториев")
         print("═" * 60)
@@ -799,6 +1031,7 @@ class GitHubArchiver(LogMixin):
         repo_updates = []  # (repo, has_new, latest_version)
         checked_count = 0
         has_update_count = 0
+        retry_failed_count = 0
 
         for i, repo in enumerate(repos, 1):
             full_name = repo.get('full_name', '')
@@ -806,6 +1039,17 @@ class GitHubArchiver(LogMixin):
             saved_version = repo.get('version', '')
             default_branch = repo.get('default_branch', 'main')
             owner, repo_name = full_name.split('/', 1)
+            repo_status = repo.get('status', '')
+
+            # Репозитории с неудачной загрузкой — помечаем на повтор
+            if repo_status in ('failed', 'incomplete'):
+                repo_updates.append((repo, True, saved_version))
+                has_update_count += 1
+                retry_failed_count += 1
+                checked_count += 1
+                pct = int(checked_count / total_repos * 100)
+                print(f"\r  Проверка: {checked_count}/{total_repos} ({pct}%) | Новых версий: {has_update_count}", end="", flush=True)
+                continue
 
             try:
                 has_new, latest_version = self.github.check_new_version(
@@ -827,7 +1071,10 @@ class GitHubArchiver(LogMixin):
             print(f"\r  Проверка: {checked_count}/{total_repos} ({pct}%) | Новых версий: {has_update_count}", end="", flush=True)
 
         print()  # newline
-        print(f"\n  ✓ Проверка завершена: {has_update_count} обновлений доступно\n")
+        if retry_failed_count:
+            print(f"\n  ✓ Проверка завершена: {has_update_count} обновлений доступно ({retry_failed_count} неудачных на повтор)\n")
+        else:
+            print(f"\n  ✓ Проверка завершена: {has_update_count} обновлений доступно\n")
 
         if has_update_count == 0:
             print("  ✓ Все репозитории уже актуальны!")
@@ -849,21 +1096,8 @@ class GitHubArchiver(LogMixin):
                 print(f"  {idx:<4} {name:<35} {old_ver:<20} {new_ver:<20}")
         print("  " + "─" * 74)
 
-        # Phase 3: Интерактивное обновление
-        print("\n  Выберите действие:")
-        print("  [Enter] Обновить ВСЕ с новыми версиями")
-        print("  [P] Обновить ВСЕ с параллельной отправкой в несколько каналов")
-        print("  [S] Пропустить синхронизацию")
-        print()
-
-        choice = input("  Ваш выбор [Enter/P/S]: ").strip().lower()
-
-        if choice == 's':
-            print("\n  Синхронизация отменена.")
-            input("\n  Нажмите Enter для возврата в меню...")
-            return
-
-        use_parallel = (choice == 'p')
+        # Phase 3: Обновление по выбранному режиму
+        use_parallel = (mode == "parallel")
 
         if use_parallel:
             github_channels = get_channels_for_function("github")
@@ -965,7 +1199,11 @@ class GitHubArchiver(LogMixin):
 
             browser = None
         else:
-            print("\n  Начинаю обновление...\n")
+            auto_sync = (mode == "auto")
+            if auto_sync:
+                print("\n  Начинаю автоматическое обновление...\n")
+            else:
+                print("\n  Начинаю обновление...\n")
 
             browser = None
             try:
@@ -983,50 +1221,36 @@ class GitHubArchiver(LogMixin):
             repo_delay = self.config.get('archiver', {}).get('repo_delay', 30)
             split_mode = get_split_mode(self.config, "archiver", default="auto")
 
-            with LiveProgressBar(has_update_count, "Синхронизация репозиториев") as bar:
-                current = 0
+            if auto_sync:
+                # Compact progress without progress bar
                 for i, (repo, has_new, latest_version) in enumerate(repo_updates, 1):
                     if not has_new:
                         skipped_count += 1
                         continue
 
-                    current += 1
                     full_name = repo.get('full_name', '')
                     display_name = repo.get('display_name', '')
-                    saved_version = repo.get('version', '')
                     default_branch = repo.get('default_branch', 'main')
                     owner, repo_name = full_name.split('/', 1)
-                    stars = repo.get('stars', 0)
-                    forks = repo.get('forks', 0)
-                    desc = repo.get('description', '') or 'Без описания'
-
-                    bar.update(current, item_name=display_name)
 
                     repo_update = dict(repo)
                     repo_update['version'] = latest_version
-                    repo_update['zip_size'] = None  # Will be set after download
+                    repo_update['zip_size'] = None
 
-                    print(f"\n  📦 {display_name}")
-                    print(f"  📝 {self._format_description(desc, 50)}")
-                    print("    ↓ Скачиваю ZIP...")
+                    print(f"  [{updated_count + 1}/{has_update_count}] {display_name} — ↓...", end="", flush=True)
 
                     zip_path = self.github.download_zip(owner, repo_name, default_branch)
 
                     if not zip_path or not os.path.exists(zip_path):
-                        print("    ✗ Не удалось скачать ZIP")
+                        print(" ✗")
                         error_count += 1
                         failed_names.append(full_name)
                         continue
 
                     zip_size = os.path.getsize(zip_path)
-                    zip_size_str = format_file_size(zip_size)
-                    print(f"    ✓ {zip_size_str}")
 
-                    text = self._build_message_text(repo_update, zip_size)
-
-                    print(f"    → Отправляю в MAX...")
                     success, _ = browser.send_message_with_file(
-                        text=text,
+                        text=self._build_message_text(repo_update, zip_size),
                         filepath=zip_path,
                         retries=self.config.get('archiver', {}).get('retries', 3),
                         retry_delay=self.config.get('archiver', {}).get('retry_delay', 10),
@@ -1040,15 +1264,84 @@ class GitHubArchiver(LogMixin):
                             'archive_size': zip_size
                         })
                         updated_count += 1
+                        print(f" ✓")
                     else:
                         self.journal.update_repository(full_name, {'status': 'failed', 'archive_size': zip_size})
                         error_count += 1
                         failed_names.append(full_name)
+                        print(" ✗")
 
                     if os.path.exists(zip_path):
                         self._safe_remove_file(zip_path)
 
                     time.sleep(repo_delay)
+            else:
+                with LiveProgressBar(has_update_count, "Синхронизация репозиториев") as bar:
+                    current = 0
+                    for i, (repo, has_new, latest_version) in enumerate(repo_updates, 1):
+                        if not has_new:
+                            skipped_count += 1
+                            continue
+
+                        current += 1
+                        full_name = repo.get('full_name', '')
+                        display_name = repo.get('display_name', '')
+                        saved_version = repo.get('version', '')
+                        default_branch = repo.get('default_branch', 'main')
+                        owner, repo_name = full_name.split('/', 1)
+                        stars = repo.get('stars', 0)
+                        forks = repo.get('forks', 0)
+                        desc = repo.get('description', '') or 'Без описания'
+
+                        bar.update(current, item_name=display_name)
+
+                        repo_update = dict(repo)
+                        repo_update['version'] = latest_version
+                        repo_update['zip_size'] = None  # Will be set after download
+
+                        print(f"\n  📦 {display_name}")
+                        print(f"  📝 {self._format_description(desc, 50)}")
+                        print("    ↓ Скачиваю ZIP...")
+
+                        zip_path = self.github.download_zip(owner, repo_name, default_branch)
+
+                        if not zip_path or not os.path.exists(zip_path):
+                            print("    ✗ Не удалось скачать ZIP")
+                            error_count += 1
+                            failed_names.append(full_name)
+                            continue
+
+                        zip_size = os.path.getsize(zip_path)
+                        zip_size_str = format_file_size(zip_size)
+                        print(f"    ✓ {zip_size_str}")
+
+                        text = self._build_message_text(repo_update, zip_size)
+
+                        print(f"    → Отправляю в MAX...")
+                        success, _ = browser.send_message_with_file(
+                            text=text,
+                            filepath=zip_path,
+                            retries=self.config.get('archiver', {}).get('retries', 3),
+                            retry_delay=self.config.get('archiver', {}).get('retry_delay', 10),
+                            split_mode=split_mode,
+                        )
+
+                        if success:
+                            self.journal.update_repository(full_name, {
+                                'version': latest_version,
+                                'status': 'sent',
+                                'archive_size': zip_size
+                            })
+                            updated_count += 1
+                        else:
+                            self.journal.update_repository(full_name, {'status': 'failed', 'archive_size': zip_size})
+                            error_count += 1
+                            failed_names.append(full_name)
+
+                        if os.path.exists(zip_path):
+                            self._safe_remove_file(zip_path)
+
+                        time.sleep(repo_delay)
 
         print()
         print("\n" + "═" * 60)
@@ -1066,11 +1359,14 @@ class GitHubArchiver(LogMixin):
 
         input("\n  Нажмите Enter для возврата в меню...")
 
-    def load_new_repositories(self):
+    def load_new_repositories(self, mode: str = "step"):
         """Загрузка новых репозиториев
 
         Автоматический автосбор: если в базе меньше репо чем запрошено,
         система сама собирает недостающие тира через tiered-коллектор.
+
+        Args:
+            mode: 'step' (пошаговая), 'auto' (автозагрузка), 'parallel' (параллельная)
         """
         print("\n" + "═" * 60)
         print("Загрузка новых репозиториев")
@@ -1083,6 +1379,11 @@ class GitHubArchiver(LogMixin):
         limit = self.config.get('archiver', {}).get('limit', 100)
 
         self._init_github()
+
+        # ── Process orphaned repos recovered from filenames ──
+        if self._orphaned_repos_to_retry:
+            self._process_orphaned_retries()
+            self._orphaned_repos_to_retry = []
 
         # ── Auto-collect if needed ────────────────────────────
         from repo_collector import RepoCollector as _RepoCollector
@@ -1161,18 +1462,8 @@ class GitHubArchiver(LogMixin):
             input("\n  Нажмите Enter для возврата в меню...")
             return
 
-        print("\n  Режим загрузки:")
-        print("  [Enter] Пошаговая (с подтверждением)")
-        print("  [P]  Параллельная во все каналы")
-        print("  [Q] Отмена")
-        mode_choice = input("\n  Ваш выбор [Enter/P/Q]: ").strip().lower()
-
-        if mode_choice == 'q':
-            print("\n  Загрузка отменена.")
-            input("\n  Нажмите Enter для возврата в меню...")
-            return
-
-        use_parallel = (mode_choice == 'p')
+        # Режим из параметра
+        use_parallel = (mode == "parallel")
         if use_parallel:
             github_channels = get_channels_for_function("github")
             if len(github_channels) <= 1:
@@ -1184,10 +1475,10 @@ class GitHubArchiver(LogMixin):
                     if new_ch:
                         github_channels = get_channels_for_function("github")
                     else:
-                        print("\n  Отменено. Использую обычный режим.")
+                        print("\n  Отменено. Использую пошаговый режим.")
                         use_parallel = False
                 else:
-                    print("\n  Использую обычный режим.")
+                    print("\n  Использую пошаговый режим.")
                     use_parallel = False
 
         loaded_count = 0
@@ -1259,7 +1550,7 @@ class GitHubArchiver(LogMixin):
             else:
                 print("  ✗ Нет файлов для отправки")
         else:
-            auto_load = False
+            auto_load = (mode == "auto")
             repo_delay = self.config.get('archiver', {}).get('repo_delay', 30)
 
             try:
@@ -1324,6 +1615,146 @@ class GitHubArchiver(LogMixin):
         print(f"  Обработано: {loaded_count + error_count}")
         print(f"  Успешно: {loaded_count}")
         print(f"  Ошибок: {error_count}")
+        print("═" * 60)
+
+        if failed_names:
+            self._prompt_ignore_failed(failed_names)
+
+        if browser:
+            browser.close()
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def retry_failed_repositories(self):
+        """Повторить загрузку неудачных репозиториев из журнала.
+
+        Берёт все репозитории со статусом 'failed' или 'incomplete',
+        перекачивает и пересылает их в MAX.
+        """
+        print("\n" + "═" * 60)
+        print("Повтор неудачных загрузок")
+        print("═" * 60)
+
+        if not self._ensure_channel_ready("max", "MAX канал", "max"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        # Собрать неудачные репозитории
+        failed_repos = self.journal.get_repositories_by_status('failed')
+        incomplete_repos = self.journal.get_repositories_by_status('incomplete')
+        retry_repos = failed_repos + incomplete_repos
+
+        if not retry_repos:
+            print("\n  ✓ Нет неудачных загрузок для повторения.")
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        # Отфильтровать игнорируемые
+        ignored_retry = [r for r in retry_repos if self.journal.is_ignored(r.get('full_name', ''))]
+        retry_repos = [r for r in retry_repos if not self.journal.is_ignored(r.get('full_name', ''))]
+
+        print(f"\n  Найдено неудачных загрузок: {len(failed_repos) + len(incomplete_repos)}")
+        if ignored_retry:
+            print(f"  В игнор-листе (пропускаются): {len(ignored_retry)}")
+        print(f"  К повторению: {len(retry_repos)}\n")
+
+        for i, repo in enumerate(retry_repos[:10], 1):
+            print(f"    {i}. {repo.get('full_name', 'unknown')} ({repo.get('status', '?')})")
+        if len(retry_repos) > 10:
+            print(f"    ... и ещё {len(retry_repos) - 10}")
+
+        print()
+        choice = input("  [Enter] Повторить все | [Q] Отмена: ").strip().lower()
+        if choice == 'q':
+            print("\n  Отменено.")
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        self._init_github()
+
+        browser = None
+        try:
+            browser = self._ensure_max_connected()
+        except Exception as e:
+            print(f"\n  ✗ Не удалось подключиться к MAX: {e}")
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        repo_delay = self.config.get('archiver', {}).get('repo_delay', 30)
+        split_mode = get_split_mode(self.config, "archiver", default="auto")
+        retries = self.config.get('archiver', {}).get('retries', 3)
+        retry_delay = self.config.get('archiver', {}).get('retry_delay', 10)
+
+        recovered_count = 0
+        still_failed_count = 0
+        failed_names = []
+
+        with LiveProgressBar(len(retry_repos), "Повтор неудачных загрузок") as bar:
+            for i, repo_data in enumerate(retry_repos, 1):
+                full_name = repo_data.get('full_name', '')
+                display_name = repo_data.get('display_name', full_name)
+                default_branch = repo_data.get('default_branch', 'main')
+
+                bar.update(i, item_name=display_name)
+                print(f"\n  {'═' * 56}")
+                print(f"  #{i}/{len(retry_repos)} | {display_name}")
+                print(f"  Предыдущий статус: {repo_data.get('status', '?')}")
+                print(f"  {'─' * 56}")
+
+                # Скачать ZIP
+                owner, repo_name = full_name.split('/', 1)
+                print("    ↓ Скачиваю ZIP...")
+                zip_path = self.github.download_zip(owner, repo_name, default_branch)
+
+                if not zip_path or not os.path.exists(zip_path):
+                    print("    ✗ Не удалось скачать ZIP")
+                    still_failed_count += 1
+                    failed_names.append(full_name)
+                    continue
+
+                zip_size = os.path.getsize(zip_path)
+                zip_size_str = format_file_size(zip_size)
+                print(f"    ✓ {zip_size_str}")
+
+                # Подготовить сообщение
+                text = self._build_message_text(repo_data, zip_size)
+                print(f"    → Отправляю в MAX...")
+
+                success, _ = browser.send_message_with_file(
+                    text=text,
+                    filepath=zip_path,
+                    retries=retries,
+                    retry_delay=retry_delay,
+                    split_mode=split_mode,
+                )
+
+                if success:
+                    self.journal.update_repository(full_name, {
+                        'status': 'sent',
+                        'archive_size': zip_size
+                    })
+                    recovered_count += 1
+                    print(f"    ✓ Отправлено (восстановлено)")
+                else:
+                    self.journal.update_repository(full_name, {
+                        'status': 'failed',
+                        'archive_size': zip_size
+                    })
+                    still_failed_count += 1
+                    failed_names.append(full_name)
+                    print(f"    ✗ Не удалось отправить")
+
+                # Удалить временный файл
+                if os.path.exists(zip_path):
+                    self._safe_remove_file(zip_path)
+
+                time.sleep(repo_delay)
+
+        print()
+        print("\n" + "═" * 60)
+        print("Повтор загрузок завершён")
+        print(f"  Восстановлено: {recovered_count}")
+        print(f"  Всё ещё неудачных: {still_failed_count}")
         print("═" * 60)
 
         if failed_names:
@@ -1441,11 +1872,22 @@ class GitHubArchiver(LogMixin):
             print(f"    ✓ Версия {version} уже загружена, пропускаю")
             return True
 
+        # Predict the filename that download_zip will create
+        expected_filename = f"{owner}-{repo_name}-{default_branch}.zip"
+
+        # Track in journal BEFORE download — survives Ctrl+C so we can recover
+        self.journal.set_currently_processing(full_name, expected_filename)
+
         print("    ↓ Скачиваю ZIP...")
         zip_path = self.github.download_zip(owner, repo_name, default_branch)
 
         if not zip_path or not os.path.exists(zip_path):
             print("    ✗ Не удалось скачать ZIP")
+            # Mark as failed in journal so retry will pick it up
+            repo_data['status'] = 'failed'
+            repo_data['version'] = repo_data.get('version', '') or 'unknown'
+            self.journal.add_repository(repo_data)
+            self.journal.clear_currently_processing()
             return False
 
         zip_size = os.path.getsize(zip_path)
@@ -1479,6 +1921,7 @@ class GitHubArchiver(LogMixin):
             repo_data['version'] = repo_data.get('version', '') or 'unknown'
             repo_data['archive_size'] = zip_size
             self.journal.add_repository(repo_data)
+            self.journal.clear_currently_processing()
             return False
 
         # Clean up temp file after upload
@@ -1491,6 +1934,7 @@ class GitHubArchiver(LogMixin):
         repo_data['version'] = repo_data.get('version', '') or 'unknown'
         repo_data['archive_size'] = zip_size
         self.journal.add_repository(repo_data)
+        self.journal.clear_currently_processing()
 
         return success
 
@@ -3081,25 +3525,35 @@ class GitHubArchiver(LogMixin):
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
             self._github_menu()
-            choice = prompt_numeric_choice("Выберите действие [0-8]", ["0", "1", "2", "3", "4", "5", "6", "7", "8"])
+            choice = prompt_numeric_choice("Выберите действие [0-9/a/b/c/d]", ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d"])
 
             if choice == '0':
                 break
             elif choice == '1':
-                self.sync_repositories()
+                self.sync_repositories(mode="step")
             elif choice == '2':
-                self.load_new_repositories()
+                self.sync_repositories(mode="auto")
             elif choice == '3':
-                self._collect_repos()
+                self.sync_repositories(mode="parallel")
             elif choice == '4':
-                self._show_collector_status()
+                self.load_new_repositories(mode="step")
             elif choice == '5':
-                self.load_runtime()
+                self.load_new_repositories(mode="auto")
             elif choice == '6':
-                self.sync_runtimes()
+                self.load_new_repositories(mode="parallel")
             elif choice == '7':
-                self._manage_ignore_list()
+                self.retry_failed_repositories()
             elif choice == '8':
+                self._collect_repos()
+            elif choice == '9':
+                self._show_collector_status()
+            elif choice == 'a':
+                self.load_runtime()
+            elif choice == 'b':
+                self.sync_runtimes()
+            elif choice == 'c':
+                self._manage_ignore_list()
+            elif choice == 'd':
                 self.audit_and_restore_publications()
 
     def _collect_repos(self):
@@ -3393,12 +3847,20 @@ class GitHubArchiver(LogMixin):
         # Offer fix
         if diff.has_issues:
             print("\n  Найдены расхождения. Исправить журнал?")
-            print("  [Y] Да — удалить записи, отсутствующие в канале")
+            print("  [R] Удалить — удалить записи, отсутствующие в канале")
+            print("  [B] Двусторонняя синхронизация — удалить, добавить орфаны,")
+            print("      обновить версии")
             print("  [N] Нет — только просмотр")
-            fix_choice = input("  Ваш выбор [Y/N]: ").strip().lower()
-            if fix_choice == "y":
+            fix_choice = input("  Ваш выбор [R/B/N]: ").strip().lower()
+            if fix_choice == "r":
                 removed = verifier.fix_journal(diff)
                 print(f"\n  ✓ Удалено {removed} записей из журнала")
+            elif fix_choice == "b":
+                result = verifier.fix_journal_bidirectional(diff)
+                print(f"\n  ✓ Двусторонняя синхронизация:")
+                print(f"    Удалено: {result['removed']}")
+                print(f"    Добавлено: {result['added']}")
+                print(f"    Обновлено: {result['updated']}")
             else:
                 print("\n  Журнал не изменён.")
 
