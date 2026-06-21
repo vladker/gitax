@@ -76,7 +76,7 @@ class BaseJournal(LogMixin):
         acquired = self._write_lock.acquire(timeout=5)
         if not acquired:
             self.logger.warning("Journal write lock timeout, skipping save")
-            return
+            return False
         try:
             self._pre_save()
             temp_fd, temp_path = tempfile.mkstemp(
@@ -94,6 +94,7 @@ class BaseJournal(LogMixin):
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
                 raise
+            return True
         finally:
             self._write_lock.release()
 
@@ -147,7 +148,40 @@ class RuntimeJournalMixin:
             ...
         ]
     }
+
+    Also tracks currently_processing item under data["currently_processing"] key
+    for crash recovery — survives interrupts so interrupted items can be marked failed.
     """
+
+    # ── Currently processing tracking ────────────────────────
+
+    def set_currently_processing(self, full_name: str, filename: str = "") -> None:
+        """Mark an item as currently being processed. Survives interrupts.
+
+        Args:
+            full_name: Repository/item identifier (e.g. "owner/repo")
+            filename: Associated temp filename (e.g. "owner-repo-main.zip")
+        """
+        self.data["currently_processing"] = {
+            "full_name": full_name,
+            "filename": filename,
+            "started_at": datetime.now().isoformat(),
+        }
+        self.save()
+
+    def get_currently_processing(self) -> dict | None:
+        """Get the currently processing item, or None if idle."""
+        cp = self.data.get("currently_processing")
+        if cp and isinstance(cp, dict) and cp.get("full_name"):
+            return cp
+        return None
+
+    def clear_currently_processing(self) -> None:
+        """Clear the currently processing marker."""
+        self.data.pop("currently_processing", None)
+        self.save()
+
+    # ── Runtime version tracking ─────────────────────────────
 
     def get_runtime_version(self) -> str | None:
         """Get the saved runtime version, or None if not set."""
