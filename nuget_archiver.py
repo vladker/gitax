@@ -153,7 +153,7 @@ class NuGetArchiver(LogMixin, BrowserInitMixin):
         repo_delay = self.config.get('nuget_archiver', {}).get(
             'repo_delay', self.config.get('archiver', {}).get('repo_delay', 30))
         output_dir = self.config.get('nuget_archiver', {}).get('output_dir', './temp_nuget')
-        split_mode = get_split_mode(self.config)
+        split_mode = get_split_mode(self.config, "nuget_archiver", default="auto")
 
         print("\n" + "═" * 60)
         print("          Загрузка топ .NET пакетов")
@@ -229,10 +229,14 @@ class NuGetArchiver(LogMixin, BrowserInitMixin):
                 success = False
                 for attempt in range(1, retries + 1):
                     try:
-                        browser.send_message(msg_text)
-                        for fp in files_to_send:
-                            browser.send_file_message(fp)
-                        success = True
+                        success, _ = browser.send_message_with_files(
+                            text=msg_text,
+                            filepaths=files_to_send,
+                            retries=1,
+                            retry_delay=0,
+                            split_mode=split_mode,
+                            expected_extensions=['.nupkg', '.7z', '.7z.001'],
+                        )
                         break
                     except Exception as e:
                         print(f"  ⚠ Попытка {attempt}/{retries}: {e}")
@@ -413,7 +417,7 @@ class NuGetArchiver(LogMixin, BrowserInitMixin):
             'retry_delay', self.config.get('archiver', {}).get('retry_delay', 10))
         repo_delay = self.config.get('nuget_archiver', {}).get(
             'repo_delay', self.config.get('archiver', {}).get('repo_delay', 30))
-        split_mode = get_split_mode(self.config)
+        split_mode = get_split_mode(self.config, "nuget_archiver", default="auto")
 
         updated = 0
         unchanged = 0
@@ -469,10 +473,14 @@ class NuGetArchiver(LogMixin, BrowserInitMixin):
             success = False
             for attempt in range(1, retries + 1):
                 try:
-                    browser.send_message(msg_text)
-                    for fp in files_to_send:
-                        browser.send_file_message(fp)
-                    success = True
+                    success, _ = browser.send_message_with_files(
+                        text=msg_text,
+                        filepaths=files_to_send,
+                        retries=1,
+                        retry_delay=0,
+                        split_mode=split_mode,
+                        expected_extensions=['.nupkg', '.7z', '.7z.001'],
+                    )
                     break
                 except Exception as e:
                     if attempt < retries:
