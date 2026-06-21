@@ -109,5 +109,19 @@ class GitHubJournalAdapter:
     def remove_entry(self, key: str) -> bool:
         return self.journal.remove_repository(key)
 
+    def add_entry(self, entry_data: dict) -> bool:
+        """Add a repository to the journal.
+
+        Used for bidirectional verification when a file exists in the
+        channel but is missing from the journal.
+        """
+        entry_data.setdefault("status", "sent")
+        entry_data.setdefault("version", "")
+        return self.journal.add_repository(entry_data)
+
+    def update_version(self, key: str, version: str) -> bool:
+        """Update the version of a repository in the journal."""
+        return self.journal.update_repository(key, {"version": version})
+
     def get_stats(self) -> dict:
         return self.journal.get_stats()

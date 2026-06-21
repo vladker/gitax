@@ -89,5 +89,23 @@ class MediaJournalAdapter:
                 return True
         return False
 
+    def add_entry(self, entry_data: dict) -> bool:
+        """Add a media file to the journal.
+
+        Used for bidirectional verification when a file exists in the
+        channel but is missing from the journal.
+        """
+        entry_data.setdefault("status", "sent")
+        self.journal.data.setdefault("entries", []).append(entry_data)
+        self.journal.save()
+        return True
+
+    def update_version(self, key: str, version: str) -> bool:
+        """Update version of a media entry.
+
+        Media journal doesn't track versions, so this is a no-op.
+        """
+        return True
+
     def get_stats(self) -> dict:
         return self.journal.get_stats()

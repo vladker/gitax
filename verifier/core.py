@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from verifier.models import ChannelFile, DiffResult, VerifierMode
 from verifier.adapters import ChannelAdapter, JournalAdapter
+from typing import Any
 
 
 class VerifierError(Exception):
@@ -119,6 +120,65 @@ class JournalChannelVerifier:
                 removed += 1
         return removed
 
+    def fix_journal_bidirectional(self, diff: DiffResult) -> dict[str, int]:
+        """Fix journal bidirectionally: remove missing, add orphans, update versions.
+
+        Performs all three operations:
+        1. Removes entries present in journal but missing from channel
+        2. Adds entries present in channel but missing from journal
+        3. Updates version mismatches
+
+        Args:
+            diff: DiffResult from verify().
+
+        Returns:
+            Dict with counts: {'removed': int, 'added': int, 'updated': int}
+        """
+        removed = 0
+        added = 0
+        updated = 0
+
+        # Step 1: Remove entries in journal but not in channel
+        for key in diff.in_journal_not_in_channel:
+            if self.journal_adapter.remove_entry(key):
+                removed += 1
+
+        # Step 2: Add entries in channel but not in journal
+        for key in diff.in_channel_not_in_journal:
+            entry_data = self._build_entry_from_key(key)
+            if entry_data and self.journal_adapter.add_entry(entry_data):
+                added += 1
+
+        # Step 3: Update version mismatches
+        for mm in diff.version_mismatches:
+            key = mm.get("key", "")
+            channel_file = mm.get("channel_file", "")
+            version = self._extract_version_from_filename(channel_file)
+            if version and self.journal_adapter.update_version(key, version):
+                updated += 1
+
+        return {"removed": removed, "added": added, "updated": updated}
+
+    def _build_entry_from_key(self, key: str) -> dict[str, Any] | None:
+        """Build a journal entry dict from a channel key.
+
+        Subclasses or adapters may override this for custom entry construction.
+        Default implementation creates a minimal entry with the key.
+        """
+        return {"key": key}
+
+    def _extract_version_from_filename(self, filename: str) -> str | None:
+        """Extract version string from a filename.
+
+        Returns None if version cannot be extracted.
+        """
+        import re
+        # Try to match common version patterns: -1.2.3, -v1.2.3, etc.
+        m = re.search(r'[-v]?(?:v)?(\d+\.\d+\.\d+)', filename)
+        if m:
+            return m.group(1)
+        return None
+
     def report(self, diff: DiffResult) -> str:
         """Generate a human-readable verification report.
 
@@ -143,7 +203,7 @@ class JournalChannelVerifier:
             lines.append("  ⚠ ВНИМАНИЕ: Скан неполный (частичные результаты)")
             lines.append("")
 
-        if not diff.has_issues and not diff.in_channel_not_in_journal:
+        if not diff.has_issues:
             lines.append("  ✓ Все записи журнала найдены в канале. Расхождений нет.")
         else:
             if diff.in_journal_not_in_channel:

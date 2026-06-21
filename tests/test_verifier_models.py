@@ -62,7 +62,7 @@ class TestDiffResult:
 
     def test_has_issues_orphans_only(self):
         dr = DiffResult(in_channel_not_in_journal=["x"])
-        assert dr.has_issues is False
+        assert dr.has_issues is True
         assert dr.orphan_count == 1
 
     def test_has_issues_mismatches(self):

@@ -111,5 +111,27 @@ class PyPIJournalAdapter:
                 return True
         return False
 
+    def add_entry(self, entry_data: dict) -> bool:
+        """Add a library to the journal.
+
+        Used for bidirectional verification when a file exists in the
+        channel but is missing from the journal.
+        """
+        entry_data.setdefault("downloaded", True)
+        entry_data.setdefault("sent", True)
+        self.journal.data.setdefault("libraries", []).append(entry_data)
+        self.journal.save()
+        return True
+
+    def update_version(self, key: str, version: str) -> bool:
+        """Update the version of a library in the journal."""
+        for entry in self.journal.get_all():
+            entry_key = self.entry_key(entry)
+            if entry_key == key:
+                entry["version"] = version
+                self.journal.save()
+                return True
+        return False
+
     def get_stats(self) -> dict:
         return self.journal.get_stats()

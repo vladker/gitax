@@ -75,6 +75,35 @@ class JournalAdapter(Protocol):
         """Remove a journal entry by key. Returns True if removed."""
         ...
 
+    def add_entry(self, entry_data: dict) -> bool:
+        """Add a new entry to the journal.
+
+        Used for bidirectional verification when a file exists in the
+        channel but is missing from the journal.
+
+        Args:
+            entry_data: Dict with entry fields (full_name, version, status, etc.)
+
+        Returns:
+            True if entry was added successfully.
+        """
+        ...
+
+    def update_version(self, key: str, version: str) -> bool:
+        """Update the version of an existing journal entry.
+
+        Used for bidirectional verification when a version mismatch is
+        detected between journal and channel.
+
+        Args:
+            key: Unique key identifying the entry.
+            version: New version string.
+
+        Returns:
+            True if entry was updated successfully.
+        """
+        ...
+
     def get_stats(self) -> dict:
         """Get journal statistics."""
         ...

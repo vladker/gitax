@@ -36,6 +36,8 @@ class MockJournalAdapter:
     def __init__(self, entries):
         self.entries = list(entries)
         self.removed_keys = set()
+        self.added_entries = []
+        self.updated_versions = {}
 
     def get_entries(self):
         return self.entries
@@ -62,6 +64,18 @@ class MockJournalAdapter:
         self.removed_keys.add(key)
         self.entries = [e for e in self.entries if self.entry_key(e) != key]
         return True
+
+    def add_entry(self, entry_data):
+        self.added_entries.append(entry_data)
+        return True
+
+    def update_version(self, key, version):
+        for entry in self.entries:
+            if self.entry_key(entry) == key:
+                entry["version"] = version
+                self.updated_versions[key] = version
+                return True
+        return False
 
     def get_stats(self):
         return {"total": len(self.entries)}
@@ -285,3 +299,123 @@ class TestVerifierError:
     def test_verifier_error_message(self):
         err = VerifierError("CDP not available")
         assert "CDP not available" in str(err)
+
+
+class TestFixJournalBidirectional:
+    """Test fix_journal_bidirectional removes, adds, and updates."""
+
+    def test_bidirectional_removes_missing(self):
+        """Test that bidirectional fix removes entries missing from channel."""
+        entries = [
+            {"key": "a", "filename": "a.zip"},
+            {"key": "b", "filename": "b.zip"},
+            {"key": "c", "filename": "c.zip"},
+        ]
+        files = [ChannelFile("a.zip"), ChannelFile("c.zip")]
+        ca = MockChannelAdapter(files)
+        ja = MockJournalAdapter(entries)
+        verifier = JournalChannelVerifier(ca, ja, "Test")
+
+        diff = verifier.verify()
+        result = verifier.fix_journal_bidirectional(diff)
+
+        assert result["removed"] == 1
+        assert "b" in ja.removed_keys
+        assert len(ja.entries) == 2
+
+    def test_bidirectional_adds_orphans(self):
+        """Test that bidirectional fix adds orphan entries from channel."""
+        entries = [
+            {"key": "a", "filename": "a.zip"},
+        ]
+        files = [
+            ChannelFile("a.zip"),
+            ChannelFile("orphan.zip"),
+        ]
+        ca = MockChannelAdapter(files)
+        ja = MockJournalAdapter(entries)
+        verifier = JournalChannelVerifier(ca, ja, "Test")
+
+        diff = verifier.verify()
+        result = verifier.fix_journal_bidirectional(diff)
+
+        assert result["added"] == 1
+        assert len(ja.added_entries) == 1
+        assert ja.added_entries[0].get("key") == "orphan.zip"
+
+    def test_bidirectional_all_operations(self):
+        """Test that bidirectional fix performs all three operations."""
+        entries = [
+            {"key": "a", "filename": "a.zip"},
+            {"key": "b", "filename": "b.zip"},  # missing from channel
+        ]
+        files = [
+            ChannelFile("a.zip"),
+            ChannelFile("orphan.zip"),  # orphan in channel
+        ]
+        ca = MockChannelAdapter(files)
+        ja = MockJournalAdapter(entries)
+        verifier = JournalChannelVerifier(ca, ja, "Test")
+
+        diff = verifier.verify()
+        result = verifier.fix_journal_bidirectional(diff)
+
+        assert result["removed"] == 1
+        assert result["added"] == 1
+        assert result["updated"] == 0
+
+    def test_bidirectional_no_changes_when_synced(self):
+        """Test that bidirectional fix makes no changes when synced."""
+        entries = [
+            {"key": "a", "filename": "a.zip"},
+        ]
+        files = [ChannelFile("a.zip")]
+        ca = MockChannelAdapter(files)
+        ja = MockJournalAdapter(entries)
+        verifier = JournalChannelVerifier(ca, ja, "Test")
+
+        diff = verifier.verify()
+        result = verifier.fix_journal_bidirectional(diff)
+
+        assert result["removed"] == 0
+        assert result["added"] == 0
+        assert result["updated"] == 0
+        assert len(ja.removed_keys) == 0
+        assert len(ja.added_entries) == 0
+
+
+class TestExtractVersion:
+    """Test _extract_version_from_filename."""
+
+    def test_extract_version_standard(self):
+        verifier = JournalChannelVerifier(
+            MockChannelAdapter([]),
+            MockJournalAdapter([]),
+            "Test"
+        )
+        version = verifier._extract_version_from_filename(
+            "package-1.2.3.tar.gz"
+        )
+        assert version == "1.2.3"
+
+    def test_extract_version_with_v_prefix(self):
+        verifier = JournalChannelVerifier(
+            MockChannelAdapter([]),
+            MockJournalAdapter([]),
+            "Test"
+        )
+        version = verifier._extract_version_from_filename(
+            "package-v2.0.0.zip"
+        )
+        assert version == "2.0.0"
+
+    def test_extract_version_no_match(self):
+        verifier = JournalChannelVerifier(
+            MockChannelAdapter([]),
+            MockJournalAdapter([]),
+            "Test"
+        )
+        version = verifier._extract_version_from_filename(
+            "no-version-here.zip"
+        )
+        assert version is None

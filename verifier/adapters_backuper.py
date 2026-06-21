@@ -99,5 +99,25 @@ class BackuperJournalAdapter:
                 return True
         return False
 
+    def add_entry(self, entry_data: dict) -> bool:
+        """Add a backup to the journal.
+
+        Used for bidirectional verification when a file exists in the
+        channel but is missing from the journal.
+        """
+        entry_data.setdefault("status", "uploaded")
+        entry_data.setdefault("volume_count", 1)
+        self.journal.data.setdefault("backups", []).append(entry_data)
+        self.journal.save()
+        return True
+
+    def update_version(self, key: str, version: str) -> bool:
+        """Update version info of a backup in the journal.
+
+        Backuper doesn't track versions the same way, so this is a no-op
+        that returns True to indicate no error.
+        """
+        return True
+
     def get_stats(self) -> dict:
         return self.journal.get_stats()
