@@ -157,25 +157,49 @@ class RustRuntime(RuntimeAPI):
             return ""
 
     def get_download_urls(self, version: str) -> list[dict[str, str]]:
-        """Get Rust installer URLs for all OS targets."""
+        """Get full offline Rust distribution URLs for all OS targets.
+
+        Downloads the complete toolchain (rustc, cargo, stdlib) from
+        static.rust-lang.org — no internet required during installation.
+        Each archive is 300–500 MB.
+        """
+        base = f"https://static.rust-lang.org/dist/rust-{version}"
         return [
             {
                 "os": OSTarget.WINDOWS,
-                "url": "https://win.rustup.rs/x86_64",
-                "filename": "rustup-init.exe",
-                "size_hint": "~15 MB",
+                "url": f"{base}-x86_64-pc-windows-msvc.tar.gz",
+                "filename": f"rust-{version}-x86_64-pc-windows-msvc.tar.gz",
+                "size_hint": "~400 MB",
+            },
+            {
+                "os": OSTarget.WINDOWS,
+                "url": f"{base}-x86_64-pc-windows-gnu.tar.gz",
+                "filename": f"rust-{version}-x86_64-pc-windows-gnu.tar.gz",
+                "size_hint": "~400 MB",
             },
             {
                 "os": OSTarget.MACOS,
-                "url": "https://sh.rustup.rs",
-                "filename": "rustup-init.sh",
-                "size_hint": "~2 KB",
+                "url": f"{base}-x86_64-apple-darwin.tar.gz",
+                "filename": f"rust-{version}-x86_64-apple-darwin.tar.gz",
+                "size_hint": "~350 MB",
+            },
+            {
+                "os": OSTarget.MACOS,
+                "url": f"{base}-aarch64-apple-darwin.tar.gz",
+                "filename": f"rust-{version}-aarch64-apple-darwin.tar.gz",
+                "size_hint": "~350 MB",
             },
             {
                 "os": OSTarget.LINUX,
-                "url": "https://sh.rustup.rs",
-                "filename": "rustup-init.sh",
-                "size_hint": "~2 KB",
+                "url": f"{base}-x86_64-unknown-linux-gnu.tar.gz",
+                "filename": f"rust-{version}-x86_64-unknown-linux-gnu.tar.gz",
+                "size_hint": "~300 MB",
+            },
+            {
+                "os": OSTarget.LINUX,
+                "url": f"{base}-aarch64-unknown-linux-gnu.tar.gz",
+                "filename": f"rust-{version}-aarch64-unknown-linux-gnu.tar.gz",
+                "size_hint": "~300 MB",
             },
         ]
 
