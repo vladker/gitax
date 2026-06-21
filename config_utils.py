@@ -284,21 +284,17 @@ def is_setup_complete(config: dict) -> bool:
     Check if required configuration is present.
 
     Required values:
-    - GITHUB_TOKEN from env var only (never from config.yaml)
+    - GITHUB_TOKEN from env var (OPTIONAL - anonymous mode works with lower rate limit)
     - At least one non-skipped channel has a URL configured
       (from env var or config.yaml channels section)
-    - OR: all 4 channels are explicitly skipped (user's choice)
+    - OR: all channels are explicitly skipped (user's choice)
 
     Args:
         config: Loaded config dict (may contain 'channels' and 'setup' keys)
 
     Returns:
-        True if token exists and at least one channel is ready, or all skipped
+        True if at least one channel is ready, or all skipped
     """
-    token = os.environ.get("GITHUB_TOKEN", "").strip()
-    if not token:
-        return False
-
     skipped = get_skipped_channels(config)
     channels = config.get("channels", {}) or {}
 

@@ -61,6 +61,7 @@ Thumbs.db
 # Journal backup
 *.backup.json
 *.bak
+softportal_journal.json
 
 # Backup temp files
 temp_backups/

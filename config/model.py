@@ -123,6 +123,7 @@ class PyPILibsArchiverConfig(BaseModel):
     retries: int = 3
     retry_delay: int = 10
     split_mode: Literal["auto", "on", "off", "prompt"] = "auto"
+    batch_size: int = 100
 
 
 class NpmArchiverConfig(BaseModel):

@@ -22,6 +22,10 @@ _CHANNEL_MIGRATION_MAP = {
     "media": ("media", "Media Main"),
     "backup": ("backup", "Backup Main"),
     "npm": ("npm", "NPM Main"),
+    "cargo": ("cargo", "Cargo Main"),
+    "nuget": ("nuget", "NuGet Main"),
+    "rubygems": ("rubygems", "RubyGems Main"),
+    "softportal": ("softportal", "SoftPortal Main"),
 }
 
 
@@ -93,6 +97,10 @@ def _apply_env_overrides(config: AppConfig) -> AppConfig:
         "CHANNEL_MEDIA": ("channels", "media"),
         "CHANNEL_BACKUP": ("channels", "backup"),
         "CHANNEL_NPM": ("channels", "npm"),
+        "CHANNEL_CARGO": ("channels", "cargo"),
+        "CHANNEL_NUGET": ("channels", "nuget"),
+        "CHANNEL_RUBYGEMS": ("channels", "rubygems"),
+        "CHANNEL_SOFTPORTAL": ("channels", "softportal"),
     }
     for env_key, (section, field) in legacy_map.items():
         raw = os.environ.get(env_key, "").strip()

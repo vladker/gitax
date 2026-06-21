@@ -60,6 +60,14 @@ media_archiver:
   retries: 3
   retry_delay: 10
 
+softportal_archiver:
+  limit: 50
+  output_dir: ./temp_softportal
+  retries: 3
+  retry_delay: 10
+  download_files: true
+  categories: []
+
 pypi_libs_archiver:
   limit: 20
   output_dir: ./temp_pypi_libs
