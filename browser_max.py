@@ -9,6 +9,7 @@ import time
 import sys
 import csv
 import json
+import zipfile
 import logging
 from typing import Optional
 from playwright.sync_api import sync_playwright, Page, Browser, TimeoutError as PlaywrightTimeout
@@ -118,6 +119,11 @@ class BrowserMAX(LogMixin):
         self._upload_file_name = ""
         self._is_video = False
 
+    @property
+    def is_connected(self) -> bool:
+        """Check if browser is currently connected."""
+        return self._connected
+
     def _lock_upload_state(self, filepath: str) -> None:
         """
         Lock upload guards — marks an upload as in progress.
@@ -155,6 +161,22 @@ class BrowserMAX(LogMixin):
             True if navigation is allowed, False if upload in progress
         """
         return not self._upload_in_progress
+
+    def _get_context(self):
+        """
+        Get the active BrowserContext regardless of connection mode.
+
+        In CDP mode the context lives in self.browser.contexts[0].
+        In persistent-context mode it's stored in self._context.
+
+        Returns:
+            BrowserContext or None if not connected
+        """
+        if self._context is not None:
+            return self._context
+        if self.browser is not None and self.browser.contexts:
+            return self.browser.contexts[0]
+        return None
 
     @classmethod
     def _stop_existing_playwright(cls) -> None:
@@ -3002,6 +3024,97 @@ class BrowserMAX(LogMixin):
         self.logger.warning(f"File confirmation timeout ({timeout}s)")
         return (False, "timeout")
 
+    def _dismiss_any_modal(self) -> bool:
+        """
+        Detect and dismiss any open modal/dialog that blocks composer interactions.
+
+        Tries (in order):
+          1. Close button inside <dialog[open]>
+          2. Press Escape key
+          3. Click backdrop (area outside dialog content)
+
+        Returns True if a modal was found and dismissed, False otherwise.
+        """
+        self._check_connection()
+        try:
+            # Check for open dialogs
+            has_modal = self.page.evaluate("""
+                () => {
+                    const dialogs = document.querySelectorAll('dialog[open], [data-testid="modal"]');
+                    for (const d of dialogs) {
+                        if (d.offsetParent !== null || d.style.display !== 'none') {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
+            if not has_modal:
+                return False
+
+            self.logger.debug("Modal detected, attempting dismissal...")
+
+            # Strategy 1: Find close button inside the dialog
+            closed = self.page.evaluate("""
+                () => {
+                    const dialog = document.querySelector('dialog[open], [data-testid="modal"]');
+                    if (!dialog) return false;
+                    const closeBtn = dialog.querySelector(
+                        'button[aria-label*="close" i], ' +
+                        'button[aria-label*="закрыт" i], ' +
+                        'button[class*="close"], ' +
+                        '[data-testid="close"], ' +
+                        'button svg'
+                    );
+                    if (closeBtn) {
+                        closeBtn.click();
+                        return true;
+                    }
+                    return false;
+                }
+            """)
+            if closed:
+                self.logger.debug("Modal dismissed via close button")
+                self.page.wait_for_timeout(300)
+                return True
+
+            # Strategy 2: Press Escape
+            self.page.keyboard.press("Escape")
+            self.page.wait_for_timeout(300)
+
+            # Check if it closed
+            still_open = self.page.evaluate("""
+                () => {
+                    const dialogs = document.querySelectorAll('dialog[open], [data-testid="modal"]');
+                    for (const d of dialogs) {
+                        if (d.offsetParent !== null || d.style.display !== 'none') {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
+            if not still_open:
+                self.logger.debug("Modal dismissed via Escape")
+                return True
+
+            # Strategy 3: Click backdrop
+            self.page.evaluate("""
+                () => {
+                    const dialog = document.querySelector('dialog[open], [data-testid="modal"]');
+                    if (dialog && dialog.backdrop) {
+                        dialog.backdrop.click();
+                    }
+                }
+            """)
+            self.page.wait_for_timeout(300)
+            self.logger.debug("Modal dismissed via backdrop click")
+            return True
+
+        except Exception as e:
+            self.logger.debug(f"Modal dismissal check failed: {e}")
+            return False
+
     def _find_message_input(self):
         """Find message input field"""
         self._check_connection()
@@ -3029,6 +3142,7 @@ class BrowserMAX(LogMixin):
     def _click_composer_area(self):
         """Click on message composer area to ensure focus"""
         self._check_connection()
+        self._dismiss_any_modal()
         self.logger.debug("Clicking composer area...")
 
         selectors = [
@@ -3086,6 +3200,7 @@ class BrowserMAX(LogMixin):
         self.logger.debug("Sending message...")
 
         try:
+            self._dismiss_any_modal()
             self._click_composer_area()
             self.page.wait_for_timeout(100)
 
@@ -3200,12 +3315,18 @@ class BrowserMAX(LogMixin):
                                 retries: int = 3, retry_delay: int = 10,
                                 split_threshold_mb: float = 49.0,
                                 split_mode: str = "auto",
-                                expected_extensions: list[str] | None = None) -> tuple[bool, bool]:
+                                expected_extensions: list[str] | None = None,
+                                batch_mode: bool = False,
+                                fast_mode: bool = False) -> tuple[bool, bool]:
         """
         Send text message with one or more files (supports split archives).
 
         Files larger than split_threshold_mb will be split using 7z into volumes.
         Each volume is sent as a separate message.
+
+        When batch_mode=True and multiple small files are provided, all files are
+        uploaded in a SINGLE file chooser dialog and sent as ONE batch message.
+        This is MUCH faster for many small files (e.g. .crate files).
 
         Args:
             text: Message text
@@ -3213,8 +3334,11 @@ class BrowserMAX(LogMixin):
             retries: Number of retries per file
             retry_delay: Delay between retries (seconds)
             split_threshold_mb: Threshold in MB to trigger splitting (default: 49)
+            split_mode: Split behavior - "auto", "on", "off", or "prompt"
             expected_extensions: List of file extensions to match for upload confirmation.
                                 Default: ['.zip']
+            batch_mode: If True, upload all files in ONE dialog (faster for small files)
+            fast_mode: If True, skip internal time.sleep() delays for max throughput
 
         Returns:
             Tuple of (all_success: bool, all_files_deletable: bool)
@@ -3223,12 +3347,30 @@ class BrowserMAX(LogMixin):
             self._expected_extensions = expected_extensions
         all_files = []
         volumes_to_cleanup = []
+        had_exe = False  # Track if any .exe was zipped
 
-        # Process each file - split if needed
+        # Process each file - auto-zip .exe, split if needed
+        temp_zips = []  # Track temp .zip files created from .exe for cleanup
+
         for fp in filepaths:
             if not os.path.exists(fp):
                 self.logger.error(f"File not found: {fp}")
                 continue
+
+            # Auto-zip .exe files — MAX struggles to confirm .exe in the feed
+            if fp.lower().endswith('.exe'):
+                had_exe = True
+                zip_path = fp + '.zip'
+                self.logger.info(f"Zipping {os.path.basename(fp)} into {os.path.basename(zip_path)}...")
+                try:
+                    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                        zf.write(fp, os.path.basename(fp))
+                    fp = zip_path
+                    temp_zips.append(zip_path)
+                    self.logger.info(f"✓ Zipped to {os.path.basename(zip_path)}")
+                except Exception as e:
+                    self.logger.error(f"Failed to zip {fp}: {e}, uploading original")
+                    # fall through with original fp
 
             file_size_mb = os.path.getsize(fp) / 1024 / 1024
             filename = os.path.basename(fp)
@@ -3287,6 +3429,11 @@ class BrowserMAX(LogMixin):
             self.logger.error("No files to upload")
             return (False, True)
 
+        # If any .exe was zipped to .zip, ensure .zip is in expected_extensions
+        if had_exe and '.zip' not in self._expected_extensions:
+            self._expected_extensions.append('.zip')
+            self.logger.debug("Added .zip to expected_extensions (exe was zipped)")
+
         self.logger.info(f"Uploading {len(all_files)} file(s)")
 
         # Ensure connected (reuse existing connection)
@@ -3307,13 +3454,15 @@ class BrowserMAX(LogMixin):
 
         # Send message text first
         self.logger.debug("Typing message...")
+        self._dismiss_any_modal()
         input_elem = self._find_message_input()
         if input_elem:
             self._type_message(text, input_elem)
 
         self.logger.debug("Sending about message...")
         self._send_message()
-        time.sleep(1)
+        if not fast_mode:
+            time.sleep(1)
 
         # CRITICAL: Update baseline AFTER text message is sent.
         # Messages from 0 to (old baseline-1) are from previous repos.
@@ -3328,43 +3477,89 @@ class BrowserMAX(LogMixin):
         all_success = True
         all_deletable = True
 
-        for i, fp in enumerate(all_files, 1):
-            filename = os.path.basename(fp)
-            file_size_bytes = os.path.getsize(fp)
-            file_size_mb = file_size_bytes / 1024 / 1024
-
-            self.logger.info(f"Uploading file {i}/{len(all_files)}: {filename} ({file_size_mb:.1f} MB)")
-
-            success = self._upload_single_file(
-                fp, filename, file_size_bytes,
-                retries=retries, retry_delay=retry_delay,
+        # BATCH MODE: upload ALL files in one dialog (much faster for many small files)
+        if batch_mode and len(all_files) > 1:
+            self.logger.info(
+                f"Batch mode: uploading {len(all_files)} file(s) in one dialog"
+            )
+            batch_ok = self._upload_files_batch(
+                all_files,
+                retries=retries,
+                retry_delay=retry_delay,
                 baseline_count=self._pre_upload_msg_count
             )
-
-            if not success:
+            if not batch_ok:
                 all_success = False
-                self.logger.error(f"Failed to upload: {filename}")
-                # Keep failed file for potential retry
+                self.logger.error("Batch upload failed")
             else:
-                self.logger.info(f"✓ Uploaded: {filename}")
-                # Update baseline so next volume only looks at messages AFTER this one
+                self.logger.info(f"✓ Batch uploaded {len(all_files)} file(s)")
                 self._pre_upload_msg_count = self.page.evaluate(
                     "() => document.querySelectorAll('[class*=\"message\"]').length"
                 ) or 0
-                self.logger.debug(f"Updated baseline: {self._pre_upload_msg_count}")
-                # Delete volume IMMEDIATELY after confirmation
-                # This ensures partial uploads are not lost on interrupt
-                if fp in volumes_to_cleanup:
-                    try:
-                        if os.path.exists(fp):
-                            os.remove(fp)
-                            self.logger.debug(f"Deleted: {filename}")
-                    except Exception as e:
-                        self.logger.warning(f"Failed to delete {filename}: {e}")
 
-            # Small delay between files
-            if i < len(all_files):
-                time.sleep(1)
+            # Cleanup volumes in batch mode
+            if volumes_to_cleanup:
+                remaining = [v for v in volumes_to_cleanup if os.path.exists(v)]
+                if remaining:
+                    self.logger.info(f"Cleaning up {len(remaining)} remaining volumes...")
+                    cleanup_volumes(remaining)
+            # Cleanup temp zips
+            for z in temp_zips:
+                try:
+                    if os.path.exists(z):
+                        os.remove(z)
+                        self.logger.debug(f"Deleted temp zip: {os.path.basename(z)}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to delete temp zip {z}: {e}")
+        else:
+            for i, fp in enumerate(all_files, 1):
+                filename = os.path.basename(fp)
+                file_size_bytes = os.path.getsize(fp)
+                file_size_mb = file_size_bytes / 1024 / 1024
+
+                self.logger.info(f"Uploading file {i}/{len(all_files)}: {filename} ({file_size_mb:.1f} MB)")
+
+                success = self._upload_single_file(
+                    fp, filename, file_size_bytes,
+                    retries=retries, retry_delay=retry_delay,
+                    baseline_count=self._pre_upload_msg_count
+                )
+
+                if not success:
+                    all_success = False
+                    self.logger.error(f"Failed to upload: {filename}")
+                    # Keep failed file for potential retry
+                else:
+                    self.logger.info(f"✓ Uploaded: {filename}")
+                    # Update baseline so next volume only looks at messages AFTER this one
+                    self._pre_upload_msg_count = self.page.evaluate(
+                        "() => document.querySelectorAll('[class*=\"message\"]').length"
+                    ) or 0
+                    self.logger.debug(f"Updated baseline: {self._pre_upload_msg_count}")
+                    # Delete volume IMMEDIATELY after confirmation
+                    # This ensures partial uploads are not lost on interrupt
+                    if fp in volumes_to_cleanup:
+                        # Retry delete — Windows sometimes holds file locks briefly
+                        for del_attempt in range(1, 6):
+                            try:
+                                if os.path.exists(fp):
+                                    os.remove(fp)
+                                    self.logger.debug(f"Deleted: {filename}")
+                                break
+                            except (OSError, PermissionError) as e:
+                                if del_attempt < 5:
+                                    self.logger.debug(
+                                        f"Retry delete {filename} ({del_attempt}/5): {e}"
+                                    )
+                                    time.sleep(1)
+                                else:
+                                    self.logger.warning(
+                                        f"Failed to delete {filename} after 5 attempts: {e}"
+                                    )
+
+                # Small delay between files (skip in fast_mode)
+                if i < len(all_files) and not fast_mode:
+                    time.sleep(1)
 
         # Cleanup any remaining volumes (should be none with immediate delete)
         if volumes_to_cleanup:
@@ -3373,7 +3568,140 @@ class BrowserMAX(LogMixin):
                 self.logger.info(f"Cleaning up {len(remaining)} remaining volumes...")
                 cleanup_volumes(remaining)
 
+        # Cleanup temp zip files
+        for z in temp_zips:
+            try:
+                if os.path.exists(z):
+                    os.remove(z)
+                    self.logger.debug(f"Deleted temp zip: {os.path.basename(z)}")
+            except Exception as e:
+                self.logger.warning(f"Failed to delete temp zip {z}: {e}")
+
         return (all_success, all_deletable)
+
+    def _upload_files_batch(self, all_files: list[str],
+                            retries: int = 3, retry_delay: int = 10,
+                            baseline_count: int = 0) -> bool:
+        """
+        Upload multiple small files in ONE file chooser dialog.
+
+        Opens a single file chooser with ALL files selected.
+        After upload completes, sends ONE message with all files
+        and confirms the last filename appeared in feed.
+
+        Args:
+            all_files: List of file paths to upload
+            retries: Number of retries
+            retry_delay: Delay between retries (seconds)
+            baseline_count: Message count baseline
+
+        Returns:
+            True if upload successful
+        """
+        if not all_files:
+            return True
+
+        first_file = all_files[0]
+        last_filename = os.path.basename(all_files[-1])
+
+        for attempt in range(1, retries + 1):
+            try:
+                self.logger.info(
+                    f"Batch upload: {len(all_files)} file(s) (attempt {attempt}/{retries})"
+                )
+
+                # === UPLOAD STATE LOCK ===
+                self._lock_upload_state(first_file)
+
+                if not self._ensure_alive():
+                    self.logger.error("Cannot reconnect to Chrome")
+                    if attempt < retries:
+                        time.sleep(retry_delay)
+                        continue
+                    return False
+
+                upload_timeout = max(60000, int(sum(
+                    os.path.getsize(f) for f in all_files
+                ) / 1024 / 1024 * 5000))
+                self.logger.debug(f"Batch upload timeout: {upload_timeout // 1000}s")
+
+                # Open ONE file chooser with ALL files
+                try:
+                    with self.page.expect_file_chooser(timeout=upload_timeout) as fc_info:
+                        self._click_upload_button()
+
+                    fc_info.value.set_files(all_files, timeout=upload_timeout)
+                    self.logger.info(f"Selected {len(all_files)} file(s) for batch upload")
+                except Exception as e:
+                    self.logger.error(f"File chooser failed for batch: {e}")
+                    if attempt < retries:
+                        time.sleep(retry_delay)
+                    continue
+
+                # Wait for upload to complete — small files upload near-instantly
+                # Install observer watching for any of the filenames
+                self._install_upload_observer(
+                    expected_filename=last_filename
+                )
+
+                upload_start = time.time()
+                max_wait = max(30, len(all_files) * 5)  # 5s per file, min 30s
+                uploaded = False
+                while time.time() - upload_start < max_wait:
+                    done, name = self._check_upload_done()
+                    if done:
+                        self.logger.info(f"Batch upload complete: {name}")
+                        uploaded = True
+                        break
+                    time.sleep(1)
+
+                if not uploaded:
+                    self.logger.warning("Batch upload wait timed out — sending anyway")
+
+                self._send_message()
+                self.logger.info("Batch message sent")
+
+                if not self._verify_composer_cleared():
+                    self.logger.warning("Composer still busy after batch send")
+
+                # Confirm in feed — check for the last filename
+                confirmed = self._confirm_file_in_feed(
+                    last_filename,
+                    sum(os.path.getsize(f) for f in all_files),
+                    baseline_count=baseline_count
+                )
+
+                if confirmed:
+                    self.logger.info(f"Batch upload confirmed ({len(all_files)} file(s))")
+                    return True
+
+                # Fallback: per-file confirmation for the last file
+                self.logger.debug("Batch confirm failed, trying full confirmation...")
+                found, reason, _ = self._wait_for_file_message(
+                    timeout=60,
+                    expected_filename=last_filename,
+                    baseline_count=baseline_count,
+                    fast_mode=True
+                )
+                if found:
+                    return True
+
+                self.logger.error(f"Batch upload not confirmed: {reason}")
+                if attempt < retries:
+                    time.sleep(retry_delay)
+                continue
+
+            except Exception as e:
+                self.logger.error(f"Batch upload error: {e}", exc_info=True)
+                if attempt < retries:
+                    time.sleep(retry_delay)
+                else:
+                    return False
+            finally:
+                # === UPLOAD STATE UNLOCK ===
+                self._unlock_upload_state()
+
+        return False
 
     def _upload_single_file(self, filepath: str, filename: str, file_size_bytes: int,
                             retries: int = 3, retry_delay: int = 10,
@@ -3415,6 +3743,9 @@ class BrowserMAX(LogMixin):
                         continue
                     else:
                         return False
+
+                # Dismiss any modal that would block upload interactions
+                self._dismiss_any_modal()
 
                 # Capture content snapshot before upload for delta confirmation
                 pre_snapshot = self._take_content_snapshot()
