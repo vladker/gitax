@@ -190,6 +190,7 @@ class PyPIAPI(LogMixin):
             "info": {
                 "summary": info.get("summary", ""),
                 "license": info.get("license", ""),
+                "classifiers": info.get("classifiers", []),
             },
             "releases": releases_list,
         }
@@ -197,9 +198,6 @@ class PyPIAPI(LogMixin):
         # Cache the raw data for download_package to reuse
         self._cache[package_name] = result
         self._cache[f"{package_name}__raw"] = data
-
-        # Small delay to avoid Cloudflare rate limiting
-        time.sleep(0.3)
 
         return result
 

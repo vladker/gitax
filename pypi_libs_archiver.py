@@ -52,10 +52,13 @@ class PyPILibsArchiver(LogMixin, BrowserInitMixin):
 
     def _cleanup(self):
         """Clean up resources on exit"""
-        # Close browser and save journal
+        # Сохраняем журнал ВСЕГДА — даже если браузер не подключён
+        try:
+            self.journal.save()
+        except Exception:
+            pass
         if self.browser:
             try:
-                self.journal.save()
                 self.browser.close()
             except Exception:
                 pass
@@ -72,6 +75,38 @@ class PyPILibsArchiver(LogMixin, BrowserInitMixin):
         elif count >= 1_000:
             return f"{count / 1_000:.1f}K"
         return str(count)
+
+    @staticmethod
+    def _extract_license_name(classifiers: list[str], raw_license: str) -> str:
+        """
+        Извлечь короткое название лицензии из classifiers,
+        с fallback на первую строку сырого текста лицензии.
+
+        PyPI classifiers содержат entries вроде:
+          "License :: OSI Approved :: MIT License"
+          "License :: OSI Approved :: Apache Software License"
+
+        Args:
+            classifiers: Список classifiers из PyPI API
+            raw_license: Сырой текст лицензии (может быть многострочным)
+
+        Returns:
+            Короткое название лицензии (одна строка)
+        """
+        # Ищем лицензию в classifiers
+        for classifier in classifiers:
+            if classifier.startswith("License ::"):
+                # "License :: OSI Approved :: MIT License" → "MIT License"
+                parts = [p.strip() for p in classifier.split("::")]
+                if len(parts) >= 3:
+                    return parts[-1]
+                return parts[-1]
+
+        # Fallback: первая строка сырого текста
+        if raw_license and "\n" in raw_license:
+            return raw_license.split("\n")[0].strip()
+
+        return raw_license.strip() if raw_license else "Unknown"
 
     def _build_message_text(self, pkg_data: dict, file_sizes: list[int]) -> str:
         """
@@ -100,10 +135,6 @@ class PyPILibsArchiver(LogMixin, BrowserInitMixin):
             f"📥 Загрузки: {self._format_downloads(downloads)}\n"
             f"📜 Лицензия: {license_str}"
         )
-
-        if file_sizes:
-            for i, size in enumerate(file_sizes):
-                text += f"\n📦 Файл {i + 1}: {format_file_size(size)}"
 
         return text
 
@@ -153,7 +184,9 @@ class PyPILibsArchiver(LogMixin, BrowserInitMixin):
                 retries=retries,
                 retry_delay=retry_delay,
                 split_mode="auto",
-                expected_extensions=['.exe', '.pkg', '.tar.xz', '.sh', '.tar.gz']
+                expected_extensions=['.exe', '.pkg', '.tar.xz', '.sh', '.tar.gz'],
+                fast_mode=True,
+                batch_mode=True,
             )
             return success
         except Exception as e:
@@ -168,6 +201,137 @@ class PyPILibsArchiver(LogMixin, BrowserInitMixin):
         except Exception:
             pass
 
+    # ── Batch helpers ──
+
+    def _process_single_package(self, pkg: dict, browser,
+                                retries: int, retry_delay: int,
+                                global_idx: int, total: int,
+                                batch_sent: list, batch_error: list):
+        """
+        Обработать один пакет: info → download → send → journal.
+        Файлы НЕ удаляются — это делает вызывающий код после всего батча.
+
+        Returns:
+            dict с ключами: name, version, summary, downloads, file_paths, success
+        """
+        name = pkg.get('name', '')
+        version = pkg.get('latest_version', '')
+        downloads = int(pkg.get('downloads_last_365_days', 0))
+        file_paths = []
+        success = False
+
+        print(f"\n  {'═' * 56}")
+        print(f"  #{global_idx}/{total} | {name} {version}")
+        print(f"  {'─' * 56}")
+
+        # Получаем детальную информацию
+        try:
+            info = self.pypi.get_package_info(name)
+        except Exception as e:
+            print(f"  ✗ Ошибка получения информации: {e}")
+            self.journal.mark_failed(name, version, str(e))
+            batch_error.append(name)
+            return {"name": name, "file_paths": [], "success": False}
+
+        latest_version = info.get('latest_version', version)
+        summary = info.get('info', {}).get('summary', '')
+        classifiers = info.get('info', {}).get('classifiers', [])
+        raw_license = info.get('info', {}).get('license', '')
+        license_str = self._extract_license_name(classifiers, raw_license)
+
+        # Скачиваем файлы
+        print(f"  ↓ Скачиваю файлы...")
+        try:
+            file_paths = self.pypi.download_package(name)
+        except ValueError as e:
+            print(f"  ✗ Файлы не найдены: {e}")
+            self.journal.mark_failed(name, latest_version, summary, downloads)
+            batch_error.append(name)
+            return {"name": name, "file_paths": [], "success": False}
+        except Exception as e:
+            print(f"  ✗ Ошибка скачивания: {e}")
+            self.journal.mark_failed(name, latest_version, summary, downloads)
+            batch_error.append(name)
+            return {"name": name, "file_paths": [], "success": False}
+
+        if not file_paths:
+            print(f"  ⚠ Файлы не найдены для {name}")
+            self.journal.mark_failed(name, latest_version, summary, downloads)
+            batch_error.append(name)
+            return {"name": name, "file_paths": [], "success": False}
+
+        # Показываем размеры файлов
+        file_sizes = []
+        for fp in file_paths:
+            size = os.path.getsize(fp)
+            file_sizes.append(size)
+            print(f"    ✓ {os.path.basename(fp)} ({format_file_size(size)})")
+
+        # Формируем текст сообщения
+        pkg_data = {
+            "name": name,
+            "latest_version": latest_version,
+            "summary": summary,
+            "downloads": downloads,
+            "license": license_str,
+        }
+        text = self._build_message_text(pkg_data, file_sizes)
+
+        # Отправляем в MAX
+        print(f"  → Отправляю в MAX...")
+        try:
+            split_mode = get_split_mode(self.config, "pypi_libs_archiver", default="auto")
+            success, _ = browser.send_message_with_files(
+                text=text,
+                filepaths=file_paths,
+                retries=retries,
+                retry_delay=retry_delay,
+                split_mode=split_mode,
+                expected_extensions=['.tar.gz', '.whl'],
+                fast_mode=True,
+                batch_mode=True,
+            )
+        except Exception as e:
+            print(f"  ✗ Ошибка отправки: {e}")
+            success = False
+
+        # Обновляем журнал
+        if success:
+            filenames = [os.path.basename(fp) for fp in file_paths]
+            if self.journal.add(name, latest_version, summary, downloads, filenames):
+                batch_sent.append(name)
+                print(f"  ✓ Отправлено")
+            else:
+                self.journal.mark_failed(name, latest_version, summary, downloads)
+                batch_error.append(name)
+                success = False
+                print(f"  ✗ Журнал не обновлён")
+        else:
+            self.journal.mark_failed(name, latest_version, summary, downloads)
+            batch_error.append(name)
+            print(f"  ✗ Ошибка загрузки в MAX")
+
+        return {"name": name, "file_paths": file_paths, "success": success}
+
+    def _cleanup_batch(self, results: list[dict]):
+        """Удалить временные файлы всего батча."""
+        for result in results:
+            for fp in result.get("file_paths", []):
+                try:
+                    if os.path.exists(fp):
+                        os.remove(fp)
+                except Exception as e:
+                    self.logger.warning(f"Failed to remove {fp}: {e}")
+            # Удаляем пустую директорию пакета
+            if result.get("file_paths"):
+                pkg_dir = os.path.dirname(result["file_paths"][0])
+                if pkg_dir and os.path.exists(pkg_dir):
+                    try:
+                        if not os.listdir(pkg_dir):
+                            os.rmdir(pkg_dir)
+                    except Exception:
+                        pass
+
     # ── Main operations ──
 
     def load_top_libraries(self, limit: int | None = None):
@@ -177,12 +341,13 @@ class PyPILibsArchiver(LogMixin, BrowserInitMixin):
         Flow:
         1. Hugovk датасет → топ пакеты
         2. Фильтр по журналу (пропуск уже отправленных)
-        3. Для каждого: get_package_info → download_package →
-           build_message → send_message_with_files → journal.add()
-        4. Очистка временных файлов после каждого пакета
+        3. Пакеты группируются в батчи по batch_size
+        4. Каждый батч: get_package_info → download → send → journal → cleanup
+        5. Очистка временных файлов после каждого батча
         """
         if limit is None:
             limit = self.config.get('pypi_libs_archiver', {}).get('limit', 20)
+        batch_size = self.config.get('pypi_libs_archiver', {}).get('batch_size', 100)
         retries = self.config.get('pypi_libs_archiver', {}).get(
             'retries', self.config.get('archiver', {}).get('retries', 3))
         retry_delay = self.config.get('pypi_libs_archiver', {}).get(
@@ -230,7 +395,8 @@ class PyPILibsArchiver(LogMixin, BrowserInitMixin):
             packages_to_process.append(pkg)
 
         print(f"  Уже в журнале: {skipped_in_journal}")
-        print(f"  Осталось для загрузки: {len(packages_to_process)}\n")
+        print(f"  Осталось для загрузки: {len(packages_to_process)}")
+        print(f"  Батч размер: {batch_size}\n")
 
         if not packages_to_process:
             print("  ✓ Все библиотеки уже отправлены!")
@@ -245,126 +411,54 @@ class PyPILibsArchiver(LogMixin, BrowserInitMixin):
             print(f"\n  ✗ Не удалось подключиться к MAX: {e}")
             return
 
-        # Обрабатываем каждый пакет
+        # Обрабатываем батчами
         sent_count = 0
         error_count = 0
         total = len(packages_to_process)
+        global_idx = 0
 
         with LiveProgressBar(total, "Загрузка PyPI пакетов") as bar:
-            for i, pkg in enumerate(packages_to_process, 1):
+            # Разбиваем на батчи
+            for batch_start in range(0, total, batch_size):
                 if self._shutdown:
-                    print(f"\n  ⚠ Прервано после {i - 1} пакетов")
+                    print(f"\n  ⚠ Прервано после {global_idx} пакетов")
                     break
 
-                name = pkg.get('name', '')
-                version = pkg.get('latest_version', '')
-                downloads = int(pkg.get('downloads_last_365_days', 0))
+                batch = packages_to_process[batch_start:batch_start + batch_size]
+                batch_num = batch_start // batch_size + 1
+                print(f"\n  ▶ Батч {batch_num}: пакеты {batch_start + 1}–{min(batch_start + len(batch), total)}")
 
-                bar.update(i, item_name=f"{name} {version}")
-                print(f"\n  {'═' * 56}")
-                print(f"  #{i}/{total} | {name} {version}")
-                print(f"  {'─' * 56}")
+                batch_sent: list[str] = []
+                batch_error: list[str] = []
+                results = []
 
-                # Получаем детальную информацию
-                try:
-                    info = self.pypi.get_package_info(name)
-                except Exception as e:
-                    print(f"  ✗ Ошибка получения информации: {e}")
-                    self.journal.mark_failed(name, version, str(e))
-                    error_count += 1
-                    self._print_progress(i, total, sent_count, error_count, "✗")
-                    continue
+                for pkg in batch:
+                    global_idx += 1
+                    name = pkg.get('name', '')
+                    version = pkg.get('latest_version', '')
 
-                latest_version = info.get('latest_version', version)
-                summary = info.get('info', {}).get('summary', '')
-                license_str = info.get('info', {}).get('license', 'Unknown')
+                    bar.update(global_idx, item_name=f"{name} {version}")
 
-                # Скачиваем файлы
-                print(f"  ↓ Скачиваю файлы...")
-                try:
-                    file_paths = self.pypi.download_package(name)
-                except ValueError as e:
-                    print(f"  ✗ Файлы не найдены: {e}")
-                    self.journal.mark_failed(name, latest_version, summary, downloads)
-                    error_count += 1
-                    self._print_progress(i, total, sent_count, error_count, "✗")
-                    continue
-                except Exception as e:
-                    print(f"  ✗ Ошибка скачивания: {e}")
-                    self.journal.mark_failed(name, latest_version, summary, downloads)
-                    error_count += 1
-                    self._print_progress(i, total, sent_count, error_count, "✗")
-                    continue
-
-                if not file_paths:
-                    print(f"  ⚠ Файлы не найдены для {name}")
-                    self.journal.mark_failed(name, latest_version, summary, downloads)
-                    error_count += 1
-                    self._print_progress(i, total, sent_count, error_count, "✗")
-                    continue
-
-                # Показываем размеры файлов
-                file_sizes = []
-                for fp in file_paths:
-                    size = os.path.getsize(fp)
-                    file_sizes.append(size)
-                    print(f"    ✓ {os.path.basename(fp)} ({format_file_size(size)})")
-
-                # Формируем текст сообщения
-                pkg_data = {
-                    "name": name,
-                    "latest_version": latest_version,
-                    "summary": summary,
-                    "downloads": downloads,
-                    "license": license_str,
-                }
-                text = self._build_message_text(pkg_data, file_sizes)
-
-                # Отправляем в MAX
-                print(f"  → Отправляю в MAX...")
-                try:
-                    split_mode = get_split_mode(self.config, "pypi_libs_archiver", default="auto")
-                    success, _ = browser.send_message_with_files(
-                        text=text,
-                        filepaths=file_paths,
-                        retries=retries,
-                        retry_delay=retry_delay,
-                        split_mode=split_mode,
-                        expected_extensions=['.tar.gz', '.whl']
+                    result = self._process_single_package(
+                        pkg, browser, retries, retry_delay,
+                        global_idx, total, batch_sent, batch_error
                     )
-                except Exception as e:
-                    print(f"  ✗ Ошибка отправки: {e}")
-                    success = False
+                    results.append(result)
 
-                # Обновляем журнал
-                if success:
-                    filenames = [os.path.basename(fp) for fp in file_paths]
-                    self.journal.add(name, latest_version, summary, downloads, filenames)
-                    sent_count += 1
-                    print(f"  ✓ Отправлено")
-                else:
-                    self.journal.mark_failed(name, latest_version, summary, downloads)
-                    error_count += 1
-                    print(f"  ✗ Ошибка загрузки в MAX")
+                    success = result.get("success", False)
+                    if success:
+                        sent_count += 1
+                    else:
+                        error_count += 1
 
-                # Удаляем временные файлы после отправки
-                for fp in file_paths:
-                    try:
-                        if os.path.exists(fp):
-                            os.remove(fp)
-                    except Exception as e:
-                        self.logger.warning(f"Failed to remove {fp}: {e}")
-                # Удаляем пустую директорию пакета
-                pkg_dir = os.path.dirname(file_paths[0]) if file_paths else ''
-                if pkg_dir and os.path.exists(pkg_dir):
-                    try:
-                        if not os.listdir(pkg_dir):
-                            os.rmdir(pkg_dir)
-                    except Exception:
-                        pass
+                    self._print_progress(global_idx, total, sent_count, error_count,
+                                         "✓" if success else "✗")
 
-                self._print_progress(i, total, sent_count, error_count,
-                                     "✓" if success else "✗")
+                # Очистка файлов всего батча
+                self._cleanup_batch(results)
+                # Сохраняем журнал после каждого батча — прогресс не потеряется при сбое
+                self.journal.save()
+                print(f"\n  ✓ Батч {batch_num} завершён (✓{len(batch_sent)} | ✗{len(batch_error)})")
 
         # Итог
         print()
@@ -378,6 +472,7 @@ class PyPILibsArchiver(LogMixin, BrowserInitMixin):
 
         if self.browser:
             try:
+                self.journal.save()
                 self.browser.close()
             except Exception:
                 pass
@@ -649,7 +744,9 @@ class PyPILibsArchiver(LogMixin, BrowserInitMixin):
                     retries=retries,
                     retry_delay=retry_delay,
                     split_mode=split_mode,
-                    expected_extensions=['.tar.gz', '.whl']
+                    expected_extensions=['.tar.gz', '.whl'],
+                    fast_mode=True,
+                    batch_mode=True,
                 )
             except Exception as e:
                 print(f"  ✗ Ошибка отправки: {e}")
@@ -657,12 +754,15 @@ class PyPILibsArchiver(LogMixin, BrowserInitMixin):
 
             if success:
                 filenames = [os.path.basename(fp) for fp in file_paths]
-                self.journal.add(name, new_ver,
-                                 entry.get('description', ''),
-                                 entry.get('downloads', 0),
-                                 filenames)
-                updated_count += 1
-                print(f"  ✓ Обновлено")
+                if self.journal.add(name, new_ver,
+                                    entry.get('description', ''),
+                                    entry.get('downloads', 0),
+                                    filenames):
+                    updated_count += 1
+                    print(f"  ✓ Обновлено")
+                else:
+                    error_count += 1
+                    print(f"  ✗ Журнал не обновлён")
             else:
                 error_count += 1
                 print(f"  ✗ Ошибка")
