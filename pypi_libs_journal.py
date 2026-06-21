@@ -44,8 +44,7 @@ class PyPILibsJournal(RuntimeJournalMixin, BaseJournal):
             "sent_at": datetime.now().isoformat(),
             "files": files,
         })
-        self.save()
-        return True
+        return self.save()
 
     def mark_failed(self, name: str, version: str, description: str = "",
                     downloads: int = 0):
