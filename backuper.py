@@ -18,7 +18,7 @@ from datetime import datetime
 from logging_config import LogMixin
 
 from browser_max import BrowserMAX
-from sevenzip import archive_directory_to_volumes, cleanup_volumes
+from sevenzip import archive_directory_to_volumes, archive_file_as_7z, cleanup_volumes
 from browser_init import BrowserInitMixin
 from backuper_journal import BackuperJournal
 from config_utils import get_channel_url, get_config_value
@@ -84,7 +84,9 @@ class Backuper(LogMixin, BrowserInitMixin):
         source_path: str,
         recursive: bool = True,
         allowed_extensions: list[str] | None = None,
-        max_size_mb: int = 0
+        max_size_mb: int = 0,
+        sort_by: str = "name",
+        sort_order: str = "asc",
     ) -> list[tuple[str, int]]:
         """
         Scan folder for files to upload as-is.
@@ -95,9 +97,11 @@ class Backuper(LogMixin, BrowserInitMixin):
             allowed_extensions: List of allowed extensions (e.g., ['.txt', '.pdf']).
                                 Empty list = all extensions allowed.
             max_size_mb: Maximum file size in MB. 0 = no limit.
+            sort_by: Sort criterion — "name", "size", or "date" (creation time).
+            sort_order: "asc" (ascending) or "desc" (descending).
 
         Returns:
-            List of (filepath, size_bytes) tuples, sorted by path
+            List of (filepath, size_bytes) tuples, sorted according to criteria.
         """
         files = []
         max_size_bytes = max_size_mb * 1024 * 1024 if max_size_mb > 0 else 0
@@ -127,8 +131,23 @@ class Backuper(LogMixin, BrowserInitMixin):
             if not recursive:
                 break
 
-        # Sort by relative path for consistent ordering
-        files.sort(key=lambda x: os.path.relpath(x[0], source_path))
+        # Apply sorting
+        reverse = sort_order.lower() == "desc"
+        if sort_by == "size":
+            files.sort(key=lambda x: x[1], reverse=reverse)
+        elif sort_by == "date":
+            def _ctime_key(item):
+                try:
+                    return os.path.getctime(item[0])
+                except OSError:
+                    return 0.0
+            files.sort(key=_ctime_key, reverse=reverse)
+        else:  # "name" — default
+            files.sort(
+                key=lambda x: os.path.relpath(x[0], source_path).casefold(),
+                reverse=reverse,
+            )
+
         return files
 
     def _convert_exe_to_zip(self, exe_path: str) -> str | None:
@@ -371,13 +390,40 @@ class Backuper(LogMixin, BrowserInitMixin):
         # 3b. Auto-convert .exe to .zip
         convert_exe = input("  Конвертировать .exe в .zip перед загрузкой? [y/N]: ").strip().lower() == "y"
 
+        # 3c. Sorting options
+        print("\n  Сортировка файлов:")
+        print("    [1] По имени")
+        print("    [2] По размеру")
+        print("    [3] По дате создания")
+        sort_choice = prompt_numeric_choice("Выбор [1-3]", ["1", "2", "3"])
+        sort_map = {"1": "name", "2": "size", "3": "date"}
+        sort_by = sort_map.get(sort_choice, "name")
+
+        print("\n  Порядок сортировки:")
+        print("    [1] По возрастанию (ASC)")
+        print("    [2] По убыванию (DESC)")
+        order_choice = prompt_numeric_choice("Выбор [1-2]", ["1", "2"])
+        sort_order = "asc" if order_choice == "1" else "desc"
+
+        # 3d. Password protection for each file
+        print()
+        use_password = input("  Архивировать каждый файл в 7z с паролем? [y/N]: ").strip().lower() == "y"
+        password = None
+        if use_password:
+            password = input("  Пароль: ").strip()
+            if not password:
+                print("  Пароль пустой, отменяю архивацию.")
+                use_password = False
+
         # 4. Scan files
         print("\n  Сканирование папки ...")
         files = self._scan_files_for_upload(
             source_path=source_path,
             recursive=recursive,
             allowed_extensions=allowed_extensions if allowed_extensions else None,
-            max_size_mb=max_size_mb
+            max_size_mb=max_size_mb,
+            sort_by=sort_by,
+            sort_order=sort_order,
         )
 
         if not files:
@@ -410,6 +456,7 @@ class Backuper(LogMixin, BrowserInitMixin):
             return
 
         # 7. Upload each file
+        output_dir = self.config.get("backuper", {}).get("output_dir", "./temp_backups")
         retries = int(self.config.get("backuper", {}).get("retries", 3))
         retry_delay = int(self.config.get("backuper", {}).get("retry_delay", 10))
         large_file_threshold = (
@@ -471,6 +518,25 @@ class Backuper(LogMixin, BrowserInitMixin):
                     else:
                         print(f"    ⚠ Конвертация не удалась, загружаю оригинал")
 
+                # Handle password-protected 7z archive on the fly
+                if use_password and password:
+                    print(f"    → Архивирование в 7z с паролем...")
+                    arch_path = archive_file_as_7z(
+                        file_path=upload_filepath,
+                        password=password,
+                        output_dir=output_dir,
+                    )
+                    if arch_path and os.path.exists(arch_path):
+                        upload_filepath = arch_path
+                        upload_filename = os.path.basename(arch_path)
+                        ext = ".7z"
+                        size = os.path.getsize(arch_path)
+                        size_str = format_file_size(size)
+                        temp_files_to_cleanup.append(arch_path)
+                        print(f"    → Запаковано: {upload_filename} ({size_str})")
+                    else:
+                        print(f"    ⚠ Архивирование не удалось, продолжаю с оригиналом")
+
                 # Upload
                 try:
                     if size >= large_file_threshold:
@@ -495,7 +561,9 @@ class Backuper(LogMixin, BrowserInitMixin):
 
                     if success:
                         print(f"    ✓ Загружен")
-                        self.journal.mark_file_uploaded(journal_key, size)
+                        # Если файл был запаролен, помечаем в журнале
+                        journal_marker = f"{journal_key} (encrypted)" if use_password else journal_key
+                        self.journal.mark_file_uploaded(journal_marker, size)
                         sent_count += 1
                     else:
                         print(f"    ✗ Ошибка загрузки")

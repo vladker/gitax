@@ -156,15 +156,29 @@ def _find_volumes(base_path: str) -> list[str]:
     return volumes
 
 
+def _retry_delete(filepath: str, max_retries: int = 5, delay: float = 1.0) -> bool:
+    """Delete a file with retries — handles Windows file-lock race conditions."""
+    import time
+    for attempt in range(1, max_retries + 1):
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+                return True
+            return True  # already gone
+        except (OSError, PermissionError) as e:
+            if attempt < max_retries:
+                _logger.debug(f"Retry delete {os.path.basename(filepath)} ({attempt}/{max_retries}): {e}")
+                time.sleep(delay)
+            else:
+                _logger.warning(f"Failed to delete {filepath} after {max_retries} attempts: {e}")
+                return False
+    return False
+
+
 def cleanup_volumes(volume_paths: list[str]):
     """Remove volume files after successful upload"""
     for vp in volume_paths:
-        try:
-            if os.path.exists(vp):
-                os.remove(vp)
-                _logger.debug(f"Removed: {vp}")
-        except Exception as e:
-            _logger.warning(f"Failed to remove {vp}: {e}")
+        _retry_delete(vp)
 
 
 def group_volumes(filenames: list[str]) -> list[dict]:
@@ -197,6 +211,106 @@ def group_volumes(filenames: list[str]) -> list[dict]:
             "volumes": sorted(volumes),
         })
     return result
+
+
+def archive_file_as_7z(
+    file_path: str,
+    password: str,
+    compression_level: int = 5,
+    output_dir: str | None = None,
+) -> str | None:
+    """
+    Create a single-volume password-protected 7z archive from a single file.
+
+    The archive is created alongside the original file (or in output_dir) with
+    ``.7z`` appended to the original filename.
+
+    Args:
+        file_path: Path to the file to archive.
+        password: Encryption password.
+        compression_level: 7z compression level 0-9 (default 5).
+        output_dir: Optional output directory; defaults to the source file's directory.
+
+    Returns:
+        Path to the created archive, or None on failure.
+    """
+    if not os.path.isfile(file_path):
+        _logger.error(f"File not found: {file_path}")
+        return None
+
+    seven_zip_exe = _get_seven_zip_exe()
+    if not os.path.exists(seven_zip_exe):
+        _logger.error(f"7z not found at {seven_zip_exe}")
+        return None
+
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        archive_name = os.path.basename(file_path) + ".7z"
+        archive_path = os.path.join(output_dir, archive_name)
+    else:
+        archive_path = file_path + ".7z"
+
+    # Clean up any leftover archive from a previous attempt
+    if os.path.exists(archive_path):
+        try:
+            os.remove(archive_path)
+        except OSError:
+            pass
+
+    cmd = [seven_zip_exe, "a", f"-mx={compression_level}", archive_path, file_path]
+
+    # Use password file to avoid leaking in process list
+    password_tempfile = None
+    try:
+        password_tempfile = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8"
+        )
+        password_tempfile.write(password)
+        password_tempfile.close()
+        try:
+            os.chmod(password_tempfile.name, 0o600)
+        except OSError:
+            pass
+        cmd.insert(2, f"-p@{password_tempfile.name}")
+        cmd.insert(2, "-mhe=on")
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+
+        if result.returncode != 0:
+            _logger.warning(f"7z single-file archive failed: {result.stderr}")
+            if os.path.exists(archive_path):
+                os.remove(archive_path)
+            return None
+
+        if os.path.exists(archive_path):
+            _logger.info(
+                f"Created password-protected archive: {archive_path} "
+                f"({os.path.getsize(archive_path) / 1024:.1f} KB)"
+            )
+            return archive_path
+        else:
+            _logger.warning("7z succeeded but no output file found")
+            return None
+
+    except subprocess.TimeoutExpired:
+        _logger.error("7z single-file archive timeout")
+        if os.path.exists(archive_path):
+            os.remove(archive_path)
+        return None
+    except FileNotFoundError:
+        _logger.error(f"7z not found at {seven_zip_exe}")
+        return None
+    except Exception as e:
+        _logger.error(f"7z single-file archive error: {e}")
+        if os.path.exists(archive_path):
+            os.remove(archive_path)
+        return None
+    finally:
+        if password_tempfile is not None:
+            try:
+                os.unlink(password_tempfile.name)
+            except OSError:
+                pass
 
 
 def archive_directory_to_volumes(
