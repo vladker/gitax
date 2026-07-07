@@ -61,6 +61,7 @@ class ChannelsConfig(BaseModel):
     nuget: str = ""
     rubygems: str = ""
     softportal: str = ""
+    thingiverse: str = ""
 
 
 class BackuperConfig(BaseModel):
@@ -130,6 +131,15 @@ class NpmArchiverConfig(BaseModel):
     """Settings: config.yaml → npm_archiver section."""
     limit: int = 20
     output_dir: str = "./temp_npm"
+    retries: int = 3
+    retry_delay: int = 10
+    split_mode: Literal["auto", "on", "off", "prompt"] = "auto"
+
+
+class ThingiverseArchiverConfig(BaseModel):
+    """Settings: config.yaml → thingiverse_archiver section."""
+    limit: int = 20
+    output_dir: str = "./temp_thingiverse"
     retries: int = 3
     retry_delay: int = 10
     split_mode: Literal["auto", "on", "off", "prompt"] = "auto"
@@ -207,7 +217,7 @@ class RepoCollectorConfig(BaseModel):
     per_page: int = Field(default=100, ge=1, le=100)
 
 
-VALID_CHANNEL_FUNCTIONS = ("github", "pypi", "media", "backup", "npm", "cargo", "nuget", "rubygems", "softportal")
+VALID_CHANNEL_FUNCTIONS = ("github", "pypi", "media", "backup", "npm", "cargo", "nuget", "rubygems", "softportal", "thingiverse")
 
 
 class ChannelEntry(BaseModel):
@@ -235,6 +245,7 @@ class ChannelRegistry(BaseModel):
     nuget: list[ChannelEntry] = Field(default_factory=list)
     rubygems: list[ChannelEntry] = Field(default_factory=list)
     softportal: list[ChannelEntry] = Field(default_factory=list)
+    thingiverse: list[ChannelEntry] = Field(default_factory=list)
 
     def get_enabled(self, function: str) -> list[ChannelEntry]:
         """Return enabled channels for a function."""
@@ -281,6 +292,7 @@ class AppConfig(BaseModel):
     cargo_archiver: CargoArchiverConfig = CargoArchiverConfig()
     nuget_archiver: NuGetArchiverConfig = NuGetArchiverConfig()
     rubygems_archiver: RubyGemsArchiverConfig = RubyGemsArchiverConfig()
+    thingiverse_archiver: ThingiverseArchiverConfig = ThingiverseArchiverConfig()
     setup: SetupConfig = SetupConfig()
     batch: BatchConfig = BatchConfig()
     github: GitHubConfig = GitHubConfig()

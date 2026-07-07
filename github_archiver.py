@@ -544,10 +544,11 @@ class GitHubArchiver(LogMixin):
 
     # Module-to-channel mapping for skip-aware UI
     _MODULE_CHANNELS = {
-        "1": "max",     # GitHub → max
-        "2": "pypi",    # PyPI → pypi
-        "3": "backup",  # Backuper → backup
-        "4": "media",   # Файлы → media
+        "1": "max",         # GitHub → max
+        "2": "pypi",        # PyPI → pypi
+        "3": "backup",      # Backuper → backup
+        "4": "media",       # Файлы → media
+        "a": "thingiverse", # Thingiverse → thingiverse
     }
 
     def _is_module_enabled(self, menu_key: str) -> bool:
@@ -861,6 +862,7 @@ class GitHubArchiver(LogMixin):
         print(menu_item("7", "NuGet — .NET пакеты", "nuget"))
         print(menu_item("8", "RubyGems — Ruby пакеты", "rubygems"))
         print(menu_item("9", "SoftPortal — программы", "softportal"))
+        print(menu_item("a", "Thingiverse (3D модели)", "thingiverse"))
         print("  [5] Сервис — журналы, настройки")
 
         if not is_setup_complete(self.config):
@@ -957,6 +959,19 @@ class GitHubArchiver(LogMixin):
         print("  [1] Загрузить топ программы")
         print("  [2] Синхронизировать программы")
         print("  [3] Обновить список категорий")
+        print("  [0] Назад")
+        print()
+
+    def _thingiverse_menu(self):
+        """Подменю Thingiverse"""
+        print("\n" + "═" * 60)
+        print("  Thingiverse — 3D модели (thingiverse.com)")
+        print("─" * 60)
+        print()
+        print("  [1] Популярные модели")
+        print("  [2] По тегам")
+        print("  [3] По категориям")
+        print("  [4] По авторам")
         print("  [0] Назад")
         print()
 
@@ -3464,20 +3479,21 @@ class GitHubArchiver(LogMixin):
 
             needs_setup = not is_setup_complete(self.config)
             if needs_setup:
-                valid_opts = ["0", "x", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
-                prompt_text = "Выберите раздел [0/X,1-9]"
+                valid_opts = ["0", "x", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a"]
+                prompt_text = "Выберите раздел [0/X,1-9,a]"
             else:
-                valid_opts = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
-                prompt_text = "Выберите раздел [0-9]"
+                valid_opts = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a"]
+                prompt_text = "Выберите раздел [0-9,a]"
             choice = prompt_numeric_choice(prompt_text, valid_opts).lower()
 
             if not choice:
                 break
 
             # ── Check if selected module is disabled ──
-            if choice in ("1", "2", "3", "4", "6", "7", "8") and not self._is_module_enabled(choice):
+            if choice in ("1", "2", "3", "4", "6", "7", "8", "9", "a") and not self._is_module_enabled(choice):
                 module_names = {"1": "GitHub", "2": "PyPI", "3": "Backuper", "4": "Файлы",
-                            "6": "Cargo", "7": "NuGet", "8": "RubyGems"}
+                            "6": "Cargo", "7": "NuGet", "8": "RubyGems", "9": "SoftPortal",
+                            "a": "Thingiverse"}
                 mod_name = module_names.get(choice, "")
                 print(f"\n  ⚠ Модуль \"{mod_name}\" отключён в настройках.")
                 print()
@@ -3519,6 +3535,8 @@ class GitHubArchiver(LogMixin):
                 self._run_rubygems_menu()
             elif choice == '9':
                 self._run_softportal_menu()
+            elif choice == 'a':
+                self._run_thingiverse()
 
     def _run_github_menu(self):
         """Цикл подменю GitHub"""
@@ -4066,6 +4084,24 @@ class GitHubArchiver(LogMixin):
             elif choice == '3':
                 self.run_softportal_categories()
 
+    def _run_thingiverse(self):
+        """Цикл подменю Thingiverse"""
+        while True:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            self._thingiverse_menu()
+            choice = prompt_numeric_choice("Выберите действие [0-4]", ["0", "1", "2", "3", "4"])
+
+            if choice == '0':
+                break
+            elif choice == '1':
+                self._run_thingiverse_popular()
+            elif choice == '2':
+                self._run_thingiverse_by_tag()
+            elif choice == '3':
+                self._run_thingiverse_by_category()
+            elif choice == '4':
+                self._run_thingiverse_by_author()
+
     # ── Batch Mode ────────────────────────────────────────────────
 
     def _batch_menu(self):
@@ -4516,6 +4552,105 @@ class GitHubArchiver(LogMixin):
         except Exception as e:
             print(f"\n  ✗ Ошибка: {e}")
             self.logger.error(f"SoftPortal categories error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def _run_thingiverse_popular(self):
+        """Загрузить популярные 3D модели"""
+        from thingiverse_archiver import ThingiverseArchiver
+
+        print("\n" + "═" * 60)
+        print("  Загрузка популярных 3D моделей")
+        print("═" * 60)
+
+        if not self._ensure_channel_ready("thingiverse", "Thingiverse канал", "thingiverse"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        try:
+            archiver = ThingiverseArchiver("config.yaml")
+            archiver.run_popular()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"Thingiverse popular error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def _run_thingiverse_by_tag(self):
+        """Загрузить 3D модели по тегу"""
+        from thingiverse_archiver import ThingiverseArchiver
+
+        print("\n" + "═" * 60)
+        print("  Загрузка 3D моделей по тегу")
+        print("═" * 60)
+
+        if not self._ensure_channel_ready("thingiverse", "Thingiverse канал", "thingiverse"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        try:
+            tag = input("  Введите тег: ").strip()
+            if not tag:
+                print("  ⚠ Тег не указан.")
+                input("\n  Нажмите Enter для возврата в меню...")
+                return
+            archiver = ThingiverseArchiver("config.yaml")
+            archiver.run_by_tag(tag)
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"Thingiverse by tag error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def _run_thingiverse_by_category(self):
+        """Загрузить 3D модели по категории"""
+        from thingiverse_archiver import ThingiverseArchiver
+
+        print("\n" + "═" * 60)
+        print("  Загрузка 3D моделей по категории")
+        print("═" * 60)
+
+        if not self._ensure_channel_ready("thingiverse", "Thingiverse канал", "thingiverse"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        try:
+            category = input("  Введите категорию: ").strip()
+            if not category:
+                print("  ⚠ Категория не указана.")
+                input("\n  Нажмите Enter для возврата в меню...")
+                return
+            archiver = ThingiverseArchiver("config.yaml")
+            archiver.run_by_category(category)
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"Thingiverse by category error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def _run_thingiverse_by_author(self):
+        """Загрузить 3D модели по автору"""
+        from thingiverse_archiver import ThingiverseArchiver
+
+        print("\n" + "═" * 60)
+        print("  Загрузка 3D моделей по автору")
+        print("═" * 60)
+
+        if not self._ensure_channel_ready("thingiverse", "Thingiverse канал", "thingiverse"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        try:
+            author = input("  Введите имя автора: ").strip()
+            if not author:
+                print("  ⚠ Имя автора не указано.")
+                input("\n  Нажмите Enter для возврата в меню...")
+                return
+            archiver = ThingiverseArchiver("config.yaml")
+            archiver.run_by_author(author)
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"Thingiverse by author error: {e}", exc_info=True)
 
         input("\n  Нажмите Enter для возврата в меню...")
 

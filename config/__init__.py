@@ -15,20 +15,20 @@ Usage:
 
 from __future__ import annotations
 
-from functools import lru_cache
-from pathlib import Path
+import threading
 from typing import Optional
 
 from config.loader import load_config
 from config.model import AppConfig
 
-# Module-level storage for config path override
+# Module-level storage for config path override and singleton instance
 _config_path: Optional[str] = None
+_config_instance: Optional[AppConfig] = None
+_config_lock = threading.Lock()
 
 
-@lru_cache(maxsize=1)
 def get_config(config_path: Optional[str] = None) -> AppConfig:
-    """Return the singleton AppConfig instance.
+    """Return the singleton AppConfig instance (thread-safe).
 
     Args:
         config_path: Path to config.yaml. If None, uses path from init_config()
@@ -37,11 +37,21 @@ def get_config(config_path: Optional[str] = None) -> AppConfig:
     Returns:
         Validated AppConfig singleton with env overrides applied.
     """
-    effective_path = config_path or _config_path
-    config = load_config(effective_path)
-    # Store path on instance for save() to use
-    config._config_path_attr = effective_path or "config.yaml"
-    return config
+    global _config_instance
+    if _config_instance is not None:
+        return _config_instance
+
+    with _config_lock:
+        # Double-check after acquiring lock
+        if _config_instance is not None:
+            return _config_instance
+
+        effective_path = config_path or _config_path
+        config = load_config(effective_path)
+        # Store path on instance for save() to use
+        config._config_path_attr = effective_path or "config.yaml"
+        _config_instance = config
+        return _config_instance
 
 
 def save_config() -> None:
@@ -56,9 +66,10 @@ def init_config(config_path: str) -> None:
     Must be called before the first get_config() call to take effect.
     Call again with a different path to reload config.
     """
-    global _config_path
-    _config_path = config_path
-    get_config.cache_clear()
+    global _config_path, _config_instance
+    with _config_lock:
+        _config_path = config_path
+        _config_instance = None
 
 
 __all__ = [

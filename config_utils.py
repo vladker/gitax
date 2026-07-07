@@ -299,7 +299,7 @@ def is_setup_complete(config: dict) -> bool:
     channels = config.get("channels", {}) or {}
 
     # All channels defined in ChannelsConfig model
-    ALL_CHANNELS = ("max", "pypi", "media", "backup", "npm", "cargo", "nuget", "rubygems")
+    ALL_CHANNELS = ("max", "pypi", "media", "backup", "npm", "cargo", "nuget", "rubygems", "thingiverse")
 
     has_configured = False
     for ch_name in ALL_CHANNELS:
@@ -360,6 +360,7 @@ _CHANNEL_TO_FUNCTION = {
     "media": "media",
     "backup": "backup",
     "npm": "npm",
+    "thingiverse": "thingiverse",
 }
 
 
