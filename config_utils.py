@@ -284,38 +284,41 @@ def is_setup_complete(config: dict) -> bool:
     Check if required configuration is present.
 
     Required values:
-    - GITHUB_TOKEN from env var (OPTIONAL - anonymous mode works with lower rate limit)
-    - At least one non-skipped channel has a URL configured
+    - GITHUB_TOKEN from env var (must be non-empty)
+    - Every non-skipped channel has a URL configured
       (from env var or config.yaml channels section)
-    - OR: all channels are explicitly skipped (user's choice)
+    - OR: all required channels are explicitly skipped (user's choice)
 
     Args:
         config: Loaded config dict (may contain 'channels' and 'setup' keys)
 
     Returns:
-        True if at least one channel is ready, or all skipped
+        True if token is set and all non-skipped channels are configured,
+        or all required channels are skipped
     """
     skipped = get_skipped_channels(config)
     channels = config.get("channels", {}) or {}
 
-    # All channels defined in ChannelsConfig model
-    ALL_CHANNELS = ("max", "pypi", "media", "backup", "npm", "cargo", "nuget", "rubygems", "thingiverse")
+    # Token is required
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if not token:
+        return False
 
-    has_configured = False
-    for ch_name in ALL_CHANNELS:
+    # Required channels (thingiverse is optional/extra)
+    REQUIRED_CHANNELS = ("max", "pypi", "media", "backup", "npm", "cargo", "nuget", "rubygems")
+
+    # Every non-skipped required channel must have a URL
+    for ch_name in REQUIRED_CHANNELS:
         if ch_name in skipped:
             continue
         env_var = f"CHANNEL_{ch_name.upper()}"
         val = os.environ.get(env_var, "").strip()
         if not val:
             val = str(channels.get(ch_name, "")).strip()
-        if val:
-            has_configured = True
-        # NOTE: intentionally NOT returning False here — we only need
-        # AT LEAST ONE channel configured (not all of them).
+        if not val:
+            return False
 
-    # Complete if at least one non-skipped channel has a URL, or all skipped
-    return has_configured or (len(skipped) >= len(ALL_CHANNELS))
+    return True
 
 
 # ── Thin wrapper over new config/ package ──

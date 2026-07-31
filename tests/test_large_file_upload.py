@@ -23,13 +23,15 @@ class TestGetUserDataDir:
 
     def test_returns_default_path(self):
         """Returns default Chrome user data path when config has no browser section."""
-        from browser_max import BrowserMAX
-
-        bm = BrowserMAX("https://example.com")
-
-        with patch("os.path.exists", return_value=False):
+        mock_cfg = MagicMock()
+        mock_cfg.browser.user_data_dir = None
+        mock_cfg.browser.profile_name = "Default"
+        
+        with patch("config.get_config", return_value=mock_cfg):
+            from browser_max import BrowserMAX
+            bm = BrowserMAX("https://example.com")
             result = bm._get_user_data_dir()
-
+        
         assert "Google" in result
         assert "Chrome" in result
         assert "User Data" in result
@@ -166,22 +168,25 @@ class TestLaunchWithProfile:
         """Launches Chromium with user data dir from _get_user_data_dir."""
         from browser_max import BrowserMAX
 
-        bm = BrowserMAX("https://example.com")
-        bm.playwright = MagicMock()
-
+        mock_pw = MagicMock()
         mock_browser = MagicMock()
-        mock_context = MagicMock()
         mock_page = MagicMock()
 
-        bm.playwright.chromium.launch.return_value = mock_browser
-        mock_browser.new_context.return_value = mock_context
-        mock_context.new_page.return_value = mock_page
+        mock_pw.chromium.launch_persistent_context.return_value = mock_browser
+        mock_browser.new_page.return_value = mock_page
 
-        with patch.object(bm, '_get_user_data_dir', return_value=r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default"):
+        with patch("browser_max.sync_playwright") as mock_sync, \
+             patch.object(BrowserMAX, '_get_user_data_dir', return_value=r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default"), \
+             patch.object(BrowserMAX, '_stop_existing_playwright'), \
+             patch.object(BrowserMAX, '_install_api_interceptor'):
+            mock_sync.return_value.start.return_value = mock_pw
+
+            bm = BrowserMAX("https://example.com")
+            bm.playwright = MagicMock()
             result = bm._launch_with_profile()
 
         assert result is True
-        bm.playwright.chromium.launch.assert_called_once()
+        mock_pw.chromium.launch_persistent_context.assert_called_once()
         assert bm._connected is True
         assert bm.page is mock_page
         assert bm.browser is mock_browser
@@ -190,35 +195,40 @@ class TestLaunchWithProfile:
         """Returns False when launch fails."""
         from browser_max import BrowserMAX
 
-        bm = BrowserMAX("https://example.com")
-        bm.playwright = MagicMock()
-        bm.playwright.chromium.launch.side_effect = Exception("Chrome not found")
+        with patch("browser_max.sync_playwright") as mock_sync, \
+             patch.object(BrowserMAX, '_stop_existing_playwright'):
+            mock_pw = MagicMock()
+            mock_sync.return_value.start.return_value = mock_pw
+            mock_pw.chromium.launch_persistent_context.side_effect = Exception("Chrome not found")
 
-        result = bm._launch_with_profile()
+            bm = BrowserMAX("https://example.com")
+            bm.playwright = MagicMock()
+            result = bm._launch_with_profile()
 
         assert result is False
 
     def test_passes_user_data_dir_arg(self):
-        """Passes --user-data-dir argument to chromium.launch."""
+        """Passes user_data_dir to launch_persistent_context."""
         from browser_max import BrowserMAX
 
-        bm = BrowserMAX("https://example.com")
-        bm.playwright = MagicMock()
+        mock_pw = MagicMock()
         mock_browser = MagicMock()
-        mock_context = MagicMock()
         mock_page = MagicMock()
-
-        bm.playwright.chromium.launch.return_value = mock_browser
-        mock_browser.new_context.return_value = mock_context
-        mock_context.new_page.return_value = mock_page
+        mock_pw.chromium.launch_persistent_context.return_value = mock_browser
+        mock_browser.new_page.return_value = mock_page
 
         expected_dir = r"C:\Custom\Profile"
-        with patch.object(bm, '_get_user_data_dir', return_value=expected_dir):
+        with patch("browser_max.sync_playwright") as mock_sync, \
+             patch.object(BrowserMAX, '_get_user_data_dir', return_value=expected_dir), \
+             patch.object(BrowserMAX, '_stop_existing_playwright'), \
+             patch.object(BrowserMAX, '_install_api_interceptor'):
+            mock_sync.return_value.start.return_value = mock_pw
+            bm = BrowserMAX("https://example.com")
+            bm.playwright = MagicMock()
             bm._launch_with_profile()
 
-        call_kwargs = bm.playwright.chromium.launch.call_args
-        args_list = call_kwargs.kwargs.get('args', [])
-        assert any(f'--user-data-dir={expected_dir}' in arg for arg in args_list)
+        call_kwargs = mock_pw.chromium.launch_persistent_context.call_args
+        assert call_kwargs.kwargs.get('user_data_dir') == expected_dir
 
 
 # ── _close_local_browser tests ──

@@ -6,10 +6,10 @@ import yaml
 
 @pytest.fixture(autouse=True)
 def clear_config_cache():
-    from config import get_config
-    get_config.cache_clear()
+    from config import init_config
+    init_config("nonexistent.yaml")
     yield
-    get_config.cache_clear()
+    init_config("nonexistent.yaml")
 
 
 @pytest.fixture

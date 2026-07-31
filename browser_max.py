@@ -9,6 +9,7 @@ import time
 import sys
 import csv
 import json
+import subprocess
 import zipfile
 import logging
 from typing import Optional
@@ -34,10 +35,6 @@ class BrowserMAXError(Exception):
 class BrowserConnectionError(BrowserMAXError):
     """Failed to connect to Chrome"""
     pass
-
-
-# Keep alias for backward compatibility (ConnectionError shadows builtin)
-ConnectionError = BrowserConnectionError
 
 
 class UploadError(BrowserMAXError):
@@ -192,18 +189,17 @@ class BrowserMAX(LogMixin):
                 pass
             cls._active_playwright = None
 
-    @staticmethod
-    def _launch_chrome_cdp():
+    def _launch_chrome_cdp(self):
         """Launch Chrome with remote debugging port 9222"""
         import socket
 
         # Check if port 9222 is already in use
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             if s.connect_ex(("127.0.0.1", 9222)) == 0:
-                _logger.debug("Port 9222 already in use, skipping launch")
+                self.logger.debug("Port 9222 already in use, skipping launch")
                 return
 
-        _logger.info("Port 9222 not available, launching Chrome with remote debugging...")
+        self.logger.info("Port 9222 not available, launching Chrome with remote debugging...")
 
         chrome_paths = [
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -220,7 +216,7 @@ class BrowserMAX(LogMixin):
                 break
 
         if not chrome_exe:
-            _logger.error("Chrome executable not found")
+            self.logger.error("Chrome executable not found")
             return
 
         user_data_dir = os.path.join(os.path.expanduser("~"), "AppData", "Local", "Google", "Chrome", "User Data")
@@ -237,10 +233,10 @@ class BrowserMAX(LogMixin):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            _logger.info(f"Launched Chrome: {chrome_exe}")
+            self.logger.info(f"Launched Chrome: {chrome_exe}")
             time.sleep(3)
         except Exception as e:
-            _logger.error(f"Failed to launch Chrome: {e}")
+            self.logger.error(f"Failed to launch Chrome: {e}")
 
     def _get_user_data_dir(self) -> str:
         """Get Chrome user data directory from config with fallback."""
@@ -583,10 +579,24 @@ class BrowserMAX(LogMixin):
 
                 if not connected:
                     self.logger.warning("All CDP attempts failed")
-                    self.logger.warning("Chrome SxS/Canary may be incompatible with Playwright CDP.")
-                    self.logger.warning("Set archiver.use_local_browser=true in config.yaml to bypass CDP.")
+                    # Try launching Chrome with remote debugging automatically
+                    self.logger.info("Attempting to launch Chrome with remote debugging...")
+                    self._launch_chrome_cdp()
+
+                    # Retry CDP connection once after launch
+                    try:
+                        self.browser = self.playwright.chromium.connect_over_cdp(
+                            "http://127.0.0.1:9222",
+                            timeout=15000
+                        )
+                        connected = True
+                        self.logger.info("Connected via CDP after auto-launch")
+                    except Exception as e:
+                        self.logger.warning(f"Post-launch CDP retry failed: {e}")
 
                 if not connected:
+                    self.logger.warning("Chrome SxS/Canary may be incompatible with Playwright CDP.")
+                    self.logger.warning("Set archiver.use_local_browser=true in config.yaml to bypass CDP.")
                     self.logger.error("Failed to connect to MAX via CDP after all retries")
                     self.playwright.stop()
                     self.playwright = None
@@ -626,7 +636,7 @@ class BrowserMAX(LogMixin):
     def ensure_page_ready(self):
         """Ensure page is loaded and ready for interaction"""
         if not self.page:
-            raise ConnectionError("Not connected. Call keep_alive_connect() first.")
+            raise BrowserConnectionError("Not connected. Call keep_alive_connect() first.")
 
         try:
             self.page.wait_for_load_state("networkidle", timeout=15000)
@@ -650,7 +660,7 @@ class BrowserMAX(LogMixin):
 
         # Reconnect if needed
         if not self._ensure_alive():
-            raise ConnectionError("Failed to connect to Chrome")
+            raise BrowserConnectionError("Failed to connect to Chrome")
 
         try:
             self.page.goto(self.channel_url, wait_until="domcontentloaded", timeout=30000)
@@ -660,7 +670,7 @@ class BrowserMAX(LogMixin):
             self._connected = False
             self.page = None
             if not self._ensure_alive():
-                raise ConnectionError("Failed to reconnect to Chrome")
+                raise BrowserConnectionError("Failed to reconnect to Chrome")
             self.page.goto(self.channel_url, wait_until="domcontentloaded", timeout=30000)
             time.sleep(2)
 
@@ -701,12 +711,12 @@ class BrowserMAX(LogMixin):
     def _check_connection(self):
         """Verify page is available and alive"""
         if not self.page:
-            raise ConnectionError("Not connected. Call connect() first.")
+            raise BrowserConnectionError("Not connected. Call connect() first.")
         if self.page.is_closed():
             self.logger.warning("Page was closed, reconnecting...")
             self._connected = False
             self.page = None
-            raise ConnectionError("Page was closed, need to reconnect")
+            raise BrowserConnectionError("Page was closed, need to reconnect")
 
     def _ensure_alive(self) -> bool:
         """
@@ -3440,7 +3450,7 @@ class BrowserMAX(LogMixin):
         if not self.page:
             self.logger.info("Connecting to MAX...")
             if not self.connect():
-                raise ConnectionError("Failed to connect to Chrome")
+                raise BrowserConnectionError("Failed to connect to Chrome")
             self.navigate()
 
         self.ensure_page_ready()

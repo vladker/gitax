@@ -134,6 +134,7 @@ class TestSendMessageWithFilesSplitMode:
         """Create BrowserMAX with all heavy dependencies mocked."""
         bm = BrowserMAX("https://example.com")
         bm.page = MagicMock()
+        bm.page.is_closed.return_value = False
         bm._connected = True
         bm.connect = MagicMock(return_value=True)
         bm.page.evaluate.return_value = 0

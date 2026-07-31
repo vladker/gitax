@@ -140,8 +140,8 @@ class TestScanChannelForFiles:
 
     def test_checks_connection_first(self, browser_max):
         """Raises error if not connected"""
-        from browser_max import BrowserMAX, ConnectionError as BMConnectionError
+        from browser_max import BrowserMAX, BrowserConnectionError
         bm = BrowserMAX("https://web.max.ru/test-channel")
         bm.page = None
-        with pytest.raises(BMConnectionError):
+        with pytest.raises(BrowserConnectionError):
             bm.scan_channel_for_files()

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from browser_max import BrowserMAX
+from browser_max import BrowserMAX, BrowserConnectionError
 
 
 class BrowserInitMixin:
@@ -35,7 +35,7 @@ class BrowserInitMixin:
         """Ensure browser is connected and ready."""
         browser = self._init_browser()
         if not browser.keep_alive_connect():
-            raise ConnectionError("Failed to connect to MAX")
+            raise BrowserConnectionError("Failed to connect to MAX")
         browser.navigate()
         browser.ensure_page_ready()
         return browser

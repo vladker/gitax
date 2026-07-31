@@ -463,7 +463,7 @@ class GitHubArchiver(LogMixin):
                     fail_count += 1
                     continue
                 owner, repo_name = parts
-                repo_info = self.github.get_repo(owner, repo_name)
+                repo_info = self.github.get_repository_details(owner, repo_name)
                 if not repo_info:
                     print(f"    ✗ Не удалось получить информацию о репозитории")
                     fail_count += 1
@@ -3235,8 +3235,29 @@ class GitHubArchiver(LogMixin):
             input("\n  Нажмите Enter для возврата в меню...")
             return
 
+        # Ask for folder path
+        print()
+        default_dir = self.config.get('media_archiver', {}).get('watch_dir', '')
+        if default_dir:
+            print(f"  Папка по умолчанию: {default_dir}")
+            folder = input(f"  Путь к папке с медиа [Enter для {default_dir}]: ").strip()
+            if not folder:
+                folder = default_dir
+        else:
+            folder = input("  Путь к папке с медиа: ").strip()
+
+        if not folder:
+            print("\n  ✗ Путь не указан")
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        if not os.path.isdir(folder):
+            print(f"\n  ✗ Папка не найдена: {folder}")
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
         try:
-            media = MediaArchiver("config.yaml")
+            media = MediaArchiver("config.yaml", watch_dir=folder)
             media.run()
         except Exception as e:
             print(f"\n  ✗ Ошибка: {e}")
@@ -3469,8 +3490,15 @@ class GitHubArchiver(LogMixin):
         """Запустить главный цикл программы"""
 
         # Auto-prompt on first launch if setup is incomplete
-        if not is_setup_complete(self.config):
+        if not is_setup_complete(self.config) and not self._orphaned_repos_to_retry:
             self._show_auto_prompt()
+
+        # Process orphaned retries immediately (before main menu)
+        if self._orphaned_repos_to_retry:
+            self._init_github()
+            self._process_orphaned_retries()
+            self._orphaned_repos_to_retry = []
+            input("\n  Нажмите Enter для продолжения...")
 
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')

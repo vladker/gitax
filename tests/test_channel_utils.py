@@ -5,11 +5,11 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def clear_config_cache():
-    """Clear the config singleton cache before each test."""
-    from config import get_config
-    get_config.cache_clear()
+    """Clear the config singleton before each test."""
+    from config import init_config
+    init_config("nonexistent.yaml")
     yield
-    get_config.cache_clear()
+    init_config("nonexistent.yaml")
 
 
 @pytest.fixture

@@ -1,5 +1,5 @@
 # tests/test_config_init.py
-"""Tests for config singleton — caching, init_config, cache clearing."""
+"""Tests for config singleton — caching, init_config, singleton reset."""
 
 import os
 import yaml
@@ -10,15 +10,17 @@ from pathlib import Path
 class TestGetConfig:
     def test_returns_appconfig(self):
         """get_config() returns an AppConfig instance."""
-        from config import get_config, AppConfig
-        cfg = get_config("nonexistent_config.yaml")
+        from config import get_config, AppConfig, init_config
+        init_config("nonexistent_config.yaml")
+        cfg = get_config()
         assert isinstance(cfg, AppConfig)
 
     def test_singleton_same_object(self):
-        """Two calls return the same object (cached)."""
-        from config import get_config
-        cfg1 = get_config("nonexistent_config.yaml")
-        cfg2 = get_config("nonexistent_config.yaml")
+        """Two calls return the same object (singleton)."""
+        from config import get_config, init_config
+        init_config("nonexistent_config.yaml")
+        cfg1 = get_config()
+        cfg2 = get_config()
         assert cfg1 is cfg2
 
     def test_init_config_changes_path(self, tmp_path, monkeypatch):
@@ -38,8 +40,8 @@ class TestGetConfig:
         cfg = get_config()
         assert cfg.archiver.limit == 777
 
-    def test_init_config_clears_cache(self, tmp_path, monkeypatch):
-        """init_config() clears the cache so next get_config() reloads."""
+    def test_init_config_clears_singleton(self, tmp_path, monkeypatch):
+        """init_config() resets the singleton so next get_config() reloads."""
         monkeypatch.chdir(tmp_path)
 
         from config import init_config, get_config
@@ -60,15 +62,14 @@ class TestGetConfig:
         assert cfg2.archiver.limit == 555
         assert cfg2 is not cfg1
 
-    def test_cache_clearable(self):
-        """get_config.cache_clear() works for testing."""
-        from config import get_config
-        get_config.cache_clear()
-        cfg1 = get_config("nonexistent_cache_test.yaml")
-        get_config.cache_clear()
-        cfg2 = get_config("nonexistent_cache_test.yaml")
-        # After clear, should be a new object
-        # (different call because cache was cleared between)
+    def test_singleton_resettable(self):
+        """init_config() resets singleton for testing."""
+        from config import init_config, get_config
+        init_config("nonexistent_cache_test.yaml")
+        cfg1 = get_config()
+        init_config("nonexistent_cache_test2.yaml")
+        cfg2 = get_config()
+        # After reset, should be a new object
         assert cfg1 is not cfg2
 
 

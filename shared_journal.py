@@ -32,18 +32,39 @@ class BaseJournal(LogMixin):
     # ── Locking ──────────────────────────────────────────────
 
     def _acquire_lock(self) -> bool:
-        """Acquire exclusive lock for safe writes (5 min stale timeout)"""
-        try:
-            if os.path.exists(self._lock_file):
-                lock_age = time.time() - os.path.getmtime(self._lock_file)
-                if lock_age > 300:
-                    self._release_lock()
-                else:
-                    return False
-            Path(self._lock_file).touch()
-            return True
-        except Exception:
-            return False
+        """Acquire exclusive lock for safe writes (5 min stale timeout).
+
+        Uses atomic O_CREAT|O_EXCL to avoid the TOCTOU race between
+        exists() and touch().  Falls back to stale-lock cleanup if
+        another holder abandoned the lock >300s ago.
+
+        Retry loop handles the secondary race: between getmtime() and
+        os.remove(), another process may create a fresh lock file.
+        """
+        for _ in range(3):
+            try:
+                # Try atomic creation — fails if lock already exists
+                fd = os.open(self._lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                os.close(fd)
+                return True
+            except FileExistsError:
+                # Lock exists — check for stale holder
+                try:
+                    lock_age = time.time() - os.path.getmtime(self._lock_file)
+                    if lock_age > 300:
+                        # Stale lock — remove and retry atomic creation
+                        try:
+                            os.remove(self._lock_file)
+                        except OSError:
+                            pass
+                        # Brief pause to let a competing process settle
+                        time.sleep(0.05)
+                        continue  # retry from top of loop
+                except OSError:
+                    continue  # lock file vanished between O_EXCL and getmtime — retry
+            except Exception:
+                return False
+        return False
 
     def _release_lock(self):
         """Release lock file"""

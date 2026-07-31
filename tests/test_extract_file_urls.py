@@ -151,10 +151,10 @@ class TestExtractFileUrls:
 
     def test_checks_connection_first(self, browser_max):
         """Raises error if not connected"""
-        from browser_max import BrowserMAX, ConnectionError as BMConnectionError
+        from browser_max import BrowserMAX, BrowserConnectionError
         bm = BrowserMAX("https://web.max.ru/test-channel")
         bm.page = None
-        with pytest.raises(BMConnectionError):
+        with pytest.raises(BrowserConnectionError):
             bm._extract_file_urls()
 
 
@@ -192,10 +192,10 @@ class TestDebugDumpFileMessages:
 
     def test_checks_connection_first(self, browser_max):
         """Raises error if not connected"""
-        from browser_max import BrowserMAX, ConnectionError as BMConnectionError
+        from browser_max import BrowserMAX, BrowserConnectionError
         bm = BrowserMAX("https://web.max.ru/test-channel")
         bm.page = None
-        with pytest.raises(BMConnectionError):
+        with pytest.raises(BrowserConnectionError):
             bm._debug_dump_file_messages()
 
     def test_returns_matching_message(self, browser_max):
