@@ -8,6 +8,7 @@ Backuper — Архивация папок в канал MAX и восстано
   Restore — сканировать канал → скачать архивы → извлечь
 """
 
+import json
 import os
 import sys
 import time
@@ -48,6 +49,9 @@ def prompt_numeric_choice(prompt_text: str, valid_options: list[str]) -> str:
         print(f"  Неверный выбор. Доступно: {', '.join(sorted(valid_options))}")
 
 
+SESSION_FILE = "backuper_session.json"
+
+
 class Backuper(LogMixin, BrowserInitMixin):
     """Архивация папок в MAX канал и восстановление"""
 
@@ -66,6 +70,40 @@ class Backuper(LogMixin, BrowserInitMixin):
         os.makedirs(output_dir, exist_ok=True)
         download_dir = self.config.get("backuper", {}).get("download_dir", "./restored")
         os.makedirs(download_dir, exist_ok=True)
+
+    # ── Session Persistence ──
+
+    def _load_session(self) -> dict | None:
+        """Load upload session from file, if it exists and is valid."""
+        if not os.path.exists(SESSION_FILE):
+            return None
+        try:
+            with open(SESSION_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Validate essential fields
+            if not data.get("source_path") or not os.path.isdir(data["source_path"]):
+                return None
+            if not data.get("file_list"):
+                return None
+            return data
+        except (json.JSONDecodeError, KeyError, OSError):
+            return None
+
+    def _save_session(self, session: dict):
+        """Persist upload session to file."""
+        try:
+            with open(SESSION_FILE, "w", encoding="utf-8") as f:
+                json.dump(session, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            self.logger.warning(f"Failed to save session: {e}")
+
+    def _clear_session(self):
+        """Remove session file after successful completion."""
+        try:
+            if os.path.exists(SESSION_FILE):
+                os.remove(SESSION_FILE)
+        except OSError:
+            pass
 
     @staticmethod
     def _dir_size(path: str) -> int:
@@ -150,8 +188,8 @@ class Backuper(LogMixin, BrowserInitMixin):
 
         return files
 
-    def _convert_exe_to_zip(self, exe_path: str) -> str | None:
-        """Convert .exe file to .zip using 7z (store mode, no compression)"""
+    def _convert_to_zip(self, source_path: str) -> str | None:
+        """Convert a binary file (.exe/.apk) to .zip using 7z (store mode, no compression)"""
         import subprocess
         from config import get_config
 
@@ -160,16 +198,15 @@ class Backuper(LogMixin, BrowserInitMixin):
             self.logger.error(f"7z not found at {seven_zip_exe}")
             return None
 
-        # Output zip path in same directory
-        zip_path = exe_path[:-4] + ".zip"  # Replace .exe with .zip
+        zip_path = source_path + ".zip"
 
         # Use 7z to create zip with store compression (-mx=0)
-        cmd = [seven_zip_exe, "a", "-tzip", "-mx=0", zip_path, exe_path]
+        cmd = [seven_zip_exe, "a", "-tzip", "-mx=0", zip_path, source_path]
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             if result.returncode == 0 and os.path.exists(zip_path):
-                self.logger.info(f"Converted {exe_path} -> {zip_path}")
+                self.logger.info(f"Converted {source_path} -> {zip_path}")
                 return zip_path
             else:
                 self.logger.warning(f"7z conversion failed: {result.stderr}")
@@ -184,7 +221,7 @@ class Backuper(LogMixin, BrowserInitMixin):
     # ── Backup Mode ──
 
     def run_backup(self):
-        """Интерактивный режим бэкапа: папка → архив → канал"""
+        """Интерактивный режим бэкапа: выбор режима архивации → канал"""
         print("\n" + "=" * 60)
         print("  Бэкап — архивация папки в канал MAX")
         print("=" * 60)
@@ -201,32 +238,67 @@ class Backuper(LogMixin, BrowserInitMixin):
             print("  ✗ Папка пуста. Нечего архивировать.")
             return
 
-        # 2. Archive name
+        # 2. Mode selection
+        print("\n  Режим архивации:")
+        print("    [1] Архив (7z) — однотомный")
+        print("    [2] Архив (7z) — многотомный (размер из конфига)")
+        print("    [3] Архив (7z) — многотомный (свой размер)")
+        mode_choice = prompt_numeric_choice("Выбор [1-3]", ["1", "2", "3"])
+
+        # Delegate to archive mode
+        self.run_backup_archive(
+            source_path=source_path,
+            mode_choice=mode_choice,
+        )
+
+    def run_backup_archive(
+        self,
+        source_path: str | None = None,
+        mode_choice: str = "1",
+    ):
+        """Архивация папки в 7z → отправка в канал.
+
+        Args:
+            source_path: Папка для архивации (если None — запрашивается).
+            mode_choice: "1" = однотомный, "2" = из конфига, "3" = свой размер.
+        """
+        print("\n" + "=" * 60)
+        print("  Бэкап — архивация папки в канал MAX")
+        print("=" * 60)
+
+        # 1. Source path
+        if source_path is None:
+            print()
+            source_path = input("  Папка для бэкапа: ").strip().strip('"').strip("'")
+            if not source_path or not os.path.isdir(source_path):
+                print("  ✗ Папка не найдена или не является директорией.")
+                return
+
+            src_size = self._dir_size(source_path)
+            if src_size == 0:
+                print("  ✗ Папка пуста. Нечего архивировать.")
+                return
+
+        # 2. Connect to browser (early check — don't waste time if browser unavailable)
+        try:
+            self._ensure_browser_connected()
+        except Exception as e:
+            print(f"\n  ✗ Не удалось подключиться к MAX: {e}")
+            return
+
+        # 3. Archive name
         default_name = f"{os.path.basename(source_path)}_{datetime.now().strftime('%Y%m%d_%H%M')}"
         archive_name = input(f"  Имя архива [{default_name}]: ").strip()
         if not archive_name:
             archive_name = default_name
 
-        # 3. Description
+        # 4. Description
         print()
         print("  Описание архива (необязательно):")
         print("  Будет добавлено в сообщение при отправке в канал.")
         description = input("  Описание: ").strip()
 
-        # 4. Mode selection
-        print("\n  Режим бэкапа:")
-        print("    [1] Архив (7z) — однотомный")
-        print("    [2] Архив (7z) — многотомный (размер из конфига)")
-        print("    [3] Архив (7z) — многотомный (свой размер)")
-        print("    [4] Загрузить файлы как есть (без архивации)")
-        mode_choice = prompt_numeric_choice("Выбор [1-4]", ["1", "2", "3", "4"])
-
-        if mode_choice == "4":
-            # Delegate to upload-as-is mode with already-selected folder
-            self.run_backup_as_is(source_path=source_path)
-            return
-
-        # 5. Volume mode (for archive modes 1-3)
+        # 5. Volume mode
         volume_size = None
         if mode_choice == "2":
             volume_size = self.config.get("backuper", {}).get("default_volume_size", "49M")
@@ -235,10 +307,8 @@ class Backuper(LogMixin, BrowserInitMixin):
             volume_size = input('  Размер тома (напр. "49M", "100M"): ').strip()
             if not volume_size:
                 volume_size = self.config.get("backuper", {}).get("default_volume_size", "49M")
-        elif mode_choice != "1":
-            print("  Неверный выбор, использую однотомный архив.")
 
-        # 5. Password
+        # 6. Password
         use_password = input("  Использовать пароль? [y/N]: ").strip().lower() == "y"
         password = None
         password_hint = None
@@ -252,7 +322,7 @@ class Backuper(LogMixin, BrowserInitMixin):
                 if hint:
                     password_hint = hint
 
-        # 6. Duplicate check
+        # 7. Duplicate check
         content_hash = self.journal.compute_content_hash(source_path)
         if self.journal.is_duplicate_by_hash(content_hash):
             confirm = input("  ⚠ Уже есть бэкап с таким содержимым. Переписать? [y/N]: ").strip().lower()
@@ -260,7 +330,7 @@ class Backuper(LogMixin, BrowserInitMixin):
                 print("  Отменено.")
                 return
 
-        # 7. Archive
+        # 8. Archive
         output_dir = self.config.get("backuper", {}).get("output_dir", "./temp_backups")
         output_base = os.path.join(output_dir, archive_name) + ".7z"
         comp_level = int(self.config.get("backuper", {}).get("compression_level", "5"))
@@ -284,14 +354,9 @@ class Backuper(LogMixin, BrowserInitMixin):
         total_size = sum(os.path.getsize(v) for v in volumes if os.path.exists(v))
         print(f"  ✓ {len(volumes)} том(ов), {format_file_size(total_size)} за {elapsed:.0f}с")
 
-        # 7. Upload to channel
+        # 9. Upload to channel
         print("\n  Отправка в канал MAX ...")
-        try:
-            browser = self._ensure_browser_connected()
-        except Exception as e:
-            print(f"  ✗ Не удалось подключиться к MAX: {e}")
-            cleanup_volumes(volumes)
-            return
+        browser = self.browser
 
         msg_text = (
             f"📦 Бэкап: {archive_name}\n"
@@ -307,7 +372,7 @@ class Backuper(LogMixin, BrowserInitMixin):
         retries = int(self.config.get("backuper", {}).get("retries", 3))
         retry_delay = int(self.config.get("backuper", {}).get("retry_delay", 10))
 
-        success, _ = browser.send_message_with_files(
+        success, _ = self.browser.send_message_with_files(
             text=msg_text,
             filepaths=volumes,
             retries=retries,
@@ -353,69 +418,143 @@ class Backuper(LogMixin, BrowserInitMixin):
     def run_backup_as_is(self, source_path: str | None = None):
         """Интерактивный режим: загрузка файлов из папки как есть (без архивации)"""
         print("\n" + "=" * 60)
-        print("  Загрузка файлов как есть — без архивации")
+        print("  Загрузка файлов как есть — без архивация")
         print("=" * 60)
 
-        # 1. Source path (only ask if not provided)
-        if source_path is None:
+        # ── Check for existing session ──
+        existing_session = self._load_session()
+        use_session = False
+
+        if existing_session:
             print()
-            source_path = input("  Папка для загрузки: ").strip().strip('"').strip("'")
-            if not source_path or not os.path.isdir(source_path):
-                print("  ✗ Папка не найдена или не является директорией.")
-                return
-        else:
+            print("  ⏱ Найдена незавершённая сессия:")
+            print(f"    Папка: {existing_session['source_path']}")
+            print(f"    Прогресс: {existing_session['current_index']}/{existing_session['total_files']}")
+            print(f"    Загружено: {existing_session['sent_count']}")
+            print(f"    Пропущено: {existing_session['skipped_count']}")
+            print(f"    Ошибок: {existing_session['failed_count']}")
+            print()
+            print("  Что делать?")
+            print("    [1] Продолжить с последнего файла")
+            print("    [2] Продолжить с последнего успешного")
+            print("    [3] Откатить на N файлов назад")
+            print("    [4] Новая сессия (сбросить старую)")
+            resume_choice = prompt_numeric_choice("  Выбор [1-4]", ["1", "2", "3", "4"])
+
+            if resume_choice == "4":
+                self._clear_session()
+                existing_session = None
+            else:
+                use_session = True
+                if resume_choice == "3":
+                    rollback_n_input = input("  На сколько файлов откатить? ").strip()
+                    try:
+                        rollback_n = int(rollback_n_input) if rollback_n_input else 3
+                    except ValueError:
+                        rollback_n = 3
+                    resume_idx = existing_session["current_index"]
+                    files_processed = existing_session.get("processed_files", [])
+                    if len(files_processed) >= rollback_n:
+                        resume_idx = len(files_processed) - rollback_n + 1
+                        resume_idx = max(1, resume_idx)
+                    existing_session["resume_index"] = resume_idx
+                    existing_session["resume_mode"] = "rollback"
+                    existing_session["rollback_n"] = rollback_n
+                elif resume_choice == "2":
+                    existing_session["resume_mode"] = "from_last_success"
+                else:
+                    existing_session["resume_mode"] = "from_current"
+
+        # 1. Source path
+        if use_session and existing_session:
+            source_path = existing_session.get("source_path", source_path)
+            if source_path and not os.path.isdir(source_path):
+                print(f"  ✗ Папка '{source_path}' не найдена, использую новую.")
+                use_session = False
             print(f"\n  Папка: {source_path}")
+        else:
+            if source_path is None:
+                print()
+                source_path = input("  Папка для загрузки: ").strip().strip('"').strip("'")
+                if not source_path or not os.path.isdir(source_path):
+                    print("  ✗ Папка не найдена или не является директорией.")
+                    return
+            else:
+                print(f"\n  Папка: {source_path}")
 
-        # 2. Description
-        print()
-        print("  Описание (необязательно):")
-        print("  Будет добавлено в каждое сообщение при отправке.")
-        description = input("  Описание: ").strip()
-
-        # 3. Filter options
-        print("\n  Фильтры файлов (Enter = без фильтра):")
-        ext_input = input("  Расширения через запятую (напр. .txt,.pdf,.jpg): ").strip()
-        allowed_extensions = [e.strip().lower() for e in ext_input.split(",") if e.strip()] if ext_input else []
-
-        size_input = input("  Макс. размер файла в MB (0 = без лимита): ").strip()
+        # 2. Connect to browser (early check — don't waste time if browser unavailable)
         try:
-            max_size_mb = int(size_input) if size_input else 0
-        except ValueError:
-            print("  Неверный ввод, использую значение по умолчанию: 0 (без лимита)")
-            max_size_mb = 0
+            self._ensure_browser_connected()
+        except Exception as e:
+            print(f"\n  ✗ Не удалось подключиться к MAX: {e}")
+            return
 
-        recursive_input = input("  Рекурсивно (включая подпапки)? [Y/n]: ").strip().lower()
-        recursive = recursive_input != "n"
+        # 3. Description
+        if use_session and existing_session:
+            description = existing_session.get("description", "")
+            print(f"\n  Описание: {description or '(пусто)'}")
+        else:
+            print()
+            print("  Описание (необязательно):")
+            print("  Будет добавлено в каждое сообщение при отправке.")
+            description = input("  Описание: ").strip()
 
-        # 3b. Auto-convert .exe to .zip
-        convert_exe = input("  Конвертировать .exe в .zip перед загрузкой? [y/N]: ").strip().lower() == "y"
+        # 4. Filter options
+        if use_session and existing_session:
+            allowed_extensions = existing_session.get("allowed_extensions", [])
+            max_size_mb = existing_session.get("max_size_mb", 0)
+            recursive = existing_session.get("recursive", True)
+            convert_bin = existing_session.get("convert_bin", False)
+            sort_by = existing_session.get("sort_by", "name")
+            sort_order = existing_session.get("sort_order", "asc")
+            use_password = existing_session.get("use_password", False)
+            password = existing_session.get("password", None)
+            print("\n  Использую настройки из сессии:")
+            print(f"    Расширения: {allowed_extensions or 'все'}")
+            print(f"    Макс. размер: {max_size_mb} MB")
+            print(f"    Рекурсивно: {recursive}")
+            print(f"    Конвертация .exe/.apk: {convert_bin}")
+        else:
+            print("\n  Фильтры файлов (Enter = без фильтра):")
+            ext_input = input("  Расширения через запятую (напр. .txt,.pdf,.jpg): ").strip()
+            allowed_extensions = [e.strip().lower() for e in ext_input.split(",") if e.strip()] if ext_input else []
 
-        # 3c. Sorting options
-        print("\n  Сортировка файлов:")
-        print("    [1] По имени")
-        print("    [2] По размеру")
-        print("    [3] По дате создания")
-        sort_choice = prompt_numeric_choice("Выбор [1-3]", ["1", "2", "3"])
-        sort_map = {"1": "name", "2": "size", "3": "date"}
-        sort_by = sort_map.get(sort_choice, "name")
+            size_input = input("  Макс. размер файла в MB (0 = без лимита): ").strip()
+            try:
+                max_size_mb = int(size_input) if size_input else 0
+            except ValueError:
+                print("  Неверный ввод, использую значение по умолчанию: 0 (без лимита)")
+                max_size_mb = 0
 
-        print("\n  Порядок сортировки:")
-        print("    [1] По возрастанию (ASC)")
-        print("    [2] По убыванию (DESC)")
-        order_choice = prompt_numeric_choice("Выбор [1-2]", ["1", "2"])
-        sort_order = "asc" if order_choice == "1" else "desc"
+            recursive_input = input("  Рекурсивно (включая подпапки)? [Y/n]: ").strip().lower()
+            recursive = recursive_input != "n"
 
-        # 3d. Password protection for each file
-        print()
-        use_password = input("  Архивировать каждый файл в 7z с паролем? [y/N]: ").strip().lower() == "y"
-        password = None
-        if use_password:
-            password = input("  Пароль: ").strip()
-            if not password:
-                print("  Пароль пустой, отменяю архивацию.")
-                use_password = False
+            convert_bin = input("  Конвертировать .exe / .apk в .zip перед загрузкой? [y/N]: ").strip().lower() == "y"
 
-        # 4. Scan files
+            print("\n  Сортировка файлов:")
+            print("    [1] По имени")
+            print("    [2] По размеру")
+            print("    [3] По дате создания")
+            sort_choice = prompt_numeric_choice("Выбор [1-3]", ["1", "2", "3"])
+            sort_map = {"1": "name", "2": "size", "3": "date"}
+            sort_by = sort_map.get(sort_choice, "name")
+
+            print("\n  Порядок сортировки:")
+            print("    [1] По возрастанию (ASC)")
+            print("    [2] По убыванию (DESC)")
+            order_choice = prompt_numeric_choice("Выбор [1-2]", ["1", "2"])
+            sort_order = "asc" if order_choice == "1" else "desc"
+
+            print()
+            use_password = input("  Архивировать каждый файл в 7z с паролем? [y/N]: ").strip().lower() == "y"
+            password = None
+            if use_password:
+                password = input("  Пароль: ").strip()
+                if not password:
+                    print("  Пароль пустой, отменяю архивацию.")
+                    use_password = False
+
+        # 5. Scan files
         print("\n  Сканирование папки ...")
         files = self._scan_files_for_upload(
             source_path=source_path,
@@ -442,17 +581,45 @@ class Backuper(LogMixin, BrowserInitMixin):
         if total_files > 10:
             print(f"    ... и ещё {total_files - 10}")
 
-        # 5. Confirm
-        confirm = input(f"\n  Загрузить {total_files} файл(ов)? [Y/n]: ").strip().lower()
+        # ── Determine start index from session ──
+        start_index = 0
+        sent_count = 0
+        skipped_count = 0
+        failed_count = 0
+        failed_files = []
+        processed_files = []  # Track processed file indices
+        rollback_n = 0
+
+        if existing_session:
+            # Restore counts from session
+            sent_count = existing_session.get("sent_count", 0)
+            skipped_count = existing_session.get("skipped_count", 0)
+            failed_count = existing_session.get("failed_count", 0)
+            failed_files = existing_session.get("failed_files", [])
+            processed_files = existing_session.get("processed_files", [])
+
+            # Determine where to start
+            if existing_session.get("resume_mode") == "from_last_success":
+                # Find the last successful file
+                last_success_idx = 0
+                for proc_idx in processed_files:
+                    journal_key = f"{os.path.basename(source_path)}/{proc_idx['rel_path']}"
+                    if self.journal.is_file_uploaded(journal_key, proc_idx.get("size", 0)):
+                        last_success_idx = proc_idx.get("file_index", 0)
+                start_index = last_success_idx
+                print(f"\n  ⏱ Возобновление с файла #{start_index + 1} (последний успешный)")
+            elif existing_session.get("resume_mode") == "rollback":
+                start_index = existing_session.get("resume_index", 0)
+                rollback_n = existing_session.get("rollback_n", 0)
+                print(f"\n  ⏱ Возобновление с файла #{start_index + 1} (откат на {rollback_n} файлов)")
+            else:
+                start_index = existing_session.get("current_index", 0)
+                print(f"\n  ⏱ Возобновление с файла #{start_index + 1}")
+
+        # 6. Confirm
+        confirm = input(f"\n  Загрузить {total_files - start_index} файл(ов) (из {total_files})? [Y/n]: ").strip().lower()
         if confirm == "n":
             print("  Отменено.")
-            return
-
-        # 6. Connect to browser
-        try:
-            browser = self._ensure_browser_connected()
-        except Exception as e:
-            print(f"\n  ✗ Не удалось подключиться к MAX: {e}")
             return
 
         # 7. Upload each file
@@ -463,30 +630,61 @@ class Backuper(LogMixin, BrowserInitMixin):
             self.config.get("archiver", {}).get("large_file_threshold_mb", 50) * 1024 * 1024
         )
 
-        sent_count = 0
-        skipped_count = 0
-        failed_count = 0
-        failed_files = []
         temp_files_to_cleanup = []
 
-        print(f"\n  Начинаю загрузку {total_files} файл(ов)...\n")
+        print(f"\n  Начинаю загрузку...\n")
+
+        # Create session data structure
+        session_data = {
+            "source_path": source_path,
+            "description": description,
+            "allowed_extensions": allowed_extensions,
+            "max_size_mb": max_size_mb,
+            "recursive": recursive,
+            "convert_bin": convert_bin,
+            "sort_by": sort_by,
+            "sort_order": sort_order,
+            "use_password": use_password,
+            "password": password,
+            "total_files": total_files,
+            "current_index": start_index,
+            "sent_count": sent_count,
+            "skipped_count": skipped_count,
+            "failed_count": failed_count,
+            "failed_files": failed_files,
+            "processed_files": processed_files,
+            "start_time": existing_session.get("start_time", datetime.now().isoformat()) if existing_session else datetime.now().isoformat(),
+        }
 
         with LiveProgressBar(total_files, "Загрузка файлов") as bar:
-            for idx, (filepath, size) in enumerate(files, 1):
+            for idx, (filepath, size) in enumerate(files):
+                # Skip already processed files
+                if idx < start_index:
+                    continue
+
                 filename = os.path.basename(filepath)
                 rel_path = os.path.relpath(filepath, source_path)
                 size_str = format_file_size(size)
-                bar.update(idx, item_name=rel_path)
-                print(f"  [{idx}/{total_files}] {rel_path} ({size_str})")
+                bar.update(idx + 1, item_name=rel_path)
+                print(f"  [{idx + 1}/{total_files}] {rel_path} ({size_str})")
 
                 # Check journal for deduplication
-                # Use a composite key: archive_name = folder_name + rel_path
                 folder_name = os.path.basename(source_path)
                 journal_key = f"{folder_name}/{rel_path}"
 
                 if self.journal.is_file_uploaded(journal_key, size):
                     print(f"    ✓ Уже загружен (журнал)")
                     skipped_count += 1
+                    processed_files.append({
+                        "file_index": idx,
+                        "rel_path": rel_path,
+                        "size": size,
+                        "status": "skipped"
+                    })
+                    session_data["current_index"] = idx
+                    session_data["skipped_count"] = skipped_count
+                    session_data["processed_files"] = processed_files
+                    self._save_session(session_data)
                     continue
 
                 # Build message text
@@ -499,14 +697,14 @@ class Backuper(LogMixin, BrowserInitMixin):
                 msg_parts.append(f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}")
                 msg_text = "\n\n".join(msg_parts)
 
-                # Handle .exe to .zip conversion
+                # Handle .exe / .apk to .zip conversion
                 upload_filepath = filepath
                 upload_filename = filename
                 ext = os.path.splitext(filename)[1].lower()
 
-                if convert_exe and ext == ".exe":
-                    print(f"    → Конвертация .exe в .zip...")
-                    zip_path = self._convert_exe_to_zip(filepath)
+                if convert_bin and ext in (".exe", ".apk"):
+                    print(f"    → Конвертация {ext} в .zip...")
+                    zip_path = self._convert_to_zip(filepath)
                     if zip_path and os.path.exists(zip_path):
                         upload_filepath = zip_path
                         upload_filename = os.path.basename(zip_path)
@@ -541,7 +739,7 @@ class Backuper(LogMixin, BrowserInitMixin):
                 try:
                     if size >= large_file_threshold:
                         print(f"    → Большой файл, загрузка через локальный браузер...")
-                        success = browser._upload_large_file(
+                        success = self.browser._upload_large_file(
                             upload_filepath, upload_filename, size,
                             retries=retries,
                             retry_delay=retry_delay,
@@ -550,7 +748,7 @@ class Backuper(LogMixin, BrowserInitMixin):
                         )
                     else:
                         print(f"    → Отправка в MAX...")
-                        success, _ = browser.send_message_with_files(
+                        success, _ = self.browser.send_message_with_files(
                             text=msg_text,
                             filepaths=[upload_filepath],
                             retries=retries,
@@ -561,21 +759,47 @@ class Backuper(LogMixin, BrowserInitMixin):
 
                     if success:
                         print(f"    ✓ Загружен")
-                        # Если файл был запаролен, помечаем в журнале
                         journal_marker = f"{journal_key} (encrypted)" if use_password else journal_key
                         self.journal.mark_file_uploaded(journal_marker, size)
                         sent_count += 1
+                        processed_files.append({
+                            "file_index": idx,
+                            "rel_path": rel_path,
+                            "size": size,
+                            "status": "uploaded"
+                        })
                     else:
                         print(f"    ✗ Ошибка загрузки")
                         self.journal.mark_file_failed(journal_key, size)
                         failed_count += 1
                         failed_files.append(rel_path)
+                        processed_files.append({
+                            "file_index": idx,
+                            "rel_path": rel_path,
+                            "size": size,
+                            "status": "failed"
+                        })
 
                 except Exception as e:
                     print(f"    ✗ Ошибка: {e}")
                     self.journal.mark_file_failed(journal_key, size)
                     failed_count += 1
                     failed_files.append(rel_path)
+                    processed_files.append({
+                        "file_index": idx,
+                        "rel_path": rel_path,
+                        "size": size,
+                        "status": "failed"
+                    })
+
+                # Save session after each file
+                session_data["current_index"] = idx
+                session_data["sent_count"] = sent_count
+                session_data["skipped_count"] = skipped_count
+                session_data["failed_count"] = failed_count
+                session_data["failed_files"] = failed_files
+                session_data["processed_files"] = processed_files
+                self._save_session(session_data)
 
         # Cleanup temp zip files
         for tf in temp_files_to_cleanup:
@@ -584,6 +808,9 @@ class Backuper(LogMixin, BrowserInitMixin):
                     os.remove(tf)
             except Exception:
                 pass
+
+        # Clear session on completion
+        self._clear_session()
 
         # Summary
         print()
@@ -599,6 +826,49 @@ class Backuper(LogMixin, BrowserInitMixin):
         print("=" * 60)
 
         self._close_browser()
+
+    # ── Journal View ──
+
+    def view_journal(self):
+        """Просмотр журнала бэкапов"""
+        print("\n" + "=" * 60)
+        print("  Журнал бэкапов")
+        print("=" * 60)
+
+        stats = self.journal.get_stats()
+        print(f"\n  Общее количество бэкапов: {stats['total_backups']}")
+        print(f"  Отправлено: {stats['uploaded']}")
+        print(f"  Ошибок: {stats['failed']}")
+        print(f"  Восстановлено: {stats['completed_downloads']} "
+              f"из {stats['total_downloads']} попыток")
+        print(f"  Архивов с паролем: {stats['password_protected']}")
+
+        # Show recent backups
+        backups = self.journal.get_all_backups()
+        if backups:
+            print(f"\n  Последние бэкапы:")
+            print(f"  {'#':>3}  {'Имя':<30} {'Томов':>5}  "
+                  f"{'Размер':>10}  {'Статус':<8}  {'Дата':>12}")
+            print(f"  {'─' * 3}  {'─' * 30} {'─' * 5}  "
+                  f"{'─' * 10}  {'─' * 8}  {'─' * 12}")
+
+            for i, entry in enumerate(reversed(backups[-20:]), 1):
+                name = entry.get("archive_name", "?")[:28]
+                vols = entry.get("volume_count", 1)
+                size = format_file_size(entry.get("total_size", 0))
+                status = entry.get("status", "?")
+                ts = entry.get("timestamp", "")
+                if ts:
+                    try:
+                        ts = datetime.fromisoformat(ts).strftime("%Y-%m-%d %H:%M")
+                    except (ValueError, TypeError):
+                        pass
+                print(f"  {i:>3}  {name:<30} {vols:>5}  "
+                      f"{size:>10}  {status:<8}  {ts:>12}")
+        else:
+            print("\n  Журнал пуст.")
+
+        print()
 
     # ── Restore Mode ──
 
@@ -982,14 +1252,19 @@ class Backuper(LogMixin, BrowserInitMixin):
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
             self._show_menu()
-            choice = prompt_numeric_choice("Выберите действие [0-2]", ["0", "1", "2"])
+            choice = prompt_numeric_choice("Выберите действие [0-4]",
+                                          ["0", "1", "2", "3", "4"])
 
             if choice == "0":
                 break
             elif choice == "1":
                 self.run_backup()
             elif choice == "2":
+                self.run_backup_as_is()
+            elif choice == "3":
                 self.run_restore()
+            elif choice == "4":
+                self.view_journal()
 
         self._close_browser()
 
@@ -1003,12 +1278,14 @@ class Backuper(LogMixin, BrowserInitMixin):
               f"({stats['uploaded']} отправлено, {stats['failed']} ошибок)")
         print(f"  Восстановлено: {stats['completed_downloads']} "
               f"из {stats['total_downloads']} попыток")
-        print(f"  Сохранённых паролей: {stats['passwords_stored']}")
+        print(f"  Архивов с паролем: {stats['password_protected']}")
         print("─" * 60)
         print()
-        print("  [1] Бэкап — архивировать папку в канал")
-        print("  [2] Восстановление — скачать архивы из канала")
-        print("  [0] Назад")
+        print("  [1] Архивация папки (7z)")
+        print("  [2] Загрузка файлов как есть")
+        print("  [3] Восстановление — скачать из канала")
+        print("  [4] Журнал бэкапов")
+        print("  [0] Выход")
         print()
 
 
