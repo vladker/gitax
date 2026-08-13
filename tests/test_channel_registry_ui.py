@@ -6,7 +6,7 @@ import pytest
 class TestChannelRegistryUI:
     def _isolate_env(self, monkeypatch):
         """Clear legacy channel env vars and disable load_dotenv."""
-        for key in ("CHANNEL_MAX", "CHANNEL_PYPI", "CHANNEL_MEDIA", "CHANNEL_BACKUP"):
+        for key in ("CHANNEL_max", "CHANNEL_pypi", "CHANNEL_media", "CHANNEL_backup"):
             monkeypatch.delenv(key, raising=False)
         monkeypatch.setattr("config.loader.load_dotenv", lambda: None)
 

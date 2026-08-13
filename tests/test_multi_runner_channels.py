@@ -13,7 +13,7 @@ def clear_config_cache():
 
 @pytest.fixture
 def isolated_env(monkeypatch):
-    for key in ("CHANNEL_MAX", "CHANNEL_PYPI", "CHANNEL_MEDIA", "CHANNEL_BACKUP"):
+    for key in ("CHANNEL_max", "CHANNEL_pypi", "CHANNEL_media", "CHANNEL_backup"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr("config.loader.load_dotenv", lambda **kwargs: None)
 

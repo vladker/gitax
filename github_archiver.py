@@ -858,12 +858,12 @@ class GitHubArchiver(LogMixin):
         print(menu_item("2", "PyPI — Python библиотеки", "pypi"))
         print(menu_item("3", "Backuper — бэкап папок в канал", "backup"))
         print(menu_item("4", "Файлы — медиа, скачивание, экспорт", "media"))
+        print("  [5] Сервис — журналы, настройки")
         print(menu_item("6", "Cargo — Rust пакеты", "cargo"))
         print(menu_item("7", "NuGet — .NET пакеты", "nuget"))
         print(menu_item("8", "RubyGems — Ruby пакеты", "rubygems"))
         print(menu_item("9", "SoftPortal — программы", "softportal"))
         print(menu_item("a", "Thingiverse (3D модели)", "thingiverse"))
-        print("  [5] Сервис — журналы, настройки")
 
         if not is_setup_complete(self.config):
             print("  [X] Выход")
@@ -2071,6 +2071,7 @@ class GitHubArchiver(LogMixin):
         from channel_downloader import DownloadJournal
         from backuper_journal import BackuperJournal
         from softportal_journal import SoftPortalJournal
+        from thingiverse_journal import ThingiverseJournal
 
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
@@ -2096,6 +2097,8 @@ class GitHubArchiver(LogMixin):
             rj_stats = rj.get_stats()
             spj = SoftPortalJournal("softportal_journal.json")
             spj_stats = spj.get_stats()
+            tj = ThingiverseJournal("thingiverse_journal.json")
+            tj_stats = tj.get_stats()
 
             print(f"\n  Текущее состояние журналов:")
             print(f"  [1] journal.json — {j_stats['total']} репозиториев "
@@ -2116,6 +2119,8 @@ class GitHubArchiver(LogMixin):
                   f"({rj_stats['sent']} отправлено, {rj_stats['failed']} ошибок)")
             print(f"  [9] softportal_journal.json — {spj_stats['total']} программ "
                   f"({spj_stats.get('failed_count', 0)} неудачных)")
+            print(f"  [10] thingiverse_journal.json — {tj_stats['total']} моделей "
+                  f"({tj_stats['sent']} отправлено, {tj_stats['failed']} ошибок)")
 
             print()
             print("  [1] Очистить journal.json")
@@ -2127,6 +2132,7 @@ class GitHubArchiver(LogMixin):
             print("  [7] Очистить nuget_journal.json")
             print("  [8] Очистить rubygems_journal.json")
             print("  [9] Очистить softportal_journal.json")
+            print("  [10] Очистить thingiverse_journal.json")
             print("  [-] Очистить ВСЕ журналы")
             print("  [0] Назад")
             print()
@@ -2149,6 +2155,7 @@ class GitHubArchiver(LogMixin):
                     _GenericJournal("nuget_journal.json").clear()
                     _GenericJournal("rubygems_journal.json").clear()
                     SoftPortalJournal("softportal_journal.json").reset()
+                    ThingiverseJournal("thingiverse_journal.json").clear()
                     print("  ✓ Все журналы очищены")
                 else:
                     print("  Отменено")
@@ -2232,6 +2239,15 @@ class GitHubArchiver(LogMixin):
                 if confirm in ('y', 'yes', 'д', 'да'):
                     SoftPortalJournal("softportal_journal.json").reset()
                     print("  ✓ softportal_journal.json очищен")
+                else:
+                    print("  Отменено")
+                input("\n  Нажмите Enter для продолжения...")
+
+            elif choice == '10':
+                confirm = input("\n  Очистить thingiverse_journal.json? [y/N]: ").strip().lower()
+                if confirm in ('y', 'yes', 'д', 'да'):
+                    ThingiverseJournal("thingiverse_journal.json").clear()
+                    print("  ✓ thingiverse_journal.json очищен")
                 else:
                     print("  Отменено")
                 input("\n  Нажмите Enter для продолжения...")
@@ -3691,9 +3707,24 @@ class GitHubArchiver(LogMixin):
         print("\n" + "═" * 60)
         print("  Backuper — резервное хранение в MAX")
         print("─" * 60)
+
+        # Show journal stats
+        try:
+            from backuper_journal import BackuperJournal
+            bj = BackuperJournal("backuper_journal.json")
+            stats = bj.get_stats()
+            print(f"  Журнал: {stats['total_backups']} бэкапов "
+                  f"({stats['uploaded']} отправлено, {stats['failed']} ошибок)")
+            print(f"  Восстановлено: {stats['completed_downloads']} "
+                  f"из {stats['total_downloads']} попыток")
+        except Exception:
+            pass
+
         print()
-        print("  [1] Бэкап — архивировать папку в канал")
-        print("  [2] Восстановление — скачать архивы из канала")
+        print("  [1] Бэкап папки (7z архив)")
+        print("  [2] Загрузка файлов как есть")
+        print("  [3] Восстановление — скачать архивы из канала")
+        print("  [4] Журнал бэкапов")
         print("  [0] Назад")
         print()
 
@@ -3702,14 +3733,18 @@ class GitHubArchiver(LogMixin):
         while True:
             os.system('cls' if os.name == 'nt' else 'clear')
             self._backuper_menu()
-            choice = prompt_numeric_choice("Выберите действие [0-2]", ["0", "1", "2"])
+            choice = prompt_numeric_choice("Выберите действие [0-4]", ["0", "1", "2", "3", "4"])
 
             if choice == '0':
                 break
             elif choice == '1':
                 self.run_backuper_backup()
             elif choice == '2':
+                self.run_backuper_upload_as_is()
+            elif choice == '3':
                 self.run_backuper_restore()
+            elif choice == '4':
+                self.run_backuper_journal()
 
     def _run_files_menu(self):
         """Цикл подменю Файлы"""
@@ -3997,7 +4032,7 @@ class GitHubArchiver(LogMixin):
         input("\n  Нажмите Enter для возврата в меню...")
 
     def run_backuper_backup(self):
-        """Запустить бэкап папки в канал"""
+        """Запустить бэкап папки в канал (7z архив с выбором режима)"""
         from backuper import Backuper
 
         print("\n" + "═" * 60)
@@ -4010,7 +4045,7 @@ class GitHubArchiver(LogMixin):
 
         try:
             backuper = Backuper("config.yaml")
-            backuper.run_backup()
+            backuper.run_backup_archive()
         except Exception as e:
             print(f"\n  ✗ Ошибка: {e}")
             self.logger.error(f"Backuper backup error: {e}", exc_info=True)
@@ -4035,6 +4070,40 @@ class GitHubArchiver(LogMixin):
         except Exception as e:
             print(f"\n  ✗ Ошибка: {e}")
             self.logger.error(f"Backuper restore error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def run_backuper_upload_as_is(self):
+        """Запустить загрузку файлов как есть (без архивации)"""
+        from backuper import Backuper
+
+        print("\n" + "═" * 60)
+        print("  Загрузка файлов как есть — без архивации")
+        print("═" * 60)
+
+        if not self._ensure_channel_ready("backup", "Backup канал", "backup"):
+            input("\n  Нажмите Enter для возврата в меню...")
+            return
+
+        try:
+            backuper = Backuper("config.yaml")
+            backuper.run_backup_as_is()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"Backuper upload-as-is error: {e}", exc_info=True)
+
+        input("\n  Нажмите Enter для возврата в меню...")
+
+    def run_backuper_journal(self):
+        """Просмотр журнала бэкапов"""
+        from backuper import Backuper
+
+        try:
+            backuper = Backuper("config.yaml")
+            backuper.view_journal()
+        except Exception as e:
+            print(f"\n  ✗ Ошибка: {e}")
+            self.logger.error(f"Backuper journal view error: {e}", exc_info=True)
 
         input("\n  Нажмите Enter для возврата в меню...")
 
@@ -4149,7 +4218,7 @@ class GitHubArchiver(LogMixin):
         print("  [7] NuGet — загрузка пакетов")
         print("  [8] NuGet — синхронизация пакетов")
         print("  [9] RubyGems — загрузка пакетов")
-        print("  [0] RubyGems — синхронизация пакетов")
+        print("  [10] RubyGems — синхронизация пакетов")
         print("  [SP] SoftPortal — загрузка программ")
         print("  [SS] SoftPortal — синхронизация программ")
         print()
@@ -4207,7 +4276,7 @@ class GitHubArchiver(LogMixin):
                 "7": ("nuget_archiver", "NuGetArchiver", "load_top_packages", "NuGet load"),
                 "8": ("nuget_archiver", "NuGetArchiver", "sync_packages", "NuGet sync"),
                 "9": ("rubygems_archiver", "RubyGemsArchiver", "load_top_packages", "RubyGems load"),
-                "0": ("rubygems_archiver", "RubyGemsArchiver", "sync_packages", "RubyGems sync"),
+                "10": ("rubygems_archiver", "RubyGemsArchiver", "sync_packages", "RubyGems sync"),
                 # Runtime load tasks (primary)
                 "GL": ("github_archiver", "GitHubArchiver", "load_runtime", "GitHub runtime load"),
                 "PL": ("pypi_libs_archiver", "PyPILibsArchiver", "load_runtime", "PyPI runtime load"),
@@ -4227,12 +4296,12 @@ class GitHubArchiver(LogMixin):
 
             if choice == 'A':
                 # All load tasks
-                for num in ("1", "3", "5", "7", "9"):
+                for num in ("1", "3", "5", "7", "9", "SP"):
                     mod, cls, method, label = task_map[num]
                     tasks.append(BatchTask(module=mod, cls=cls, method=method, label=label))
             elif choice == 'S':
                 # All sync tasks
-                for num in ("2", "4", "6", "8", "0"):
+                for num in ("2", "4", "6", "8", "10", "SS"):
                     mod, cls, method, label = task_map[num]
                     tasks.append(BatchTask(module=mod, cls=cls, method=method, label=label))
             elif choice == 'V':

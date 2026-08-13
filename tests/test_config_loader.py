@@ -92,9 +92,9 @@ class TestLoadConfig:
         assert cfg.github.token == "ghp_test123"
 
     def test_env_override_legacy_channel(self, tmp_path, monkeypatch):
-        """CHANNEL_MAX env var maps to channels.max and migrates to registry."""
+        """CHANNEL_max env var maps to channels.max and migrates to registry."""
         monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv("CHANNEL_MAX", "https://channel.from.env")
+        monkeypatch.setenv("CHANNEL_max", "https://channel.from.env")
         from config.loader import load_config
         cfg = load_config(tmp_path / "nonexistent.yaml")
         # Legacy channel preserved for backward compat

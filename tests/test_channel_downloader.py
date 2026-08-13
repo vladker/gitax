@@ -413,7 +413,7 @@ class TestChannelDownloaderEnvConfig:
 
     def test_channel_url_from_env_var(self, tmp_path, monkeypatch):
         """CHANNEL_max env var is resolved into config['max']['channel_url']"""
-        monkeypatch.setenv("CHANNEL_MAX", "https://web.max.ru/env-channel")
+        monkeypatch.setenv("CHANNEL_max", "https://web.max.ru/env-channel")
         config_file = tmp_path / "test_config.yaml"
         config_file.write_text("channels: {}\n")
         from channel_downloader import ChannelDownloader
@@ -425,7 +425,7 @@ class TestChannelDownloaderEnvConfig:
 
     def test_env_var_overrides_yaml(self, tmp_path, monkeypatch):
         """Env var takes priority over config.yaml value"""
-        monkeypatch.setenv("CHANNEL_MAX", "https://web.max.ru/env-channel")
+        monkeypatch.setenv("CHANNEL_max", "https://web.max.ru/env-channel")
         config_file = tmp_path / "test_config.yaml"
         config_file.write_text("channels:\n  max: https://web.max.ru/yaml-channel\n")
         from channel_downloader import ChannelDownloader
@@ -437,7 +437,7 @@ class TestChannelDownloaderEnvConfig:
 
     def test_yaml_fallback_when_no_env(self, tmp_path, monkeypatch):
         """config.yaml channels.max is used when env var is not set"""
-        monkeypatch.delenv("CHANNEL_MAX", raising=False)
+        monkeypatch.delenv("CHANNEL_max", raising=False)
         # Prevent load_dotenv from loading .env and overriding test config
         monkeypatch.setattr("config.loader.load_dotenv", lambda: None)
         config_file = tmp_path / "test_config.yaml"

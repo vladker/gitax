@@ -145,7 +145,7 @@ class TestConfigValidation:
 
     def test_missing_channel_url_exits(self, tmp_path, monkeypatch):
         """Test missing channel URL causes exit"""
-        monkeypatch.delenv("CHANNEL_PYPI", raising=False)
+        monkeypatch.delenv("CHANNEL_pypi", raising=False)
         # Mock load_dotenv to prevent .env from overriding test config
         monkeypatch.setattr("config.loader.load_dotenv", lambda **kwargs: None)
         config_file = tmp_path / "test_config.yaml"
@@ -162,7 +162,7 @@ class TestConfigValidation:
 
     def test_channel_url_from_env(self, tmp_path, monkeypatch):
         """Test channel URL is read from CHANNEL_pypi env var"""
-        monkeypatch.setenv("CHANNEL_PYPI", "https://web.max.ru/pypi-channel")
+        monkeypatch.setenv("CHANNEL_pypi", "https://web.max.ru/pypi-channel")
         config_file = tmp_path / "test_config.yaml"
         config_file.write_text("channels: {}\n")
         from pypi_libs_archiver import PyPILibsArchiver
@@ -175,7 +175,7 @@ class TestConfigValidation:
 
     def test_channel_url_from_yaml(self, tmp_path, monkeypatch):
         """Test channel URL fallback to config.yaml channels.pypi"""
-        monkeypatch.delenv("CHANNEL_PYPI", raising=False)
+        monkeypatch.delenv("CHANNEL_pypi", raising=False)
         config_file = tmp_path / "test_config.yaml"
         config_file.write_text("channels:\n  pypi: https://web.max.ru/pypi-channel\n")
         # Mock load_dotenv to prevent .env from overriding test config

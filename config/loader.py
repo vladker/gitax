@@ -92,15 +92,16 @@ def _apply_env_overrides(config: AppConfig) -> AppConfig:
     legacy_map: dict[str, tuple[str, str]] = {
         "GITHUB_TOKEN": ("github", "token"),
         "MEDIA_WATCH_DIR": ("media_archiver", "watch_dir"),
-        "CHANNEL_MAX": ("channels", "max"),
-        "CHANNEL_PYPI": ("channels", "pypi"),
-        "CHANNEL_MEDIA": ("channels", "media"),
-        "CHANNEL_BACKUP": ("channels", "backup"),
-        "CHANNEL_NPM": ("channels", "npm"),
-        "CHANNEL_CARGO": ("channels", "cargo"),
-        "CHANNEL_NUGET": ("channels", "nuget"),
-        "CHANNEL_RUBYGEMS": ("channels", "rubygems"),
-        "CHANNEL_SOFTPORTAL": ("channels", "softportal"),
+        "MAX_CHANNEL_URL": ("channels", "max"),
+        "CHANNEL_max": ("channels", "max"),
+        "CHANNEL_pypi": ("channels", "pypi"),
+        "CHANNEL_media": ("channels", "media"),
+        "CHANNEL_backup": ("channels", "backup"),
+        "CHANNEL_npm": ("channels", "npm"),
+        "CHANNEL_cargo": ("channels", "cargo"),
+        "CHANNEL_nuget": ("channels", "nuget"),
+        "CHANNEL_rubygems": ("channels", "rubygems"),
+        "CHANNEL_softportal": ("channels", "softportal"),
     }
     for env_key, (section, field) in legacy_map.items():
         raw = os.environ.get(env_key, "").strip()

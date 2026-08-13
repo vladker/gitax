@@ -15,7 +15,7 @@ def clear_config_cache():
 @pytest.fixture
 def isolated_env(monkeypatch):
     """Remove CHANNEL_* env vars and prevent load_dotenv from reloading them."""
-    for key in ("CHANNEL_MAX", "CHANNEL_PYPI", "CHANNEL_MEDIA", "CHANNEL_BACKUP"):
+    for key in ("CHANNEL_max", "CHANNEL_pypi", "CHANNEL_media", "CHANNEL_backup"):
         monkeypatch.delenv(key, raising=False)
     # Prevent load_dotenv from reloading .env (which has fake CHANNEL_* values)
     # Patch at the module where it's used, not where it's defined

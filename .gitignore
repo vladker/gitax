@@ -53,6 +53,12 @@ tmp/
 
 # opencode
 opencode.jsonc
+.opencode/
+.claude/
+
+# Node
+node_modules/
+package-lock.json
 
 # OS
 .DS_Store

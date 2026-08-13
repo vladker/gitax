@@ -18,8 +18,8 @@ def get_channel_url(config: dict, channel_name: str, env_prefix: str = "CHANNEL"
     Resolve channel URL with standardized priority chain.
 
     Priority:
-    1. Environment variable: {ENV_PREFIX}_{CHANNEL_NAME_UPPER}
-       (e.g., CHANNEL_MAX, CHANNEL_PYPI, CHANNEL_BACKUP)
+    1. Environment variable: {ENV_PREFIX}_{channel_name}
+       (e.g., CHANNEL_max, CHANNEL_pypi, CHANNEL_backup)
     2. config.yaml: channels.{channel_name}
        (e.g., channels.max, channels.pypi, channels.backup)
 
@@ -41,7 +41,7 @@ def get_channel_url(config: dict, channel_name: str, env_prefix: str = "CHANNEL"
         label = channel_name
 
     # 1. Check environment variable: CHANNEL_max, CHANNEL_pypi, etc.
-    env_var = f"{env_prefix}_{channel_name.upper()}"
+    env_var = f"{env_prefix}_{channel_name}"
     env_url = os.environ.get(env_var) or ""
     env_url = env_url.strip()
     if env_url:
@@ -56,8 +56,8 @@ def get_channel_url(config: dict, channel_name: str, env_prefix: str = "CHANNEL"
 
     # 3. Not found
     if required:
-        print(f"\u2717 URL канала \"{label}\" не указан.")
-        print(f"  Укажите CHANNEL_{channel_name.upper()} в .env файле")
+        print(f"✗ URL канала \"{label}\" не указан.")
+        print(f"  Укажите CHANNEL_{channel_name} в .env файле")
         print(f"  или channels.{channel_name} в config.yaml")
         sys.exit(1)
 

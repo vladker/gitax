@@ -3737,11 +3737,9 @@ class BrowserMAX(LogMixin):
             try:
                 self.logger.debug(f"Attempt {attempt}/{retries}")
 
-                # === UPLOAD STATE LOCK ===
-                # Set flags before any browser interaction to block destructive navigation
-                self._lock_upload_state(filepath)
-
-                # Check connection is still alive.
+                # Check connection is still alive BEFORE locking upload state.
+                # _ensure_alive() has a guard that blocks reconnection when
+                # _upload_in_progress is True — we must reconnect FIRST, then lock.
                 # NOTE: Navigation is the caller's responsibility.
                 # _upload_large_file() handles its own navigation,
                 # send_message_with_files() navigates before calling us.
@@ -3753,6 +3751,10 @@ class BrowserMAX(LogMixin):
                         continue
                     else:
                         return False
+
+                # === UPLOAD STATE LOCK ===
+                # Set flags before any browser interaction to block destructive navigation
+                self._lock_upload_state(filepath)
 
                 # Dismiss any modal that would block upload interactions
                 self._dismiss_any_modal()
@@ -3773,28 +3775,34 @@ class BrowserMAX(LogMixin):
                     uploaded = True
                 except PlaywrightTimeout:
                     self.logger.warning("File chooser timeout, trying drag-drop...")
-                    uploaded = self._upload_file_drop(filepath)
-                    if not uploaded:
-                        self.logger.warning("Drag-drop failed, trying input method...")
-                        try:
-                            file_input = self.page.locator('input[type="file"]').first
-                            file_input.set_input_files(filepath, timeout=upload_timeout)
-                            self.logger.info("File uploaded via input")
-                            uploaded = True
-                        except Exception as e2:
-                            self.logger.error(f"Input method also failed: {e2}")
+                    try:
+                        uploaded = self._upload_file_drop(filepath)
+                        if not uploaded:
+                            self.logger.warning("Drag-drop failed, trying input method...")
+                            try:
+                                file_input = self.page.locator('input[type="file"]').first
+                                file_input.set_input_files(filepath, timeout=upload_timeout)
+                                self.logger.info("File uploaded via input")
+                                uploaded = True
+                            except Exception as e2:
+                                self.logger.error(f"Input method also failed: {e2}")
+                    except BrowserConnectionError:
+                        self.logger.error("Browser disconnected during fallback upload")
                 except Exception as e:
                     self.logger.warning(f"File chooser failed: {e}")
-                    uploaded = self._upload_file_drop(filepath)
-                    if not uploaded:
-                        self.logger.warning("Drag-drop failed, trying input method...")
-                        try:
-                            file_input = self.page.locator('input[type="file"]').first
-                            file_input.set_input_files(filepath, timeout=upload_timeout)
-                            self.logger.info("File uploaded via input")
-                            uploaded = True
-                        except Exception as e2:
-                            self.logger.error(f"Input method also failed: {e2}")
+                    try:
+                        uploaded = self._upload_file_drop(filepath)
+                        if not uploaded:
+                            self.logger.warning("Drag-drop failed, trying input method...")
+                            try:
+                                file_input = self.page.locator('input[type="file"]').first
+                                file_input.set_input_files(filepath, timeout=upload_timeout)
+                                self.logger.info("File uploaded via input")
+                                uploaded = True
+                            except Exception as e2:
+                                self.logger.error(f"Input method also failed: {e2}")
+                    except BrowserConnectionError:
+                        self.logger.error("Browser disconnected during fallback upload")
 
                 if not uploaded:
                     self.logger.error("Failed to upload file - all methods failed")
