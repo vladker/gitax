@@ -432,7 +432,7 @@ class MediaJournal(BaseJournal):
         sent = self.get_sent_bytes()
         total_files = len(self.data.get("file_index", {}))
         if total == 0:
-            return {"percent": 0.0, "sent_bytes": 0, "remaining_bytes": 0, "total_files": total_files}
+            return {"percent": 0.0, "sent_bytes": sent, "remaining_bytes": 0, "total_files": total_files}
         pct = (sent / total) * 100
         return {
             "percent": round(pct, 2),
@@ -677,7 +677,7 @@ class MediaArchiver(LogMixin, BrowserInitMixin):
                 # Update batch progress
                 batch_name = self._get_batch_for_file(filepath, batches, watch_dir)
                 if batch_name:
-                    self.journal.update_batch(batch_name, file_size, sent=uploaded)
+                    self.journal.update_batch(batch_name, filename, file_size, sent=uploaded)
 
                 # Show progress every 50 files
                 if i % 50 == 0 or i == len(files):

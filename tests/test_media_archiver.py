@@ -156,50 +156,65 @@ class TestMediaJournalBatchTracking:
     """Tests for batch (subdirectory) tracking"""
 
     def test_update_batch_tracks_bytes(self, tmp_path):
-        """update_batch() accumulates total and sent bytes"""
+        """update_batch() accumulates sent files and sent bytes"""
         from media_archiver import MediaJournal
         j = MediaJournal(str(tmp_path / "journal.json"))
-        j.update_batch("Photos/2024", 1000, sent=True)
-        j.update_batch("Photos/2024", 2000, sent=True)
-        j.update_batch("Photos/2024", 500, sent=False)
+        j.register_batch("Photos/2024", total_files=3, total_bytes=3500)
+        j.update_batch("Photos/2024", "a.jpg", 1000, sent=True)
+        j.update_batch("Photos/2024", "b.jpg", 2000, sent=True)
+        j.update_batch("Photos/2024", "c.jpg", 500, sent=False)
         b = j.batches["Photos/2024"]
         assert b["total_bytes"] == 3500
         assert b["sent_bytes"] == 3000
+        assert b["sent_files"] == 2
+        assert b["status"] == "in_progress"
 
     def test_batch_completion_flag(self, tmp_path):
-        """mark_batch_complete() sets completed flag"""
+        """mark_batch_complete() forces the completed status"""
         from media_archiver import MediaJournal
         j = MediaJournal(str(tmp_path / "journal.json"))
-        j.update_batch("Videos", 5000, sent=True)
+        j.register_batch("Videos", total_files=2, total_bytes=5000)
+        j.update_batch("Videos", "v.mp4", 2500, sent=True)
+        assert j.batches["Videos"]["status"] == "in_progress"
         j.mark_batch_complete("Videos")
-        assert j.batches["Videos"]["completed"] is True
+        assert j.batches["Videos"]["status"] == "completed"
+        assert j.batches["Videos"]["sent_bytes"] == 5000
 
 
 class TestMediaJournalProgress:
     """Tests for progress calculation"""
 
     def test_get_progress_returns_stats(self, tmp_path):
-        """get_progress() returns correct byte statistics"""
+        """get_progress() returns byte statistics for the whole journal"""
         from media_archiver import MediaJournal
         j = MediaJournal(str(tmp_path / "journal.json"))
         j.mark_sent("a.jpg", 1000)
         j.mark_sent("b.jpg", 2000)
         j.mark_failed("c.jpg", 500, "s1")
+        j.set_total_bytes_scanned(3500)
         prog = j.get_progress()
         assert prog["total_files"] == 3
-        assert prog["sent_files"] == 2
         assert prog["sent_bytes"] == 3000
-        assert prog["failed_files"] == 1
+        assert prog["remaining_bytes"] == 500
 
     def test_progress_percentage(self, tmp_path):
-        """Progress percentage is calculated correctly"""
+        """Progress percentage is sent bytes over scanned bytes"""
         from media_archiver import MediaJournal
         j = MediaJournal(str(tmp_path / "journal.json"))
         j.mark_sent("a.jpg", 1000)
         j.mark_sent("b.jpg", 1000)
         j.mark_failed("c.jpg", 1000, "s1")
+        j.set_total_bytes_scanned(3000)
+        assert j.get_progress()["percent"] == pytest.approx(66.67, abs=0.1)
+
+    def test_progress_without_scan_is_zero(self, tmp_path):
+        """Without a scan baseline progress stays 0%"""
+        from media_archiver import MediaJournal
+        j = MediaJournal(str(tmp_path / "journal.json"))
+        j.mark_sent("a.jpg", 1000)
         prog = j.get_progress()
-        assert prog["percent"] == pytest.approx(33.33, abs=0.1)
+        assert prog["percent"] == 0.0
+        assert prog["sent_bytes"] == 1000
 
 
 class TestMediaJournalLegacyMigration:
@@ -209,34 +224,34 @@ class TestMediaJournalLegacyMigration:
         """Old entries list migrates to file_index dict on load"""
         from media_archiver import MediaJournal
         fp = tmp_path / "journal.json"
-        # Write old format
         old_data = {
+            "version": 1,
             "entries": [
-                {"path": "old.jpg", "size": 3000, "status": "sent", "timestamp": "2025-01-01"},
-                {"path": "old2.jpg", "size": 4000, "status": "sent", "timestamp": "2025-01-02"}
+                {"filename": "old.jpg", "size_bytes": 3000, "status": "sent", "sent_at": "2025-01-01"},
+                {"filename": "old2.jpg", "size_bytes": 4000, "status": "sent", "sent_at": "2025-01-02"},
             ],
-            "total_processed": 2
         }
-        with open(fp, "w") as f:
-            json.dump(old_data, f)
-        # Load - should migrate
+        fp.write_text(json.dumps(old_data), encoding="utf-8")
+
         j = MediaJournal(str(fp))
         assert "old.jpg|3000" in j.file_index
         assert "old2.jpg|4000" in j.file_index
-        assert len(j.entries) == 0  # old entries cleared
+        assert j.data["version"] == 2
+        assert "entries" not in j.data
 
     def test_migration_preserves_sent_status(self, tmp_path):
         """Migration preserves sent/failed status from old format"""
         from media_archiver import MediaJournal
         fp = tmp_path / "journal.json"
         old_data = {
+            "version": 1,
             "entries": [
-                {"path": "ok.jpg", "size": 100, "status": "sent"},
-                {"path": "bad.jpg", "size": 200, "status": "failed"}
-            ]
+                {"filename": "ok.jpg", "size_bytes": 100, "status": "sent"},
+                {"filename": "bad.jpg", "size_bytes": 200, "status": "failed"},
+            ],
         }
-        with open(fp, "w") as f:
-            json.dump(old_data, f)
+        fp.write_text(json.dumps(old_data), encoding="utf-8")
+
         j = MediaJournal(str(fp))
         assert j.is_sent("ok.jpg", 100) is True
         assert j.is_sent("bad.jpg", 200) is False

@@ -136,6 +136,10 @@ class PyPILibsArchiver(LogMixin, BrowserInitMixin):
             f"📜 Лицензия: {license_str}"
         )
 
+        if file_sizes:
+            for i, size in enumerate(file_sizes):
+                text += f"\n📦 Файл {i + 1}: {format_file_size(size)}"
+
         return text
 
     @staticmethod
