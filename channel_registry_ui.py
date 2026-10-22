@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sys
+
+from logging_config import mask_url
 from config import get_config
 from config.model import ChannelEntry
 
@@ -17,7 +19,7 @@ def _print_channels(channels: list[ChannelEntry], function: str) -> None:
     for i, ch in enumerate(channels):
         status = "✓" if ch.enabled else "✗"
         label = ch.label if ch.label else f"Channel {i+1}"
-        print(f"    [{i}] {status} {label} ({ch.url})")
+        print(f"    [{i}] {status} {label} ({mask_url(ch.url)})")
     print()
 
 
@@ -32,7 +34,7 @@ def add_channel(function: str, url: str, label: str = "") -> None:
     config = get_config()
     config.channel_registry.add_channel(function, url, label)
     _save_config()
-    print(f"  ✓ Added channel to {function}: {url}")
+    print(f"  ✓ Added channel to {function}: {mask_url(url)}")
 
 
 def remove_channel(function: str, index: int) -> None:
@@ -43,7 +45,7 @@ def remove_channel(function: str, index: int) -> None:
         removed = channels[index]
         config.channel_registry.remove_channel(function, index)
         _save_config()
-        print(f"  ✓ Removed channel from {function}: {removed.url}")
+        print(f"  ✓ Removed channel from {function}: {mask_url(removed.url)}")
     else:
         print(f"  ✗ Invalid index: {index}")
 
@@ -95,7 +97,7 @@ def select_channel(function: str, allow_add: bool = False) -> ChannelEntry | Non
     # Show channel list
     print(f"\n  Доступные каналы для {function}:")
     for i, ch in enumerate(channels):
-        print(f"    [{i}] {ch.label or ch.url} ({ch.url})")
+        print(f"    [{i}] {ch.label or mask_url(ch.url)} ({mask_url(ch.url)})")
     
     add_idx = None
     if allow_add:

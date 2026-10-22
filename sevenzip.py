@@ -13,10 +13,60 @@ import os
 import logging
 import subprocess
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterator, Optional
 
 _logger = logging.getLogger("gitax")
+
+
+@dataclass
+class PasswordArgs:
+    """7z CLI arguments that carry a password plus the temp file backing it."""
+    args: list[str]
+    temp_path: Optional[str] = None
+
+
+@contextmanager
+def password_args(password: str | None,
+                  encrypt_header: bool = False) -> Iterator[PasswordArgs]:
+    """
+    Build 7z password arguments without exposing the secret in the command line.
+
+    The password is written to a private temp file and passed as ``-p@<file>``,
+    so it never appears in the process command line (visible on Windows through
+    WMI/``Win32_Process`` and Process Explorer). The temp file is removed when the
+    context manager exits.
+
+    Args:
+        password: Encryption password, or None for no password arguments.
+        encrypt_header: Also add ``-mhe=on`` to encrypt the archive header
+            (filenames stay hidden). Only valid for archive creation.
+
+    Yields:
+        PasswordArgs with the CLI arguments (empty when no password given).
+    """
+    if not password:
+        yield PasswordArgs([])
+        return
+
+    temp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", delete=False, encoding="utf-8"
+    )
+    try:
+        temp.write(password)
+        temp.close()
+        try:
+            os.chmod(temp.name, 0o600)
+        except OSError:
+            pass  # Windows may not support chmod; file is still private via temp dir
+        args = (["-mhe=on"] if encrypt_header else []) + [f"-p@{temp.name}"]
+        yield PasswordArgs(args, temp.name)
+    finally:
+        try:
+            os.unlink(temp.name)
+        except OSError:
+            pass
 
 
 @dataclass
@@ -259,22 +309,10 @@ def archive_file_as_7z(
 
     cmd = [seven_zip_exe, "a", f"-mx={compression_level}", archive_path, file_path]
 
-    # Use password file to avoid leaking in process list
-    password_tempfile = None
     try:
-        password_tempfile = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False, encoding="utf-8"
-        )
-        password_tempfile.write(password)
-        password_tempfile.close()
-        try:
-            os.chmod(password_tempfile.name, 0o600)
-        except OSError:
-            pass
-        cmd.insert(2, f"-p@{password_tempfile.name}")
-        cmd.insert(2, "-mhe=on")
-
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        with password_args(password, encrypt_header=True) as pw:
+            cmd[2:2] = pw.args
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
 
         if result.returncode != 0:
             _logger.warning(f"7z single-file archive failed: {result.stderr}")
@@ -305,12 +343,6 @@ def archive_file_as_7z(
         if os.path.exists(archive_path):
             os.remove(archive_path)
         return None
-    finally:
-        if password_tempfile is not None:
-            try:
-                os.unlink(password_tempfile.name)
-            except OSError:
-                pass
 
 
 def archive_directory_to_volumes(
@@ -355,23 +387,10 @@ def archive_directory_to_volumes(
     if volume_size:
         cmd.insert(2, "-v" + volume_size)
 
-    # Use password file instead of CLI argument to avoid leaking in process list
-    password_tempfile = None
-    if password:
-        password_tempfile = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False, encoding="utf-8"
-        )
-        password_tempfile.write(password)
-        password_tempfile.close()
-        try:
-            os.chmod(password_tempfile.name, 0o600)
-        except OSError:
-            pass  # Windows may not support chmod; file is still private via temp dir
-        cmd.insert(2, f"-p@{password_tempfile.name}")
-        cmd.insert(2, "-mhe=on")
-
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        with password_args(password, encrypt_header=True) as pw:
+            cmd[2:2] = pw.args
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
         if result.returncode != 0:
             _logger.warning(f"7z archive failed: {result.stderr}")
             if clean_existing:
@@ -403,9 +422,38 @@ def archive_directory_to_volumes(
         _logger.error(f"7z archive error: {e}")
         _cleanup_existing_volumes(output_base)
         return []
-    finally:
-        if password_tempfile is not None:
-            try:
-                os.unlink(password_tempfile.name)
-            except OSError:
-                pass
+
+
+def extract_7z_archive(archive_path: str, extract_dir: str,
+                       password: str | None = None) -> bool:
+    """
+    Extract a 7z archive (or first volume of a split archive) to a directory.
+
+    Args:
+        archive_path: Path to the ``.7z`` archive or ``.7z.001`` volume.
+        extract_dir: Destination directory.
+        password: Optional decryption password. Passed to 7z via a private temp
+            file, never via the command line.
+
+    Returns:
+        True on success, False on failure.
+    """
+    seven_zip_exe = _get_seven_zip_exe()
+    if not os.path.exists(seven_zip_exe):
+        _logger.error(f"7z not found at {seven_zip_exe}")
+        return False
+
+    cmd = [seven_zip_exe, "x", archive_path, f"-o{extract_dir}", "-y"]
+
+    try:
+        with password_args(password) as pw:
+            cmd.extend(pw.args)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        _logger.error("7z extract timeout")
+        return False
+    except Exception as e:
+        _logger.error(f"7z extract error: {e}")
+        return False
+

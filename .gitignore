@@ -30,6 +30,10 @@ ENV/
 config.yaml
 *.json
 *.auth-state.json
+# Runtime state files (listed explicitly so they survive a future *.json cleanup)
+backuper_session.json
+backuper_journal.json
+*_journal.json
 # Note: .yaml.example files ARE tracked (safe templates)
 
 # Environment variables
@@ -38,12 +42,16 @@ config.yaml
 
 # Logs
 *.log
+*.log.*
 archiver.log
+logs/
 
 # Temp files
 temp/
 tmp/
 *.zip
+*.7z
+*.7z.[0-9][0-9][0-9]
 
 # IDE
 .vscode/

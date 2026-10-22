@@ -14,7 +14,7 @@ import zipfile
 import logging
 from typing import Optional
 from playwright.sync_api import sync_playwright, Page, Browser, TimeoutError as PlaywrightTimeout
-from logging_config import LogMixin, setup_logging
+from logging_config import LogMixin, mask_url, setup_logging
 
 # Re-export 7z utilities from sevenzip module for backward compatibility
 from sevenzip import (
@@ -656,7 +656,7 @@ class BrowserMAX(LogMixin):
                 f"Cannot navigate during upload: {self._upload_file_name}"
             )
 
-        self.logger.info(f"Opening channel: {self.channel_url}")
+        self.logger.info(f"Opening channel: {mask_url(self.channel_url)}")
 
         # Reconnect if needed
         if not self._ensure_alive():

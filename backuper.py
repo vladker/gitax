@@ -19,12 +19,13 @@ from datetime import datetime
 from logging_config import LogMixin
 
 from browser_max import BrowserMAX
-from sevenzip import archive_directory_to_volumes, archive_file_as_7z, cleanup_volumes
+from sevenzip import (archive_directory_to_volumes, archive_file_as_7z,
+                      cleanup_volumes, extract_7z_archive)
 from browser_init import BrowserInitMixin
 from backuper_journal import BackuperJournal
 from config_utils import get_channel_url, get_config_value
 from progressbar import LiveProgressBar
-from utils import format_file_size
+from utils import format_file_size, prompt_secret
 
 
 def prompt_numeric_choice(prompt_text: str, valid_options: list[str]) -> str:
@@ -85,9 +86,22 @@ class Backuper(LogMixin, BrowserInitMixin):
                 return None
             if not data.get("file_list"):
                 return None
+            if "password" in data:
+                self._scrub_session_password(data)
             return data
         except (json.JSONDecodeError, KeyError, OSError):
             return None
+
+    def _scrub_session_password(self, data: dict):
+        """Remove a plaintext password left in a session file by an older version."""
+        leaked = data.pop("password", None)
+        data["use_password"] = bool(data.get("use_password")) or bool(leaked)
+        self._save_session(data)
+        self.logger.warning(
+            f"Plaintext password removed from {SESSION_FILE}. The password is not "
+            f"stored anymore; re-enter it when resuming, and change it if the file "
+            f"could have been read by others."
+        )
 
     def _save_session(self, session: dict):
         """Persist upload session to file."""
@@ -313,7 +327,7 @@ class Backuper(LogMixin, BrowserInitMixin):
         password = None
         password_hint = None
         if use_password:
-            password = input("  Пароль: ").strip()
+            password = prompt_secret("  Пароль: ")
             if not password:
                 print("  Пароль пустой, отменяю шифрование.")
                 use_password = False
@@ -508,7 +522,14 @@ class Backuper(LogMixin, BrowserInitMixin):
             sort_by = existing_session.get("sort_by", "name")
             sort_order = existing_session.get("sort_order", "asc")
             use_password = existing_session.get("use_password", False)
-            password = existing_session.get("password", None)
+            password = None
+            if use_password:
+                print("\n  Сессия зашифрована паролем — пароли не сохраняются, "
+                      "введите его снова.")
+                password = prompt_secret("  Пароль: ")
+                if not password:
+                    print("  Пароль не введён, файлы будут загружены без шифрования.")
+                    use_password = False
             print("\n  Использую настройки из сессии:")
             print(f"    Расширения: {allowed_extensions or 'все'}")
             print(f"    Макс. размер: {max_size_mb} MB")
@@ -549,7 +570,7 @@ class Backuper(LogMixin, BrowserInitMixin):
             use_password = input("  Архивировать каждый файл в 7z с паролем? [y/N]: ").strip().lower() == "y"
             password = None
             if use_password:
-                password = input("  Пароль: ").strip()
+                password = prompt_secret("  Пароль: ")
                 if not password:
                     print("  Пароль пустой, отменяю архивацию.")
                     use_password = False
@@ -645,7 +666,6 @@ class Backuper(LogMixin, BrowserInitMixin):
             "sort_by": sort_by,
             "sort_order": sort_order,
             "use_password": use_password,
-            "password": password,
             "total_files": total_files,
             "current_index": start_index,
             "sent_count": sent_count,
@@ -985,7 +1005,7 @@ class Backuper(LogMixin, BrowserInitMixin):
 
         global_password = None
         if pw_mode == "1":
-            global_password = input("  Пароль: ").strip()
+            global_password = prompt_secret("  Пароль: ")
 
         # 6. Download and extract
         print(f"\n  Скачивание и извлечение в '{download_dir}' ...\n")
@@ -1016,7 +1036,7 @@ class Backuper(LogMixin, BrowserInitMixin):
                     prompt += " (архив защищён паролем)"
                 else:
                     prompt += " (пусто = без пароля)"
-                pw = input(f"    {prompt}: ").strip()
+                pw = prompt_secret(f"    {prompt}: ")
                 if pw:
                     self.journal.mark_password_protected(archive_name)
 
@@ -1219,31 +1239,9 @@ class Backuper(LogMixin, BrowserInitMixin):
                     f.write(chunk)
 
     def _extract_7z(self, archive_path: str, extract_dir: str, password: str | None = None) -> bool:
-        """Extract 7z archive to directory"""
-        import subprocess
-        from config import get_config
+        """Extract 7z archive to directory."""
+        return extract_7z_archive(archive_path, extract_dir, password)
 
-        seven_zip_exe = get_config().backuper.seven_zip_exe
-
-        if not os.path.exists(seven_zip_exe):
-            self.logger.error(f"7z not found at {seven_zip_exe}")
-            return False
-
-        cmd = [seven_zip_exe, "x", archive_path, f"-o{extract_dir}", "-y"]
-        if password:
-            # Pass password directly via -p flag (no temp file)
-            # Safe on Windows: subprocess args are not exposed in process listings
-            cmd.extend([f"-p{password}"])
-
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
-            return result.returncode == 0
-        except subprocess.TimeoutExpired:
-            self.logger.error("7z extract timeout")
-            return False
-        except Exception as e:
-            self.logger.error(f"7z extract error: {e}")
-            return False
 
     # ── Main Menu ──
 
